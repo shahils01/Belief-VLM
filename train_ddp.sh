@@ -1,4 +1,4 @@
-VL_MODEL_PRESET="${VL_MODEL_PRESET:-llava_onevision_0p5b}"
+VL_MODEL_PRESET="${VL_MODEL_PRESET:-internvl3_5_1b}"
 DATASET_NAME="${DATASET_NAME:-wofmanaf/ego4d-video}"
 VIDEO_ROOT="${VIDEO_ROOT:-}"
 
