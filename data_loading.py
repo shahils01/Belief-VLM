@@ -308,13 +308,27 @@ def collate_hf_batch(batch):
 def _load_split(args, split: str):
     from datasets import load_dataset
 
-    dataset = load_dataset(
-        args.dataset_name,
-        name=args.dataset_config or None,
-        split=split,
-        streaming=args.streaming,
-        trust_remote_code=args.trust_remote_code_dataset,
-    )
+    load_kwargs = {
+        "name": args.dataset_config or None,
+        "split": split,
+        "streaming": args.streaming,
+    }
+    if args.trust_remote_code_dataset:
+        load_kwargs["trust_remote_code"] = True
+
+    try:
+        dataset = load_dataset(args.dataset_name, **load_kwargs)
+    except RuntimeError as exc:
+        msg = str(exc)
+        if "Dataset scripts are no longer supported" in msg:
+            raise RuntimeError(
+                "This dataset repo is script-backed, but your installed `datasets` version no longer supports Hub "
+                "dataset scripts. Use one of these options: (1) downgrade to `datasets<4.0` if you want to load "
+                f"`{args.dataset_name}` directly, (2) convert/download the dataset to a standard format and load it "
+                "locally, or (3) switch to a parquet/arrow-backed Hub dataset. The current training code is fine; "
+                "the failure is in dataset loading, not DDP."
+            ) from exc
+        raise
     return dataset
 
 

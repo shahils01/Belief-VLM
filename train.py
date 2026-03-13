@@ -44,7 +44,7 @@ def parse_args():
     parser.add_argument("--train_split", type=str, default="train")
     parser.add_argument("--val_split", type=str, default="validation")
     parser.add_argument("--streaming", action="store_true")
-    parser.add_argument("--trust_remote_code_dataset", action="store_true", default=True)
+    parser.add_argument("--trust_remote_code_dataset", action="store_true", default=False)
     parser.add_argument("--no_trust_remote_code_dataset", dest="trust_remote_code_dataset", action="store_false")
     parser.add_argument("--video_column", type=str, default="video")
     parser.add_argument("--text_column", type=str, default="text")
