@@ -1,7 +1,6 @@
 import argparse
 import functools
 import inspect
-import json
 import os
 
 import torch
@@ -32,34 +31,33 @@ except Exception:
     CPUOffload = None
     size_based_auto_wrap_policy = None
 
-from data_loading import hf_video_loader
+from data_loading import ego4d_video_loader
 from model import ModelConfig, MultimodalBeliefModel
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--dataset_name", type=str, default="HuggingFaceM4/something_something_v2")
+    parser.add_argument("--dataset_name", type=str, default="wofmanaf/ego4d-video")
     parser.add_argument("--dataset_config", type=str, default="")
+    parser.add_argument("--dataset_revision", type=str, default="main")
+    parser.add_argument("--dataset_split", type=str, default="train")
     parser.add_argument("--train_split", type=str, default="train")
     parser.add_argument("--val_split", type=str, default="validation")
+    parser.add_argument("--val_ratio", type=float, default=0.01)
     parser.add_argument("--streaming", action="store_true")
     parser.add_argument("--trust_remote_code_dataset", action="store_true", default=False)
     parser.add_argument("--no_trust_remote_code_dataset", dest="trust_remote_code_dataset", action="store_false")
     parser.add_argument("--video_column", type=str, default="video")
-    parser.add_argument("--text_column", type=str, default="text")
-    parser.add_argument("--label_column", type=str, default="label")
+    parser.add_argument("--video_root", type=str, default="")
+    parser.add_argument("--conversations_column", type=str, default="conversations")
+    parser.add_argument("--id_column", type=str, default="id")
     parser.add_argument("--max_samples_per_split", type=int, default=0)
-    parser.add_argument("--shuffle_buffer", type=int, default=512)
+    parser.add_argument("--shuffle_buffer", type=int, default=256)
 
-    parser.add_argument("--batch_size", type=int, default=2)
+    parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--video_frames", type=int, default=8)
-    parser.add_argument(
-        "--text_prompt_template",
-        type=str,
-        default="Classify the human action shown in this video. Text context: {text}",
-    )
 
     parser.add_argument("--mixed_precision", type=str, default="no", choices=["no", "fp16", "bf16"])
     parser.add_argument("--fsdp", action="store_true")
@@ -89,10 +87,6 @@ def parse_args():
     parser.add_argument("--vl_dtype", type=str, default="bfloat16", choices=["float16", "bfloat16", "float32"])
     parser.add_argument("--vl_max_text_len", type=int, default=256)
     parser.add_argument("--freeze_vl", action="store_true")
-    parser.add_argument("--value_pooling", type=str, default="hidden_mean", choices=["hidden_mean", "last_token_logits"])
-    parser.add_argument("--vl_logits_to_keep", type=int, default=0)
-    parser.add_argument("--classifier_dropout", type=float, default=0.1)
-    parser.add_argument("--num_labels", type=int, default=0)
 
     parser.add_argument("--peft", type=str, default="none", choices=["none", "lora", "qlora"])
     parser.add_argument("--lora_r", type=int, default=16)
@@ -101,16 +95,16 @@ def parse_args():
     parser.add_argument("--lora_target_modules", type=str, default="")
     parser.add_argument("--lora_bias", type=str, default="none", choices=["none", "all", "lora_only"])
 
-    parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--lr", type=float, default=2e-5)
     parser.add_argument("--weight_decay", type=float, default=0.01)
-    parser.add_argument("--label_smoothing", type=float, default=0.0)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--log_every", type=int, default=20)
-    parser.add_argument("--save_dir", type=str, default="checkpoints_belief")
+    parser.add_argument("--save_dir", type=str, default="checkpoints_belief_sft")
     parser.add_argument("--resume_checkpoint", type=str, default="")
     parser.add_argument("--load_model_only", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--eval_max_new_tokens", type=int, default=64)
 
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--wandb_project", type=str, default="belief-vlm")
@@ -179,13 +173,9 @@ def build_model(args, device):
         vl_backend=args.vl_backend,
         vl_model_name=args.vl_model_name,
         vl_dtype=args.vl_dtype,
-        vl_max_text_len=args.vl_max_text_len,
         freeze_vl=args.freeze_vl,
         quantization_config=getattr(args, "quantization_config", None),
-        num_labels=args.num_labels,
-        classifier_dropout=args.classifier_dropout,
-        value_pooling=args.value_pooling,
-        logits_to_keep=args.vl_logits_to_keep,
+        use_cache=not args.disable_vl_cache,
     )
     return MultimodalBeliefModel(cfg, device=device)
 
@@ -195,8 +185,8 @@ def _configure_memory_optimizations(model, args):
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
 
-    if args.disable_vl_cache and hasattr(model.backbone.model, "config") and hasattr(model.backbone.model.config, "use_cache"):
-        model.backbone.model.config.use_cache = False
+    if hasattr(model.backbone.model, "config") and hasattr(model.backbone.model.config, "use_cache"):
+        model.backbone.model.config.use_cache = False if args.disable_vl_cache or args.gradient_checkpointing else model.backbone.model.config.use_cache
 
     if args.gradient_checkpointing:
         fn = getattr(model.backbone.model, "gradient_checkpointing_enable", None)
@@ -223,7 +213,7 @@ def _count_parameters(model):
     return total, trainable
 
 
-def _load_checkpoint_state(model, ckpt_state, args, accelerator):
+def _load_checkpoint_state(model, ckpt_state, accelerator):
     unwrapped = accelerator.unwrap_model(model)
     try:
         unwrapped.load_state_dict(ckpt_state)
@@ -237,10 +227,10 @@ def _load_checkpoint_state(model, ckpt_state, args, accelerator):
         )
 
 
+
 def run_epoch(model, loader, optimizer, accelerator, args, train, global_step):
     model.train() if train else model.eval()
     total_loss = 0.0
-    total_correct = 0
     total_examples = 0
     step = 0
 
@@ -254,14 +244,8 @@ def run_epoch(model, loader, optimizer, accelerator, args, train, global_step):
 
         with accelerator.accumulate(model):
             with torch.set_grad_enabled(train):
-                outputs = model(inputs, return_features=False)
-                logits = outputs["logits"]
-                loss = torch.nn.functional.cross_entropy(
-                    logits,
-                    labels,
-                    label_smoothing=args.label_smoothing,
-                )
-
+                outputs = model(inputs, labels=labels)
+                loss = outputs["loss"]
                 if train:
                     accelerator.backward(loss)
                     if args.max_grad_norm > 0:
@@ -269,18 +253,20 @@ def run_epoch(model, loader, optimizer, accelerator, args, train, global_step):
                     optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
 
-        preds = logits.argmax(dim=-1)
-        total_correct += (preds == labels).sum().item()
-        total_examples += labels.numel()
-        total_loss += loss.detach().item() * labels.size(0)
+        batch_size = labels.size(0)
+        total_loss += loss.detach().item() * batch_size
+        total_examples += batch_size
+
+        if (not train) and step == 1 and accelerator.is_main_process:
+            accelerator.print(f"val preview prompt: {batch['prompt_text'][0]}")
+            accelerator.print(f"val preview target: {batch['answer_text'][0]}")
 
         if args.log_every > 0 and step % args.log_every == 0:
             avg_loss = total_loss / max(total_examples, 1)
-            avg_acc = total_correct / max(total_examples, 1)
             phase = "train" if train else "val"
-            accelerator.print(f"{phase} step={step} loss={avg_loss:.4f} acc={avg_acc:.4f}")
+            accelerator.print(f"{phase} step={step} loss={avg_loss:.4f}")
             if args.wandb:
-                metrics = {f"{phase}/loss": avg_loss, f"{phase}/acc": avg_acc}
+                metrics = {f"{phase}/loss": avg_loss}
                 if train:
                     metrics["train/lr"] = optimizer.param_groups[0]["lr"]
                     accelerator.log(metrics, step=global_step + step)
@@ -288,8 +274,7 @@ def run_epoch(model, loader, optimizer, accelerator, args, train, global_step):
                     accelerator.log(metrics, step=global_step)
 
     avg_loss = total_loss / max(total_examples, 1)
-    avg_acc = total_correct / max(total_examples, 1)
-    return avg_loss, avg_acc, (global_step + step if train else global_step)
+    return avg_loss, (global_step + step if train else global_step)
 
 
 def main():
@@ -299,7 +284,6 @@ def main():
 
     if args.detect_anomaly:
         torch.autograd.set_detect_anomaly(True)
-
     if args.peft == "qlora" and args.fsdp:
         raise RuntimeError("FSDP + QLoRA is not supported.")
 
@@ -377,18 +361,9 @@ def main():
             init_kwargs["wandb"]["tags"] = [item.strip() for item in args.wandb_tags.split(",") if item.strip()]
         accelerator.init_trackers(project_name=args.wandb_project, init_kwargs=init_kwargs)
 
-    accelerator.print(f"dataset={args.dataset_name} train_split={args.train_split} val_split={args.val_split}")
-    train_loader, label_names = hf_video_loader(args, args.train_split, args.batch_size, args.num_workers, is_train=True)
-    val_loader = None
-    if args.val_split:
-        val_loader, val_label_names = hf_video_loader(args, args.val_split, args.batch_size, args.num_workers, is_train=False)
-        if label_names is None:
-            label_names = val_label_names
-
-    if args.num_labels <= 0:
-        if not label_names:
-            raise RuntimeError("Could not infer the number of labels from the dataset. Pass --num_labels explicitly.")
-        args.num_labels = len(label_names)
+    accelerator.print(f"dataset={args.dataset_name} split={args.dataset_split} train_alias={args.train_split} val_alias={args.val_split}")
+    train_loader = ego4d_video_loader(args, args.train_split, args.batch_size, args.num_workers, is_train=True)
+    val_loader = ego4d_video_loader(args, args.val_split, args.batch_size, args.num_workers, is_train=False) if args.val_ratio > 0 else None
 
     model = build_model(args, device=accelerator.device)
     model = _apply_peft(model, args)
@@ -411,19 +386,15 @@ def main():
     global_step = 0
     if args.resume_checkpoint:
         ckpt = torch.load(args.resume_checkpoint, map_location="cpu")
-        _load_checkpoint_state(model, ckpt["model"], args, accelerator)
+        _load_checkpoint_state(model, ckpt["model"], accelerator)
         if not args.load_model_only:
             optimizer.load_state_dict(ckpt["optimizer"])
             start_epoch = int(ckpt.get("epoch", -1)) + 1
             global_step = int(ckpt.get("global_step", 0))
             accelerator.print(f"resumed checkpoint={args.resume_checkpoint} start_epoch={start_epoch}")
 
-    if accelerator.is_main_process and label_names:
-        with open(os.path.join(args.save_dir, "label_names.json"), "w", encoding="utf-8") as handle:
-            json.dump(label_names, handle, indent=2)
-
     for epoch in range(start_epoch, args.epochs):
-        train_loss, train_acc, global_step = run_epoch(
+        train_loss, global_step = run_epoch(
             model=model,
             loader=train_loader,
             optimizer=optimizer,
@@ -432,13 +403,13 @@ def main():
             train=True,
             global_step=global_step,
         )
-        accelerator.print(f"epoch={epoch} train_loss={train_loss:.4f} train_acc={train_acc:.4f}")
+        accelerator.print(f"epoch={epoch} train_loss={train_loss:.4f}")
         if args.wandb:
-            accelerator.log({"train/epoch_loss": train_loss, "train/epoch_acc": train_acc}, step=global_step)
+            accelerator.log({"train/epoch_loss": train_loss}, step=global_step)
 
         if val_loader is not None:
             with torch.no_grad():
-                val_loss, val_acc, _ = run_epoch(
+                val_loss, _ = run_epoch(
                     model=model,
                     loader=val_loader,
                     optimizer=optimizer,
@@ -447,9 +418,9 @@ def main():
                     train=False,
                     global_step=global_step,
                 )
-            accelerator.print(f"epoch={epoch} val_loss={val_loss:.4f} val_acc={val_acc:.4f}")
+            accelerator.print(f"epoch={epoch} val_loss={val_loss:.4f}")
             if args.wandb:
-                accelerator.log({"val/epoch_loss": val_loss, "val/epoch_acc": val_acc}, step=global_step)
+                accelerator.log({"val/epoch_loss": val_loss}, step=global_step)
 
         accelerator.wait_for_everyone()
         if accelerator.is_main_process:
@@ -461,7 +432,6 @@ def main():
                     "epoch": epoch,
                     "global_step": global_step,
                     "args": vars(args),
-                    "label_names": label_names,
                 },
                 ckpt_path,
             )

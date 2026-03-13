@@ -1,52 +1,52 @@
 # Belief-VLM
 
-`Belief-VLM` is now a supervised video-text classification pipeline for human-belief or action prediction tasks.
-The model takes a decoded video clip plus a text prompt, pools the VLM representation, and trains a classification head against dataset labels.
+`Belief-VLM` is now configured for supervised multimodal fine-tuning on `wofmanaf/ego4d-video`.
+The training objective is causal language modeling over the assistant response in each `conversations` sample, conditioned on the video plus the user prompt.
 
-## What changed
-- Removed the robot observation, graph, GNN, reward, TD, and contrastive training path from the main training pipeline.
-- Replaced the old WebDataset trajectory loader with a Hugging Face video dataset loader.
-- Switched the training objective to supervised classification with cross-entropy loss.
+## Data format
+The current loader targets the Hugging Face dataset `wofmanaf/ego4d-video`.
+Each sample is expected to contain:
+- `id`
+- `video`: a path-like string such as `EGO_1.npy`
+- `conversations`: user/assistant turns
 
-## Recommended loss
-For Something-Something V2, use standard multiclass cross-entropy:
+The loader resolves the `.npy` video file either from `--video_root` or by downloading it from the dataset repo with `huggingface_hub`.
+It samples `--video_frames` frames uniformly and masks the prompt tokens so the loss is applied only to the assistant answer.
+
+## Loss
+Training uses standard causal LM cross-entropy with label masking:
 
 ```text
-L = CrossEntropy(logits, class_label)
+L = CrossEntropy(next_token_logits, assistant_tokens_only)
 ```
 
-This is the right default because each clip has one action label. If you see overconfidence, add light `--label_smoothing 0.05`.
+This is the correct objective for `ego4d-video` because the supervision is free-form text, not class IDs.
 
-## Dataset support
-The default configuration targets the Hugging Face dataset `HuggingFaceM4/something_something_v2`.
-The loader expects:
-- a decoded `video` column
-- a text column such as `text`
-- an integer `label` column
-
-You can override those with `--video_column`, `--text_column`, and `--label_column`.
+## Train/val split
+The dataset exposes only a `train` split on Hugging Face.
+This code creates a deterministic validation holdout from that split using `--val_ratio` and the sample `id`.
 
 ## Training
-Single node, 2 GPUs:
+Example DDP run:
 
 ```bash
 accelerate launch --num_processes 2 train.py \
-  --dataset_name HuggingFaceM4/something_something_v2 \
-  --train_split train \
-  --val_split validation \
-  --batch_size 2 \
+  --dataset_name wofmanaf/ego4d-video \
+  --dataset_split train \
+  --val_ratio 0.01 \
+  --batch_size 1 \
   --video_frames 8 \
   --mixed_precision bf16 \
-  --grad_accum_steps 8 \
+  --grad_accum_steps 16 \
   --vl_model_preset llava_onevision_0p5b \
   --peft qlora \
   --gradient_checkpointing \
-  --text_prompt_template "Classify the human action shown in this video. Text context: {text}" \
-  --save_dir checkpoints_belief
+  --save_dir checkpoints_belief_ego4d
 ```
 
+If you already downloaded the `.npy` files locally, pass `--video_root /path/to/ego4d_npy` to avoid per-sample hub fetches.
+
 ## Notes
-- Something-Something V2 is a single-label action dataset, so classification is simpler and better aligned than TD/value regression.
-- The text field in this dataset is usually a template-style action description. Keep it if you want a video+text model; drop or randomize it only if you want to force a mostly-video classifier.
-- For large VLMs, start with `--peft qlora` or `--peft lora` instead of full fine-tuning.
-- Video decoding through Hugging Face datasets typically needs `datasets[video]` and a backend such as `torchcodec`.
+- `wofmanaf/ego4d-video` is not a classification dataset, so the old label-classifier path has been replaced with generative SFT.
+- The loader expects each `.npy` file to contain a time-major frame array. If the actual file layout differs, the frame decoder in `data_loading.py` will need one more adjustment.
+- For large models, `--peft qlora` or `--peft lora` is the practical starting point.
