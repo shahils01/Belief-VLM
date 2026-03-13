@@ -1,167 +1,46 @@
-import io
-import os
-import fnmatch
-import re
-from collections import defaultdict, deque
+from typing import Iterable, Optional
 
+import numpy as np
 import torch
-from torch.utils.data import DataLoader, IterableDataset
-import webdataset as wds
+from PIL import Image
+from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
 
-def _as_numpy(x):
-    if isinstance(x, bytes):
-        import numpy as np
-        try:
-            return np.load(io.BytesIO(x), allow_pickle=True)
-        except Exception:
-            return torch.load(io.BytesIO(x), map_location="cpu")
-    return x
+DEFAULT_TEXT_COLUMNS = ("text", "template", "sentence", "caption")
+DEFAULT_LABEL_COLUMNS = ("label", "labels")
 
 
-def _is_glob_pattern(s):
-    return any(ch in s for ch in ("*", "?", "["))
+def _normalize_media_size(image_size):
+    if isinstance(image_size, (tuple, list)):
+        if len(image_size) >= 2:
+            return {"height": int(image_size[0]), "width": int(image_size[1])}
+        if len(image_size) == 1:
+            size = int(image_size[0])
+            return {"height": size, "width": size}
+    if image_size is None:
+        return None
+    size = int(image_size)
+    return {"height": size, "width": size}
 
 
-def _hf_list_dataset_files(repo_id, revision):
-    try:
-        from huggingface_hub import HfApi
-    except Exception as e:
-        raise RuntimeError(
-            "Hugging Face wildcard shard expansion requires `huggingface_hub`. "
-            "Install it with: pip install huggingface_hub"
-        ) from e
-    api = HfApi()
-    return api.list_repo_files(repo_id=repo_id, repo_type="dataset", revision=revision)
+def build_vlm_processor(args):
+    from transformers import AutoConfig, AutoProcessor
 
-
-def _expand_hf_uri_spec(spec):
-    # Format: hf://datasets/<org>/<repo>@<revision>/<path_or_glob>
-    m = re.match(r"^hf://datasets/([^/@]+/[^/@]+)(?:@([^/]+))?/(.+)$", spec)
-    if not m:
-        return [spec]
-    repo_id, revision, repo_path = m.group(1), (m.group(2) or "main"), m.group(3)
-    if not _is_glob_pattern(repo_path):
-        return [f"https://huggingface.co/datasets/{repo_id}/resolve/{revision}/{repo_path}"]
-
-    files = _hf_list_dataset_files(repo_id, revision)
-    matches = [f for f in files if fnmatch.fnmatch(f, repo_path)]
-    matches = sorted([f for f in matches if f.endswith(".tar")])
-    if not matches:
-        raise RuntimeError(f"No .tar files matched '{spec}'")
-    return [f"https://huggingface.co/datasets/{repo_id}/resolve/{revision}/{f}" for f in matches]
-
-
-def _expand_hf_http_spec(spec):
-    # Format: https://huggingface.co/datasets/<org>/<repo>/tree/<revision>/<path_or_glob>
-    # Also supports /resolve/<revision>/...
-    m = re.match(r"^https://huggingface\.co/datasets/([^/]+/[^/]+)/(tree|resolve)/([^/]+)/(.+)$", spec)
-    if not m:
-        return [spec]
-    repo_id, mode, revision, repo_path = m.group(1), m.group(2), m.group(3), m.group(4)
-
-    if not _is_glob_pattern(repo_path):
-        if mode == "tree":
-            return [f"https://huggingface.co/datasets/{repo_id}/resolve/{revision}/{repo_path}"]
-        return [spec]
-
-    files = _hf_list_dataset_files(repo_id, revision)
-    matches = [f for f in files if fnmatch.fnmatch(f, repo_path)]
-    matches = sorted([f for f in matches if f.endswith(".tar")])
-    if not matches:
-        raise RuntimeError(f"No .tar files matched '{spec}'")
-    return [f"https://huggingface.co/datasets/{repo_id}/resolve/{revision}/{f}" for f in matches]
-
-
-def resolve_shards_spec(shards):
-    parts = [p.strip() for p in str(shards).split("::") if p.strip()]
-    resolved = []
-    for p in parts:
-        if p.startswith("hf://datasets/"):
-            resolved.extend(_expand_hf_uri_spec(p))
-        elif p.startswith("https://huggingface.co/datasets/"):
-            resolved.extend(_expand_hf_http_spec(p))
-        else:
-            resolved.append(p)
-    return "::".join(resolved)
-
-
-def _edge_index_to_adj(edge_index, num_nodes):
-    edge_index = _as_numpy(edge_index)
-    if torch.is_tensor(edge_index):
-        ei = edge_index
-    else:
-        import numpy as np
-        ei = torch.as_tensor(np.asarray(edge_index))
-
-    if ei.dim() == 2 and ei.shape[0] == num_nodes and ei.shape[1] == num_nodes:
-        return ei.float()
-    if ei.dim() == 2 and ei.shape[0] == 2:
-        src = ei[0].long()
-        dst = ei[1].long()
-        mask = (src >= 0) & (dst >= 0) & (src < num_nodes) & (dst < num_nodes)
-        src = src[mask]
-        dst = dst[mask]
-        adj = torch.zeros((num_nodes, num_nodes), dtype=torch.float32)
-        if src.numel() > 0:
-            adj[src, dst] = 1.0
-        return adj
-    raise ValueError("edge_index has unexpected shape")
-
-
-def _reduce_value(x, reduce_mode):
-    if reduce_mode == "sum":
-        return x.sum()
-    if reduce_mode == "first":
-        return x.flatten()[0]
-    return x.mean()
-
-
-def _reduce_done(x, reduce_mode):
-    if reduce_mode == "all":
-        return (x > 0).all()
-    if reduce_mode == "sum":
-        return x.sum() > 0
-    if reduce_mode == "first":
-        return x.flatten()[0] > 0
-    if reduce_mode == "mean":
-        return x.float().mean() > 0.5
-    return (x > 0).any()
-
-
-def _reward_from_frame(sample, reduce_mode):
-    arr = _as_numpy(sample["rewards.npy"])
-    if hasattr(arr, "numpy"):
-        arr = arr.numpy()
-    t = torch.tensor(arr, dtype=torch.float32)
-    return _reduce_value(t, reduce_mode)
-
-
-def _done_from_frame(sample, reduce_mode):
-    arr = _as_numpy(sample["dones.npy"])
-    if hasattr(arr, "numpy"):
-        arr = arr.numpy()
-    t = torch.tensor(arr, dtype=torch.float32)
-    return _reduce_done(t, reduce_mode)
-
-
-def _done_any_all_from_frame(sample):
-    arr = _as_numpy(sample["dones.npy"])
-    if hasattr(arr, "numpy"):
-        arr = arr.numpy()
-    t = torch.tensor(arr, dtype=torch.float32)
-    done_any = (t > 0).any()
-    done_all = (t > 0).all()
-    return done_any, done_all
-
-
-def _extract_episode_id(key):
-    key = str(key)
-    if "_step_" in key:
-        return key.split("_step_", 1)[0]
-    if "_" in key:
-        return key.rsplit("_", 1)[0]
-    return key
+    trust_remote_code = args.vl_backend == "internvl"
+    processor = AutoProcessor.from_pretrained(args.vl_model_name, trust_remote_code=trust_remote_code)
+    cfg_hf = AutoConfig.from_pretrained(args.vl_model_name, trust_remote_code=trust_remote_code)
+    vision_cfg = getattr(cfg_hf, "vision_config", None)
+    media_size = _normalize_media_size(getattr(vision_cfg, "image_size", None) if vision_cfg is not None else None)
+    if media_size is not None:
+        for proc_name in ("image_processor", "video_processor"):
+            proc = getattr(processor, proc_name, None)
+            if proc is None:
+                continue
+            if hasattr(proc, "size"):
+                proc.size = dict(media_size)
+            if hasattr(proc, "crop_size"):
+                proc.crop_size = dict(media_size)
+    return processor
 
 
 def preprocess_vlm_video_inputs(
@@ -169,576 +48,286 @@ def preprocess_vlm_video_inputs(
     frames,
     text,
     vl_backend="llava_video",
-    text_prompt_template=None,
     vlm_max_text_len=256,
-    vlm_truncation=False,
-    vlm_padding="longest",
-    obs_token_repeats=1,
     squeeze_batch_dim=True,
 ):
-    if vlm_processor is None:
-        raise RuntimeError("Dataloader processor not set.")
-    if not isinstance(text, str):
-        text = text_prompt_template
-    if not isinstance(text, str):
-        text = ""
-    proc_text = text
-
     tokenizer = getattr(vlm_processor, "tokenizer", None)
+    prompt = text if isinstance(text, str) else ""
     if tokenizer is not None:
         vocab = tokenizer.get_vocab()
-        has_media_token = any(tok in proc_text for tok in ("<video>", "<image>", "<img>"))
-        media_token = None
-        if vl_backend == "llava_video" and "<video>" in vocab:
-            media_token = "<video>"
-        elif vl_backend == "internvl":
-            for candidate in ("<video>", "<image>", "<img>"):
-                if candidate in vocab:
-                    media_token = candidate
-                    break
-        elif "<video>" in vocab:
-            media_token = "<video>"
-        elif "<image>" in vocab:
-            media_token = "<image>"
-        if media_token is not None and not has_media_token:
-            proc_text = f"{media_token}\n{proc_text}"
-        reps = max(1, int(obs_token_repeats))
-        if reps > 1 and "<obs>" in proc_text:
-            proc_text = proc_text.replace("<obs>", " ".join(["<obs>"] * reps), 1)
-
-    # For batched videos (list of list-of-frames), HF processors expect batched text.
-    if isinstance(frames, (list, tuple)) and len(frames) > 0 and isinstance(frames[0], (list, tuple)):
-        proc_text = [proc_text for _ in range(len(frames))]
+        if not any(token in prompt for token in ("<video>", "<image>", "<img>")):
+            if vl_backend == "internvl":
+                for token in ("<video>", "<image>", "<img>"):
+                    if token in vocab:
+                        prompt = f"{token}\n{prompt}"
+                        break
+            elif "<video>" in vocab:
+                prompt = f"<video>\n{prompt}"
+            elif "<image>" in vocab:
+                prompt = f"<image>\n{prompt}"
 
     try:
-        max_len = vlm_max_text_len if vlm_truncation else None
         inputs = vlm_processor(
-            text=proc_text,
+            text=prompt,
             videos=frames,
             return_tensors="pt",
-            padding=vlm_padding,
-            truncation=vlm_truncation,
-            max_length=max_len,
+            padding="longest",
+            truncation=False,
+            max_length=vlm_max_text_len,
         )
     except TypeError:
-        inputs = vlm_processor(text=proc_text, images=frames, return_tensors="pt")
+        inputs = vlm_processor(
+            text=prompt,
+            images=frames,
+            return_tensors="pt",
+            padding="longest",
+            truncation=False,
+            max_length=vlm_max_text_len,
+        )
 
     packed = {}
-    for k, v in dict(inputs).items():
-        if squeeze_batch_dim and torch.is_tensor(v) and v.dim() > 0 and v.shape[0] == 1:
-            v = v.squeeze(0)
-        packed[k] = v
+    for key, value in dict(inputs).items():
+        if squeeze_batch_dim and torch.is_tensor(value) and value.dim() > 0 and value.shape[0] == 1:
+            value = value.squeeze(0)
+        packed[key] = value
     return packed
 
 
-class SequenceWebDataset(IterableDataset):
+def _frame_to_pil(frame):
+    if isinstance(frame, Image.Image):
+        return frame.convert("RGB")
+
+    if torch.is_tensor(frame):
+        frame = frame.detach().cpu().numpy()
+    elif hasattr(frame, "asnumpy"):
+        frame = frame.asnumpy()
+    else:
+        frame = np.asarray(frame)
+
+    if frame.ndim == 3 and frame.shape[0] in (1, 3):
+        frame = np.transpose(frame, (1, 2, 0))
+    if frame.ndim == 2:
+        frame = np.repeat(frame[..., None], 3, axis=-1)
+    if frame.shape[-1] == 1:
+        frame = np.repeat(frame, 3, axis=-1)
+
+    if np.issubdtype(frame.dtype, np.floating):
+        scale = 255.0 if frame.max() <= 1.0 else 1.0
+        frame = np.clip(frame * scale, 0.0, 255.0).astype(np.uint8)
+    else:
+        frame = frame.astype(np.uint8)
+    return Image.fromarray(frame).convert("RGB")
+
+
+def _sample_frame_indices(num_frames: int, num_samples: int):
+    if num_frames <= 0:
+        raise ValueError("num_frames must be positive.")
+    if num_frames <= num_samples:
+        return list(range(num_frames))
+    return np.linspace(0, num_frames - 1, num=num_samples, dtype=np.int64).tolist()
+
+
+def _video_length(video) -> int:
+    for attr in ("num_frames", "frames"):
+        value = getattr(video, attr, None)
+        if isinstance(value, int) and value > 0:
+            return value
+    metadata = getattr(video, "metadata", None)
+    for attr in ("num_frames", "frames"):
+        value = getattr(metadata, attr, None) if metadata is not None else None
+        if isinstance(value, int) and value > 0:
+            return value
+    try:
+        return len(video)
+    except Exception as e:
+        raise RuntimeError(
+            "Could not determine the decoded video length. Install the video decoding extras used by datasets, "
+            "for example `pip install datasets[video] torchcodec`."
+        ) from e
+
+
+def _extract_frames(video, frame_indices):
+    if hasattr(video, "get_batch"):
+        batch = video.get_batch(frame_indices)
+        if hasattr(batch, "asnumpy"):
+            batch = batch.asnumpy()
+        return [_frame_to_pil(frame) for frame in batch]
+
+    if hasattr(video, "get_frames"):
+        batch = video.get_frames(frame_indices)
+        if hasattr(batch, "asnumpy"):
+            batch = batch.asnumpy()
+        return [_frame_to_pil(frame) for frame in batch]
+
+    if hasattr(video, "get_frame_at"):
+        frames = []
+        for idx in frame_indices:
+            item = video.get_frame_at(int(idx))
+            data = item[0] if isinstance(item, tuple) else getattr(item, "data", item)
+            frames.append(_frame_to_pil(data))
+        return frames
+
+    return [_frame_to_pil(video[int(idx)]) for idx in frame_indices]
+
+
+def decode_video_frames(video, num_frames: int):
+    total_frames = _video_length(video)
+    frame_indices = _sample_frame_indices(total_frames, num_frames)
+    frames = _extract_frames(video, frame_indices)
+    if len(frames) < num_frames and frames:
+        frames.extend([frames[-1]] * (num_frames - len(frames)))
+    return frames
+
+
+def format_sample_text(template: str, sample_text: str) -> str:
+    sample_text = "" if sample_text is None else str(sample_text).strip()
+    if not template:
+        return sample_text
+    try:
+        return template.format(text=sample_text)
+    except Exception:
+        if sample_text:
+            return f"{template}\n{sample_text}"
+        return template
+
+
+def _infer_label_names(dataset, label_column: str):
+    features = getattr(dataset, "features", None)
+    if not features or label_column not in features:
+        return None
+    label_feature = features[label_column]
+    names = getattr(label_feature, "names", None)
+    if names:
+        return list(names)
+    return None
+
+
+def _resolve_text_column(sample, requested_column: Optional[str]):
+    if requested_column and requested_column in sample:
+        return requested_column
+    for candidate in DEFAULT_TEXT_COLUMNS:
+        if candidate in sample:
+            return candidate
+    return None
+
+
+def _resolve_label_value(sample, requested_column: Optional[str]):
+    if requested_column and requested_column in sample:
+        return int(sample[requested_column])
+    for candidate in DEFAULT_LABEL_COLUMNS:
+        if candidate in sample:
+            return int(sample[candidate])
+    raise KeyError(f"Could not find a label column in sample. Checked: {DEFAULT_LABEL_COLUMNS}")
+
+
+class HFVideoClassificationDataset(IterableDataset):
     def __init__(
         self,
-        shards,
-        clip_len,
-        clip_stride,
-        text_mode,
-        robot_source,
-        reward_reduce,
-        done_reduce,
-        vl_backend="llava_video",
-        vlm_processor=None,
-        text_prompt_template=None,
-        include_next=False,
-        vlm_max_text_len=256,
-        vlm_truncation=False,
-        vlm_padding="longest",
-        gamma=0.99,
-        return_horizon="clip",
-        n_step=1,
-        include_nstep_bootstrap=False,
-        num_robots=None,
-        robot_obs_dim=None,
-        obs_token_repeats=1,
+        dataset,
+        processor,
+        args,
+        split: str,
+        is_train: bool,
     ):
-        self.shards = shards
-        self.clip_len = clip_len
-        self.clip_stride = clip_stride
-        self.text_mode = text_mode
-        self.robot_source = robot_source
-        self.reward_reduce = reward_reduce
-        self.done_reduce = done_reduce
-        self.vl_backend = str(vl_backend)
-        self.vlm_processor = vlm_processor
-        self.text_prompt_template = text_prompt_template
-        self.include_next = include_next
-        self.vlm_max_text_len = vlm_max_text_len
-        self.vlm_truncation = vlm_truncation
-        self.vlm_padding = vlm_padding
-        self.gamma = float(gamma)
-        self.n_step = max(1, int(n_step))
-        self.include_nstep_bootstrap = include_nstep_bootstrap
-        self.num_robots = int(num_robots) if num_robots is not None else None
-        self.robot_obs_dim = int(robot_obs_dim) if robot_obs_dim is not None else None
-        self.obs_token_repeats = max(1, int(obs_token_repeats))
-        if return_horizon not in {"clip", "trajectory"}:
-            raise ValueError("return_horizon must be one of {'clip', 'trajectory'}")
-        self.return_horizon = return_horizon
+        self.dataset = dataset
+        self.processor = processor
+        self.args = args
+        self.split = split
+        self.is_train = is_train
 
-    @staticmethod
-    def _as_bool(x):
-        if torch.is_tensor(x):
-            if x.numel() == 0:
-                return False
-            return bool(x.detach().float().max().item() > 0.0)
-        return bool(x)
+    def _iter_dataset(self) -> Iterable:
+        dataset = self.dataset
+        worker = get_worker_info()
+        worker_id = worker.id if worker is not None else 0
+        num_workers = worker.num_workers if worker is not None else 1
 
-    @staticmethod
-    def _terminal_pad_from(frame):
-        padded = dict(frame)
-        reward = frame["reward"]
-        done = frame["done"]
-        if torch.is_tensor(reward):
-            padded["reward"] = reward.new_zeros(())
-        else:
-            padded["reward"] = 0.0
-        if torch.is_tensor(done):
-            padded["done"] = torch.ones_like(done, dtype=done.dtype)
-        else:
-            padded["done"] = True
-        return padded
+        if hasattr(dataset, "shard") and num_workers > 1:
+            dataset = dataset.shard(num_shards=num_workers, index=worker_id, contiguous=False)
 
-    def _apply_done_termination(self, clip):
-        done_idx = None
-        for idx, frame in enumerate(clip):
-            if self._as_bool(frame["done"]):
-                done_idx = idx
-                break
-        if done_idx is None or done_idx == len(clip) - 1:
-            return clip
+        if self.is_train and hasattr(dataset, "shuffle"):
+            dataset = dataset.shuffle(seed=self.args.seed + worker_id, buffer_size=self.args.shuffle_buffer)
 
-        terminal = clip[done_idx]
-        out = list(clip[: done_idx + 1])
-        for _ in range(done_idx + 1, len(clip)):
-            out.append(self._terminal_pad_from(terminal))
-        return out
+        if hasattr(dataset, "__iter__") and not hasattr(dataset, "__len__"):
+            return iter(dataset)
 
-    def _discounted_return(self, frames):
-        ret = None
-        discount = 1.0
-        for frame in frames:
-            reward = frame["reward"]
-            if ret is None:
-                ret = torch.zeros_like(reward)
-            ret = ret + discount * reward
-            if self._as_bool(frame["done"]):
-                break
-            discount *= self.gamma
-        if ret is None:
-            ret = torch.tensor(0.0, dtype=torch.float32)
-        return ret
-
-    def _nstep_discounted_return(self, buffer, clip_start):
-        reward_start = clip_start + self.clip_len - 1
-        ret = None
-        discount = 1.0
-        done_n = False
-        for j in range(self.n_step):
-            idx = reward_start + j
-            if idx >= len(buffer):
-                done_n = True
-                break
-            frame = buffer[idx]
-            reward = frame["reward"]
-            if ret is None:
-                ret = torch.zeros_like(reward)
-            ret = ret + discount * reward
-            if self._as_bool(frame["done"]):
-                done_n = True
-                break
-            discount *= self.gamma
-
-        if ret is None:
-            ret = torch.tensor(0.0, dtype=torch.float32)
-            done_n = True
-        return ret, done_n
-
-    def _normalize_robot_tensors(self, robot_obs, adj):
-        if self.num_robots is None and self.robot_obs_dim is None:
-            return robot_obs, adj
-
-        cur_n = int(robot_obs.shape[0])
-        cur_d = int(robot_obs.shape[1])
-        tgt_n = self.num_robots if self.num_robots is not None else cur_n
-        tgt_d = self.robot_obs_dim if self.robot_obs_dim is not None else cur_d
-
-        if cur_n == tgt_n and cur_d == tgt_d:
-            return robot_obs, adj
-
-        out_obs = torch.zeros((tgt_n, tgt_d), dtype=robot_obs.dtype)
-        copy_n = min(cur_n, tgt_n)
-        copy_d = min(cur_d, tgt_d)
-        out_obs[:copy_n, :copy_d] = robot_obs[:copy_n, :copy_d]
-
-        out_adj = torch.zeros((tgt_n, tgt_n), dtype=adj.dtype)
-        copy_adj_n = min(cur_n, tgt_n)
-        out_adj[:copy_adj_n, :copy_adj_n] = adj[:copy_adj_n, :copy_adj_n]
-        return out_obs, out_adj
+        indices = range(worker_id, len(dataset), num_workers)
+        return (dataset[idx] for idx in indices)
 
     def __iter__(self):
-        if wds is None:
-            raise RuntimeError("webdataset is not installed.")
+        sample_count = 0
+        iterator = self._iter_dataset()
+        text_column = self.args.text_column
+        for sample in iterator:
+            if self.args.max_samples_per_split > 0 and sample_count >= self.args.max_samples_per_split:
+                break
 
-        try:
-            dataset = wds.WebDataset(
-                self.shards,
-                shardshuffle=100,
-                nodesplitter=getattr(wds, "split_by_node", None),
-                workersplitter=getattr(wds, "split_by_worker", None),
-            ).decode("pil")
-        except TypeError:
-            dataset = wds.WebDataset(self.shards, shardshuffle=100).decode("pil")
-            if hasattr(dataset, "split_by_node"):
-                dataset = dataset.split_by_node()
-            if hasattr(dataset, "split_by_worker"):
-                dataset = dataset.split_by_worker()
-
-        current_ep = None
-        buffer = []
-
-        def flush_buffer():
-            extra = 0
-            if self.include_nstep_bootstrap:
-                extra = self.n_step
-            elif self.include_next:
-                extra = 1
-            min_len = self.clip_len + extra
-            if len(buffer) < min_len:
-                return
-            max_i = len(buffer) - self.clip_len - extra
-            start_idxs = list(range(0, max_i + 1, self.clip_stride))
-            if len(start_idxs) > 1:
-                perm = torch.randperm(len(start_idxs)).tolist()
-                start_idxs = [start_idxs[p] for p in perm]
-
-            for i in start_idxs:
-                clip = self._apply_done_termination(buffer[i : i + self.clip_len])
-
-                raw_video = [f["image"] for f in clip]
-                raw_next_video = None
-                if self.include_next:
-                    next_clip = self._apply_done_termination(buffer[i + 1 : i + 1 + self.clip_len])
-                    raw_next_video = [f["image"] for f in next_clip]
-                nstep_clip = None
-                if self.include_nstep_bootstrap:
-                    nstep_clip = self._apply_done_termination(buffer[i + self.n_step : i + self.n_step + self.clip_len])
-                    raw_nstep_video = [f["image"] for f in nstep_clip]
-
-                text = clip[0]["text"]
-                inputs = preprocess_vlm_video_inputs(
-                    vlm_processor=self.vlm_processor,
-                    frames=raw_video,
-                    text=text,
-                    vl_backend=self.vl_backend,
-                    text_prompt_template=self.text_prompt_template,
-                    vlm_max_text_len=self.vlm_max_text_len,
-                    vlm_truncation=self.vlm_truncation,
-                    vlm_padding=self.vlm_padding,
-                    obs_token_repeats=self.obs_token_repeats,
-                    squeeze_batch_dim=True,
-                )
-                next_inputs = (
-                    preprocess_vlm_video_inputs(
-                        vlm_processor=self.vlm_processor,
-                        frames=raw_next_video,
-                        text=text,
-                        vl_backend=self.vl_backend,
-                        text_prompt_template=self.text_prompt_template,
-                        vlm_max_text_len=self.vlm_max_text_len,
-                        vlm_truncation=self.vlm_truncation,
-                        vlm_padding=self.vlm_padding,
-                        obs_token_repeats=self.obs_token_repeats,
-                        squeeze_batch_dim=True,
-                    )
-                    if self.include_next
-                    else None
-                )
-                nstep_inputs = (
-                    preprocess_vlm_video_inputs(
-                        vlm_processor=self.vlm_processor,
-                        frames=raw_nstep_video,
-                        text=text,
-                        vl_backend=self.vl_backend,
-                        text_prompt_template=self.text_prompt_template,
-                        vlm_max_text_len=self.vlm_max_text_len,
-                        vlm_truncation=self.vlm_truncation,
-                        vlm_padding=self.vlm_padding,
-                        obs_token_repeats=self.obs_token_repeats,
-                        squeeze_batch_dim=True,
-                    )
-                    if self.include_nstep_bootstrap
-                    else None
-                )
-
-                robot_obs = torch.stack([f["robot_obs"] for f in clip], dim=0)
-                adj = torch.stack([f["adj"] for f in clip], dim=0)
-                if self.include_next:
-                    next_robot_obs = torch.stack([f["robot_obs"] for f in next_clip], dim=0)
-                    next_adj = torch.stack([f["adj"] for f in next_clip], dim=0)
-                if self.include_nstep_bootstrap:
-                    nstep_robot_obs = torch.stack([f["robot_obs"] for f in nstep_clip], dim=0)
-                    nstep_adj = torch.stack([f["adj"] for f in nstep_clip], dim=0)
-
-                reward = clip[-1]["reward"]
-                done = clip[-1]["done"]
-                if self.return_horizon == "trajectory":
-                    traj = []
-                    for j in range(i + self.clip_len, len(buffer)):
-                        traj.append(buffer[j])
-                        if self._as_bool(buffer[j]["done"]):
-                            break
-                    returns = self._discounted_return(traj)
-                else:
-                    returns = self._discounted_return(clip)
-
-                out = {
-                    "inputs": inputs,
-                    "robot_obs": robot_obs,
-                    "adj": adj,
-                    "reward": reward.view(1),
-                    "returns": returns.view(1),
-                    "done": done.view(1),
-                    "shard_id": clip[0]["shard_id"],
-                }
-                if self.include_next:
-                    out["next_inputs"] = next_inputs
-                    out["next_robot_obs"] = next_robot_obs
-                    out["next_adj"] = next_adj
-                if self.include_nstep_bootstrap:
-                    nstep_returns, nstep_done = self._nstep_discounted_return(buffer, i)
-                    out["td_nstep_return"] = nstep_returns.view(1)
-                    out["td_nstep_done"] = torch.tensor([float(nstep_done)], dtype=torch.float32)
-                    out["td_nstep_inputs"] = nstep_inputs
-                    out["td_nstep_robot_obs"] = nstep_robot_obs
-                    out["td_nstep_adj"] = nstep_adj
-                yield out
-
-        for sample in dataset:
-            key = sample.get("__key__", "")
-            if isinstance(key, bytes):
-                key = key.decode("utf-8", errors="ignore")
-            shard_url = sample.get("__url__", "")
-            if isinstance(shard_url, bytes):
-                shard_url = shard_url.decode("utf-8", errors="ignore")
-            shard_id = os.path.basename(str(shard_url)) if shard_url else "unknown_shard"
-            ep_id = _extract_episode_id(key)
-
-            if current_ep is None:
-                current_ep = ep_id
-            if ep_id != current_ep:
-                yield from flush_buffer()
-                buffer = []
-                current_ep = ep_id
-
-            image = sample["image.png"]
-            robot_src = _as_numpy(sample[f"{self.robot_source}.npy"])
-            if hasattr(robot_src, "numpy"):
-                robot_src = robot_src.numpy()
-            robot_obs = torch.tensor(robot_src, dtype=torch.float32)
-
-            num_nodes = robot_obs.shape[0]
-            adj = _edge_index_to_adj(_as_numpy(sample["edge_index.npy"]), num_nodes)
-            # Normalize per-frame graph tensors so mixed-source datasets can still batch.
-            robot_obs, adj = self._normalize_robot_tensors(robot_obs, adj)
-
-            if self.text_mode == "raw":
-                text = self.text_prompt_template
-            else:
-                text = _as_numpy(sample["text_emb.npy"])
-                if hasattr(text, "numpy"):
-                    text = text.numpy()
-                text = torch.tensor(text, dtype=torch.float32)
-
-            reward = _reward_from_frame(sample, self.reward_reduce)
-            done = _done_from_frame(sample, self.done_reduce)
-            done_any, done_all = _done_any_all_from_frame(sample)
-
-            buffer.append(
-                {
-                    "image": image,
-                    "robot_obs": robot_obs,
-                    "adj": adj,
-                    "text": text,
-                    "reward": reward,
-                    "done": done,
-                    "done_any": done_any,
-                    "done_all": done_all,
-                    "shard_id": shard_id,
-                }
+            text_column = _resolve_text_column(sample, text_column)
+            sample_text = sample.get(text_column, "") if text_column is not None else ""
+            prompt = format_sample_text(self.args.text_prompt_template, sample_text)
+            video = sample[self.args.video_column]
+            frames = decode_video_frames(video, self.args.video_frames)
+            inputs = preprocess_vlm_video_inputs(
+                vlm_processor=self.processor,
+                frames=frames,
+                text=prompt,
+                vl_backend=self.args.vl_backend,
+                vlm_max_text_len=self.args.vl_max_text_len,
             )
+            label = _resolve_label_value(sample, self.args.label_column)
 
-        yield from flush_buffer()
+            sample_count += 1
+            yield {
+                "inputs": inputs,
+                "label": torch.tensor(label, dtype=torch.long),
+                "text": sample_text,
+            }
 
 
-def _collate_sequence_batch(batch):
-    def _stack_inputs(items):
-        out = {}
-        keys = items[0].keys()
-        for k in keys:
-            vals = [d[k] for d in items]
-            if torch.is_tensor(vals[0]):
-                if k == "pixel_values" and vals[0].dim() == 4:
-                    out[k] = torch.cat(vals, dim=0)
-                else:
-                    out[k] = torch.stack(vals, dim=0)
+def _stack_inputs(items):
+    output = {}
+    for key in items[0].keys():
+        values = [item[key] for item in items]
+        if torch.is_tensor(values[0]):
+            if key == "pixel_values" and values[0].dim() == 4:
+                output[key] = torch.cat(values, dim=0)
             else:
-                out[k] = vals
-        return out
+                output[key] = torch.stack(values, dim=0)
+        else:
+            output[key] = values
+    return output
 
-    out = {
-        "inputs": _stack_inputs([b["inputs"] for b in batch]),
-        "robot_obs": torch.stack([b["robot_obs"] for b in batch], dim=0),
-        "adj": torch.stack([b["adj"] for b in batch], dim=0),
-        "reward": torch.stack([b["reward"] for b in batch], dim=0).view(-1),
-        "done": torch.stack([b["done"] for b in batch], dim=0).view(-1),
+
+def collate_hf_batch(batch):
+    return {
+        "inputs": _stack_inputs([item["inputs"] for item in batch]),
+        "labels": torch.stack([item["label"] for item in batch], dim=0),
+        "texts": [item["text"] for item in batch],
     }
-    if "done_any" in batch[0]:
-        out["done_any"] = torch.stack([b["done_any"] for b in batch], dim=0).view(-1)
-    if "done_all" in batch[0]:
-        out["done_all"] = torch.stack([b["done_all"] for b in batch], dim=0).view(-1)
-    if "next_inputs" in batch[0]:
-        out["next_inputs"] = _stack_inputs([b["next_inputs"] for b in batch])
-        out["next_robot_obs"] = torch.stack([b["next_robot_obs"] for b in batch], dim=0)
-        out["next_adj"] = torch.stack([b["next_adj"] for b in batch], dim=0)
-    if "returns" in batch[0]:
-        out["returns"] = torch.stack([b["returns"] for b in batch], dim=0).view(-1)
-    if "td_nstep_return" in batch[0]:
-        out["td_nstep_return"] = torch.stack([b["td_nstep_return"] for b in batch], dim=0).view(-1)
-        out["td_nstep_done"] = torch.stack([b["td_nstep_done"] for b in batch], dim=0).view(-1)
-        out["td_nstep_inputs"] = _stack_inputs([b["td_nstep_inputs"] for b in batch])
-        out["td_nstep_robot_obs"] = torch.stack([b["td_nstep_robot_obs"] for b in batch], dim=0)
-        out["td_nstep_adj"] = torch.stack([b["td_nstep_adj"] for b in batch], dim=0)
-    return out
 
 
-class UniqueShardBatchDataset(IterableDataset):
-    def __init__(self, base_dataset, batch_size, max_queue_per_shard=16, drop_last=True):
-        self.base_dataset = base_dataset
-        self.batch_size = int(batch_size)
-        self.max_queue_per_shard = int(max_queue_per_shard)
-        self.drop_last = bool(drop_last)
-        if self.batch_size <= 0:
-            raise ValueError("batch_size must be > 0")
-        if self.max_queue_per_shard <= 0:
-            raise ValueError("max_queue_per_shard must be > 0")
+def _load_split(args, split: str):
+    from datasets import load_dataset
 
-    def __iter__(self):
-        per_shard = defaultdict(deque)
-
-        for sample in self.base_dataset:
-            shard_id = sample.get("shard_id", "unknown_shard")
-            q = per_shard[shard_id]
-            if len(q) >= self.max_queue_per_shard:
-                q.popleft()
-            q.append(sample)
-
-            while len(per_shard) >= self.batch_size:
-                shard_ids = list(per_shard.keys())
-                if len(shard_ids) > self.batch_size:
-                    perm = torch.randperm(len(shard_ids))[: self.batch_size].tolist()
-                    shard_ids = [shard_ids[i] for i in perm]
-                else:
-                    shard_ids = shard_ids[: self.batch_size]
-
-                batch = []
-                empty_keys = []
-                for sid in shard_ids:
-                    sq = per_shard[sid]
-                    batch.append(sq.popleft())
-                    if len(sq) == 0:
-                        empty_keys.append(sid)
-                for sid in empty_keys:
-                    del per_shard[sid]
-                yield batch
-
-        if not self.drop_last:
-            leftovers = []
-            for q in per_shard.values():
-                while len(q) > 0:
-                    leftovers.append(q.popleft())
-            if leftovers:
-                yield leftovers
-
-
-def _collate_prebatched_sequence_batch(batch):
-    return _collate_sequence_batch(batch)
-
-
-def webdataset_loader(args, shards, batch_size, num_workers):
-    shards = resolve_shards_spec(shards)
-    vlm_processor = None
-    if args.preprocess_in_loader:
-        from transformers import AutoConfig, AutoProcessor
-
-        vlm_processor = AutoProcessor.from_pretrained(
-            args.vl_model_name,
-            trust_remote_code=(args.vl_backend == "internvl"),
-        )
-        if args.vl_backend == "internvl":
-            cfg_hf = AutoConfig.from_pretrained(args.vl_model_name, trust_remote_code=True)
-            vision_cfg = getattr(cfg_hf, "vision_config", None)
-            image_size = getattr(vision_cfg, "image_size", None) if vision_cfg is not None else None
-            if isinstance(image_size, (tuple, list)):
-                if len(image_size) >= 2:
-                    media_size = {"height": int(image_size[0]), "width": int(image_size[1])}
-                elif len(image_size) == 1:
-                    size = int(image_size[0])
-                    media_size = {"height": size, "width": size}
-                else:
-                    media_size = None
-            elif image_size is not None:
-                size = int(image_size)
-                media_size = {"height": size, "width": size}
-            else:
-                media_size = None
-            if media_size is not None:
-                for proc_name in ("image_processor", "video_processor"):
-                    proc = getattr(vlm_processor, proc_name, None)
-                    if proc is None:
-                        continue
-                    if hasattr(proc, "size"):
-                        proc.size = dict(media_size)
-                    if hasattr(proc, "crop_size"):
-                        proc.crop_size = dict(media_size)
-        tokenizer = getattr(vlm_processor, "tokenizer", None)
-        if tokenizer is not None and "<obs>" not in tokenizer.get_vocab():
-            tokenizer.add_special_tokens({"additional_special_tokens": ["<obs>"]})
-
-    dataset = SequenceWebDataset(
-        shards=shards,
-        clip_len=args.clip_len,
-        clip_stride=args.clip_stride,
-        text_mode=args.text_mode,
-        robot_source=args.robot_source,
-        reward_reduce=args.reward_reduce,
-        done_reduce=args.done_reduce,
-        vl_backend=args.vl_backend,
-        vlm_processor=vlm_processor,
-        text_prompt_template=args.text_prompt_template,
-        include_next=(args.loss_type != "contrastive" and args.return_mode == "td"),
-        include_nstep_bootstrap=(args.loss_type != "contrastive" and args.return_mode == "nstep"),
-        vlm_max_text_len=args.vl_max_text_len,
-        vlm_truncation=(args.vl_backend not in {"llava_video", "internvl"}),
-        vlm_padding=("longest" if args.vl_backend in {"llava_video", "internvl"} else "max_length"),
-        gamma=getattr(args, "gamma", 0.99),
-        return_horizon=getattr(args, "return_horizon", "clip"),
-        n_step=getattr(args, "n_step", 1),
-        num_robots=getattr(args, "num_robots", None),
-        robot_obs_dim=getattr(args, "robot_obs_dim", None),
-        obs_token_repeats=getattr(args, "obs_summary_tokens", 1),
+    dataset = load_dataset(
+        args.dataset_name,
+        name=args.dataset_config or None,
+        split=split,
+        streaming=args.streaming,
+        trust_remote_code=args.trust_remote_code_dataset,
     )
-    if getattr(args, "shard_aware_batching", False):
-        dataset = UniqueShardBatchDataset(
-            base_dataset=dataset,
-            batch_size=batch_size,
-            max_queue_per_shard=getattr(args, "shard_batch_max_queue_per_shard", 16),
-            drop_last=True,
-        )
-        return DataLoader(dataset, batch_size=None, num_workers=num_workers, collate_fn=_collate_prebatched_sequence_batch)
+    return dataset
 
-    return DataLoader(dataset, batch_size=batch_size, num_workers=num_workers, collate_fn=_collate_sequence_batch)
+
+def hf_video_loader(args, split: str, batch_size: int, num_workers: int, is_train: bool):
+    dataset = _load_split(args, split)
+    label_names = _infer_label_names(dataset, args.label_column)
+    processor = build_vlm_processor(args)
+    wrapped = HFVideoClassificationDataset(dataset=dataset, processor=processor, args=args, split=split, is_train=is_train)
+    loader = DataLoader(
+        wrapped,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        collate_fn=collate_hf_batch,
+        pin_memory=torch.cuda.is_available(),
+    )
+    return loader, label_names

@@ -1,117 +1,52 @@
-# MA-VLCM (Multimodal Value Model)
+# Belief-VLM
 
-Backbone used here:
-- **Vision/Text**: DeepSeek VLM (DeepSeek-VL by default; DeepSeek-VL2 optional)
-- **Temporal**: Transformer encoder over frame embeddings
-- **Graph**: dense adjacency message passing over robot nodes per timestep
-- **Fusion**: MLP by default; optional MoE MLP
+`Belief-VLM` is now a supervised video-text classification pipeline for human-belief or action prediction tasks.
+The model takes a decoded video clip plus a text prompt, pools the VLM representation, and trains a classification head against dataset labels.
 
-This is a minimal, clean starting point for video + text + robot state + dynamic graph, with all key sizes configurable.
+## What changed
+- Removed the robot observation, graph, GNN, reward, TD, and contrastive training path from the main training pipeline.
+- Replaced the old WebDataset trajectory loader with a Hugging Face video dataset loader.
+- Switched the training objective to supervised classification with cross-entropy loss.
 
-## Install
-Conda (recommended on clusters):
-```
-bash setup_palmetto_env.sh ma-vlcm
-conda activate ma-vlcm
-```
-For DeepSeek-VL2 (MoE backbone), follow the official DeepSeek-VL2 repo install steps and then use `--vl_backend deepseek_vl2`.
+## Recommended loss
+For Something-Something V2, use standard multiclass cross-entropy:
 
-## WebDataset expected keys
-Each **frame** sample should contain these keys:
-- `image.png`
-- `obs.npy` and/or `state.npy`
-- `edge_index.npy`
-- `caption.txt`
-- `rewards.npy`
-- `dones.npy`
-
-The loader groups consecutive frames by episode id (parsed from `__key__` like `000000_000123`) and builds clips of length `--clip_len`.
-
-## Hugging Face-hosted shards
-If your data is stored on Hugging Face as `shard-*.tar`, use the same WebDataset loader by pointing `--train_shards` to HF `resolve` URLs.
-
-## Value loss (TD)
-We use TD(0) with reward from `rewards.npy`:
-```
-V_loss = MSE(V(s_t), r_t + gamma * (1 - done_t) * V(s_{t+1}))
+```text
+L = CrossEntropy(logits, class_label)
 ```
 
-## Run
-```
-python train.py \
-  --train_shards "/path/to/train/{00000..00099}.tar" \
-  --batch_size 4 \
-  --clip_len 8 \
-  --clip_stride 1 \
-  --robot_source obs \
-  --reward_reduce mean \
-  --done_reduce any \
-  --gamma 0.99 \
-  --text_mode raw \
-  --preprocess_in_loader \
-  --wandb \
-  --wandb_project ma-vlcm \
-  --wandb_run_name local-debug \
-  --epochs 2
-```
+This is the right default because each clip has one action label. If you see overconfidence, add light `--label_smoothing 0.05`.
 
-### Run from Hugging Face-hosted WebDataset shards
-```
-python train.py \
-  --train_shards "https://huggingface.co/datasets/your-org/your-dataset/resolve/main/shard-{000000..000099}.tar" \
-  --batch_size 4 \
-  --clip_len 8 \
-  --clip_stride 1 \
-  --robot_source obs \
-  --reward_reduce mean \
-  --done_reduce any \
-  --gamma 0.99 \
-  --text_mode raw \
-  --preprocess_in_loader \
-  --wandb \
-  --wandb_project ma-vlcm \
-  --wandb_run_name hf-debug \
-  --epochs 2
-```
+## Dataset support
+The default configuration targets the Hugging Face dataset `HuggingFaceM4/something_something_v2`.
+The loader expects:
+- a decoded `video` column
+- a text column such as `text`
+- an integer `label` column
 
-## Weights & Biases tracking
-- Login once on the machine: `wandb login`
-- Enable logging with `--wandb`
-- Useful options:
-  - `--wandb_project ma-vlcm`
-  - `--wandb_entity <team_or_user>`
-  - `--wandb_run_name <name>`
-  - `--wandb_tags ddp,llava,lora`
+You can override those with `--video_column`, `--text_column`, and `--label_column`.
 
-## Multi-GPU (FSDP)
-To shard the model across GPUs (instead of full model replica per GPU), launch with Accelerate and enable FSDP:
-```
-accelerate launch --num_processes 4 train.py \
-  --train_shards "/path/to/train/{00000..00099}.tar" \
-  --batch_size 4 \
-  --clip_len 8 \
-  --clip_stride 1 \
-  --robot_source obs \
-  --reward_reduce mean \
-  --done_reduce any \
-  --gamma 0.99 \
-  --text_mode raw \
-  --preprocess_in_loader \
-  --epochs 2 \
-  --fsdp \
-  --fsdp_min_num_params 1000000 \
-  --wandb \
-  --wandb_project ma-vlcm \
-  --wandb_run_name fsdp-run
-```
-Notes:
-- Use `--fsdp_cpu_offload` if GPU memory is tight (slower).
-- `--fsdp_min_num_params` controls how aggressively submodules are wrapped/sharded.
+## Training
+Single node, 2 GPUs:
 
-## DeepSeek VLM choices
-- Default: `--vl_backend deepseek_vl --vl_model_name deepseek-community/deepseek-vl-1.3b-base`
-- For MoE backbone: use `--vl_backend deepseek_vl2` and a DeepSeek-VL2 model name (requires DeepSeek-VL2 repo)
+```bash
+accelerate launch --num_processes 2 train.py \
+  --dataset_name HuggingFaceM4/something_something_v2 \
+  --train_split train \
+  --val_split validation \
+  --batch_size 2 \
+  --video_frames 8 \
+  --mixed_precision bf16 \
+  --grad_accum_steps 8 \
+  --vl_model_preset llava_onevision_0p5b \
+  --peft qlora \
+  --gradient_checkpointing \
+  --text_prompt_template "Classify the human action shown in this video. Text context: {text}" \
+  --save_dir checkpoints_belief
+```
 
 ## Notes
-- Images are preprocessed using the DeepSeek VLM processor (resizes/crops to the expected size).
-- If your `image.png` is already preprocessed for the model, set `--video_preprocessed` and feed tensors instead of PIL.
+- Something-Something V2 is a single-label action dataset, so classification is simpler and better aligned than TD/value regression.
+- The text field in this dataset is usually a template-style action description. Keep it if you want a video+text model; drop or randomize it only if you want to force a mostly-video classifier.
+- For large VLMs, start with `--peft qlora` or `--peft lora` instead of full fine-tuning.
+- Video decoding through Hugging Face datasets typically needs `datasets[video]` and a backend such as `torchcodec`.

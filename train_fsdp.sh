@@ -1,22 +1,21 @@
-accelerate launch --num_processes 8 train.py \
-  --train_shards "/scratch/shahils/data/wds_gotogoal/shard-{000000..000080}.tar" \
-  --batch_size 2 \
-  --clip_len 10 \
-  --clip_stride 10 \
-  --robot_source obs \
-  --reward_reduce mean \
-  --done_reduce any \
-  --gamma 0.99 \
-  --text_mode raw \
-  --return_mode td \
-  --n_step 50 \
-  --vl_backend llava_video \
-  --vl_model_name llava-hf/LLaVA-NeXT-Video-7B-hf \
-  --text_prompt_template "You are a critic model. You are given video frames, robot state sequences, and a graph adjacency per timestep for a robot team. Assess how good or bad the current policy is at the task and respond with a single scalar judgment." \
+VL_MODEL_PRESET="${VL_MODEL_PRESET:-llava_onevision_0p5b}"
+
+accelerate launch --num_processes 4 train.py \
+  --dataset_name HuggingFaceM4/something_something_v2 \
+  --train_split train \
+  --val_split validation \
+  --batch_size 1 \
+  --num_workers 0 \
+  --video_frames 8 \
+  --grad_accum_steps 16 \
+  --mixed_precision bf16 \
+  --allow_tf32 \
+  --epochs 5 \
+  --log_every 20 \
+  --vl_model_preset "$VL_MODEL_PRESET" \
+  --value_pooling hidden_mean \
+  --text_prompt_template "Classify the human action shown in this video. Text context: {text}" \
+  --peft lora \
+  --gradient_checkpointing \
   --fsdp \
-  --fsdp_min_num_params 1000000 \
-  --fsdp_use_orig_params \
-  --wandb \
-  --wandb_project ma-vlcm \
-  --wandb_run_name ma-vlcm-fsdp
-  # --mixed_precision fp32 \
+  --save_dir checkpoints_belief_fsdp

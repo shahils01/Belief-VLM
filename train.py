@@ -1,22 +1,21 @@
 import argparse
-import os
 import functools
 import inspect
+import json
+import os
 
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from accelerate import Accelerator
-
-try:
-    from accelerate.utils import DistributedDataParallelKwargs
-except Exception:
-    DistributedDataParallelKwargs = None
 
 try:
     from accelerate import DataLoaderConfiguration
 except Exception:
     DataLoaderConfiguration = None
+
+try:
+    from accelerate.utils import DistributedDataParallelKwargs
+except Exception:
+    DistributedDataParallelKwargs = None
 
 try:
     from accelerate.utils import FullyShardedDataParallelPlugin
@@ -33,301 +32,93 @@ except Exception:
     CPUOffload = None
     size_based_auto_wrap_policy = None
 
-from model import ModelConfig, MultimodalValueModel
-from data_loading import webdataset_loader
+from data_loading import hf_video_loader
+from model import ModelConfig, MultimodalBeliefModel
 
 
 def parse_args():
-    p = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser()
 
-    # Data / webdataset
-    p.add_argument("--train_shards", type=str, required=True, help="WebDataset shard pattern for training")
-    p.add_argument("--val_shards", type=str, default="", help="Optional WebDataset shard pattern for validation")
-    p.add_argument("--batch_size", type=int, default=8)
-    p.add_argument("--num_workers", type=int, default=4)
-    p.add_argument("--samples_per_epoch", type=int, default=10000)
-    p.add_argument("--text_mode", type=str, default="raw", choices=["raw", "emb"])
-    p.add_argument(
+    parser.add_argument("--dataset_name", type=str, default="HuggingFaceM4/something_something_v2")
+    parser.add_argument("--dataset_config", type=str, default="")
+    parser.add_argument("--train_split", type=str, default="train")
+    parser.add_argument("--val_split", type=str, default="validation")
+    parser.add_argument("--streaming", action="store_true")
+    parser.add_argument("--trust_remote_code_dataset", action="store_true", default=True)
+    parser.add_argument("--no_trust_remote_code_dataset", dest="trust_remote_code_dataset", action="store_false")
+    parser.add_argument("--video_column", type=str, default="video")
+    parser.add_argument("--text_column", type=str, default="text")
+    parser.add_argument("--label_column", type=str, default="label")
+    parser.add_argument("--max_samples_per_split", type=int, default=0)
+    parser.add_argument("--shuffle_buffer", type=int, default=512)
+
+    parser.add_argument("--batch_size", type=int, default=2)
+    parser.add_argument("--num_workers", type=int, default=0)
+    parser.add_argument("--video_frames", type=int, default=8)
+    parser.add_argument(
         "--text_prompt_template",
         type=str,
-        default="You are a critic model. You are given video frames, robot state sequences, and a graph adjacency per timestep for a robot team. Assess how good or bad the current policy is at the task and respond with a single scalar judgment.",
+        default="Classify the human action shown in this video. Text context: {text}",
     )
 
-    # Sequence building
-    p.add_argument("--clip_len", type=int, default=20)
-    p.add_argument("--clip_stride", type=int, default=1)
-    p.add_argument("--robot_source", type=str, default="obs", choices=["obs", "state"])
-    p.add_argument("--reward_reduce", type=str, default="mean", choices=["mean", "sum", "first"])
-    p.add_argument("--done_reduce", type=str, default="all", choices=["any", "all", "mean", "sum", "first"])
-    p.add_argument("--preprocess_in_loader", default=True, action="store_true", help="Use VLM image processor in dataloader")
-    p.add_argument("--debug_save_video", action="store_true", help="Save one video sample for debugging")
-    p.add_argument("--debug_out_dir", type=str, default="debug_samples")
-    p.add_argument("--debug_decode_text", action="store_true", help="Decode VLM token predictions for debugging")
-    p.add_argument("--debug_decode_every", type=int, default=200, help="Decode/print debug text every N steps")
-    p.add_argument("--debug_decode_max_tokens", type=int, default=32, help="Max decoded tokens for debug text")
+    parser.add_argument("--mixed_precision", type=str, default="no", choices=["no", "fp16", "bf16"])
+    parser.add_argument("--fsdp", action="store_true")
+    parser.add_argument("--fsdp_min_num_params", type=int, default=1_000_000)
+    parser.add_argument("--fsdp_cpu_offload", action="store_true")
+    parser.add_argument("--fsdp_use_orig_params", action="store_true")
+    parser.add_argument("--ddp_find_unused_parameters", action="store_true")
+    parser.add_argument("--grad_accum_steps", type=int, default=1)
+    parser.add_argument("--gradient_checkpointing", action="store_true")
+    parser.add_argument("--disable_vl_cache", action="store_true")
+    parser.add_argument("--allow_tf32", action="store_true")
+    parser.add_argument("--detect_anomaly", action="store_true")
 
-    # Value targets
-    p.add_argument("--gamma", type=float, default=0.99)
-    p.add_argument("--return_mode", type=str, default="td", choices=["td", "nstep"])
-    p.add_argument(
-        "--return_horizon",
-        type=str,
-        default="trajectory",
-        choices=["clip", "trajectory"],
-        help="For nstep-style targets: discounted return over clip or from clip start to terminal state in episode.",
-    )
-    p.add_argument("--n_step", type=int, default=50)
-    p.add_argument("--loss_type", type=str, default="td_contrastive", choices=["td", "contrastive", "td_contrastive"])
-    p.add_argument(
-        "--contrastive_objective",
-        type=str,
-        default="infonce",
-        choices=["point_to_set", "infonce"],
-        help="Contrastive objective used when loss_type includes contrastive.",
-    )
-    p.add_argument("--contrastive_margin", type=float, default=0.0)
-    p.add_argument("--infonce_temperature", type=float, default=0.1, help="Temperature for InfoNCE contrastive loss.")
-    p.add_argument(
-        "--infonce_topk_pos",
-        type=int,
-        default=0,
-        help="Top-K high-reward samples used as positive pool for InfoNCE (0 => B//2).",
-    )
-    p.add_argument(
-        "--contrastive_multidepth",
-        action="store_true",
-        help="Apply contrastive supervision on multiple hidden depths using attention-max pooled features.",
-    )
-    p.add_argument(
-        "--contrastive_depth_offsets",
-        type=str,
-        default="0",
-        help="Comma-separated hidden-layer offsets from final layer for multidepth contrastive (e.g., '0,4,8').",
-    )
-    p.add_argument(
-        "--contrastive_depth_weights",
-        type=str,
-        default="",
-        help="Optional comma-separated weights for multidepth losses. Empty => uniform.",
-    )
-    p.add_argument("--lambda_td", type=float, default=1.0, help="Weight for TD loss when using td_contrastive")
-    p.add_argument("--lambda_c", type=float, default=1.0, help="Weight for contrastive loss when using td_contrastive")
-    p.add_argument(
-        "--lambda_value_c",
-        type=float,
-        default=1.0,
-        help="Weight for value-head pairwise contrastive loss when loss_type=contrastive.",
-    )
-    p.add_argument(
-        "--shard_aware_batching",
-        action="store_true",
-        help="Build batches with at most one mini-trajectory per shard on each process.",
-    )
-    p.add_argument(
-        "--shard_batch_max_queue_per_shard",
-        type=int,
-        default=16,
-        help="Max queued samples per shard while waiting to form unique-shard batches.",
-    )
-
-    # Accelerate
-    p.add_argument("--mixed_precision", type=str, default="no", choices=["no", "fp16", "bf16"])
-    p.add_argument("--fsdp", action="store_true", help="Use FSDP to shard model parameters across GPUs")
-    p.add_argument("--fsdp_min_num_params", type=int, default=1_000_000, help="Auto-wrap threshold for FSDP")
-    p.add_argument("--fsdp_cpu_offload", action="store_true", help="Offload FSDP parameters to CPU when not in use")
-    p.add_argument("--fsdp_use_orig_params", action="store_true", help="Use FSDP use_orig_params to allow mixed requires_grad")
-    p.add_argument("--ddp_find_unused_parameters", action="store_true", help="Set DDP find_unused_parameters=True")
-    p.add_argument("--grad_accum_steps", type=int, default=1, help="Gradient accumulation steps")
-    p.add_argument("--gradient_checkpointing", action="store_true", help="Enable gradient checkpointing on VLM backbone")
-    p.add_argument("--disable_vl_cache", action="store_true", help="Disable VLM KV cache during training for lower memory")
-    p.add_argument("--allow_tf32", action="store_true", help="Enable TF32 matmul/cuDNN kernels on Ampere+ GPUs")
-    p.add_argument(
-        "--detect_anomaly",
-        action="store_true",
-        help="Enable torch autograd anomaly detection for debugging in-place/backward errors.",
-    )
-
-    # VLM backbone
-    p.add_argument(
+    parser.add_argument(
         "--vl_backend",
         type=str,
-        default="deepseek_vl",
-        choices=["deepseek_vl", "deepseek_vl2", "llava_video", "internvl"],
+        default="llava_video",
+        choices=["llava_video", "internvl"],
     )
-    p.add_argument("--vl_model_name", type=str, default="deepseek-community/deepseek-vl-1.3b-base")
-    p.add_argument(
+    parser.add_argument("--vl_model_name", type=str, default="llava-hf/llava-onevision-qwen2-0.5b-ov-hf")
+    parser.add_argument(
         "--vl_model_preset",
         type=str,
-        default="custom",
-        choices=[
-            "custom",
-            "llava_next_video_7b",
-            "llava_onevision_0p5b",
-            "internvl3_5_1b",
-            "internvl3_5_2b",
-            "internvl3_5_4b",
-            "internvl3_5_8b",
-        ],
-        help="Convenience preset for known VLM checkpoints.",
+        default="llava_onevision_0p5b",
+        choices=["custom", "llava_next_video_7b", "llava_onevision_0p5b", "internvl3_5_1b", "internvl3_5_2b", "internvl3_5_4b", "internvl3_5_8b"],
     )
-    p.add_argument("--vl_dtype", type=str, default="bfloat16", choices=["float16", "bfloat16", "float32"])
-    p.add_argument("--vl_max_text_len", type=int, default=256)
-    p.add_argument("--freeze_vl", action="store_true")
-    p.add_argument(
-        "--value_pooling",
-        type=str,
-        default="last_token_logits",
-        choices=["last_token_logits", "hidden_mean"],
-        help="Feature pooling strategy for value head; last_token_logits is more memory efficient.",
-    )
-    p.add_argument("--vl_logits_to_keep", type=int, default=0, help="If supported, keep logits for only last K tokens")
-    p.add_argument("--obs_summary_tokens", type=int, default=2, help="Number of temporal graph summary tokens injected as <obs>.")
+    parser.add_argument("--vl_dtype", type=str, default="bfloat16", choices=["float16", "bfloat16", "float32"])
+    parser.add_argument("--vl_max_text_len", type=int, default=256)
+    parser.add_argument("--freeze_vl", action="store_true")
+    parser.add_argument("--value_pooling", type=str, default="hidden_mean", choices=["hidden_mean", "last_token_logits"])
+    parser.add_argument("--vl_logits_to_keep", type=int, default=0)
+    parser.add_argument("--classifier_dropout", type=float, default=0.1)
+    parser.add_argument("--num_labels", type=int, default=0)
 
-    # PEFT / LoRA
-    p.add_argument("--peft", type=str, default="none", choices=["none", "lora", "qlora"])
-    p.add_argument("--lora_r", type=int, default=16)
-    p.add_argument("--lora_alpha", type=int, default=32)
-    p.add_argument("--lora_dropout", type=float, default=0.05)
-    p.add_argument("--lora_target_modules", type=str, default="")
-    p.add_argument("--lora_bias", type=str, default="none", choices=["none", "all", "lora_only"])
+    parser.add_argument("--peft", type=str, default="none", choices=["none", "lora", "qlora"])
+    parser.add_argument("--lora_r", type=int, default=16)
+    parser.add_argument("--lora_alpha", type=int, default=32)
+    parser.add_argument("--lora_dropout", type=float, default=0.05)
+    parser.add_argument("--lora_target_modules", type=str, default="")
+    parser.add_argument("--lora_bias", type=str, default="none", choices=["none", "all", "lora_only"])
 
-    # Video
-    p.add_argument("--video_channels", type=int, default=3)
-    p.add_argument("--video_height", type=int, default=224)
-    p.add_argument("--video_width", type=int, default=224)
-    p.add_argument("--video_frames", type=int, default=100)
-    p.add_argument("--video_preprocessed", action="store_true")
-    p.add_argument("--video_mean", type=float, nargs=3, default=(0.5, 0.5, 0.5))
-    p.add_argument("--video_std", type=float, nargs=3, default=(0.5, 0.5, 0.5))
+    parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--lr", type=float, default=2e-5)
+    parser.add_argument("--weight_decay", type=float, default=0.01)
+    parser.add_argument("--label_smoothing", type=float, default=0.0)
+    parser.add_argument("--max_grad_norm", type=float, default=1.0)
+    parser.add_argument("--log_every", type=int, default=20)
+    parser.add_argument("--save_dir", type=str, default="checkpoints_belief")
+    parser.add_argument("--resume_checkpoint", type=str, default="")
+    parser.add_argument("--load_model_only", action="store_true")
+    parser.add_argument("--seed", type=int, default=42)
 
-    # Robots / graph
-    p.add_argument("--num_robots", type=int, default=5)
-    p.add_argument("--robot_obs_dim", type=int, default=40)
+    parser.add_argument("--wandb", action="store_true")
+    parser.add_argument("--wandb_project", type=str, default="belief-vlm")
+    parser.add_argument("--wandb_entity", type=str, default="")
+    parser.add_argument("--wandb_run_name", type=str, default="")
+    parser.add_argument("--wandb_tags", type=str, default="")
 
-    # Text
-    p.add_argument("--text_dim", type=int, default=512)
-
-    # Model
-    p.add_argument("--d_model", type=int, default=256)
-    p.add_argument("--temporal_layers", type=int, default=2)
-    p.add_argument("--temporal_heads", type=int, default=4)
-    p.add_argument("--temporal_dropout", type=float, default=0.1)
-    p.add_argument("--gnn_layers", type=int, default=2)
-    p.add_argument("--fusion_hidden", type=int, default=512)
-    p.add_argument("--use_moe", action="store_true")
-    p.add_argument("--moe_experts", type=int, default=4)
-    p.add_argument("--moe_top_k", type=int, default=2)
-
-    # Train
-    p.add_argument("--epochs", type=int, default=500)
-    p.add_argument("--lr", type=float, default=3e-4)
-    p.add_argument("--weight_decay", type=float, default=0.01)
-    p.add_argument("--log_every", type=int, default=50)
-    p.add_argument("--save_dir", type=str, default="checkpoints_new")
-    p.add_argument("--resume_checkpoint", type=str, default="", help="Path to checkpoint .pt to resume training")
-    p.add_argument("--load_model_only", action="store_true", help="Load only model weights from checkpoint")
-    p.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging via Accelerate trackers")
-    p.add_argument("--wandb_project", type=str, default="ma-vlcm", help="W&B project name")
-    p.add_argument("--wandb_entity", type=str, default="", help="W&B entity/team (optional)")
-    p.add_argument("--wandb_run_name", type=str, default="", help="W&B run name (optional)")
-    p.add_argument("--wandb_tags", type=str, default="", help="Comma-separated W&B tags (optional)")
-
-    return p.parse_args()
-
-
-def _parse_int_csv(value: str):
-    if value is None:
-        return []
-    items = [x.strip() for x in str(value).split(",") if x.strip()]
-    out = []
-    for x in items:
-        out.append(int(x))
-    return out
-
-
-def _parse_float_csv(value: str):
-    if value is None or str(value).strip() == "":
-        return []
-    items = [x.strip() for x in str(value).split(",") if x.strip()]
-    out = []
-    for x in items:
-        out.append(float(x))
-    return out
-
-
-def _resolve_contrastive_depth_args(args):
-    offsets = _parse_int_csv(args.contrastive_depth_offsets)
-    if not offsets:
-        offsets = [0]
-    offsets = [max(0, int(o)) for o in offsets]
-    args.contrastive_depth_offsets_list = offsets
-
-    weights = _parse_float_csv(args.contrastive_depth_weights)
-    if weights and len(weights) != len(offsets):
-        raise ValueError(
-            "contrastive_depth_weights length must match contrastive_depth_offsets. "
-            f"Got {len(weights)} vs {len(offsets)}."
-        )
-    args.contrastive_depth_weights_list = weights
-
-
-def build_model(args, device):
-    cfg = ModelConfig(
-        vl_backend=args.vl_backend,
-        vl_model_name=args.vl_model_name,
-        vl_dtype=args.vl_dtype,
-        vl_max_text_len=args.vl_max_text_len,
-        freeze_vl=args.freeze_vl,
-        quantization_config=getattr(args, "quantization_config", None),
-        video_channels=args.video_channels,
-        video_height=args.video_height,
-        video_width=args.video_width,
-        video_frames=args.video_frames,
-        video_preprocessed=args.video_preprocessed,
-        video_mean=tuple(args.video_mean),
-        video_std=tuple(args.video_std),
-        num_robots=args.num_robots,
-        robot_obs_dim=args.robot_obs_dim,
-        text_dim=args.text_dim,
-        d_model=args.d_model,
-        temporal_layers=args.temporal_layers,
-        temporal_heads=args.temporal_heads,
-        temporal_dropout=args.temporal_dropout,
-        gnn_layers=args.gnn_layers,
-        fusion_hidden=args.fusion_hidden,
-        use_moe=args.use_moe,
-        moe_experts=args.moe_experts,
-        moe_top_k=args.moe_top_k,
-        debug_save_video=args.debug_save_video,
-        value_pooling=args.value_pooling,
-        logits_to_keep=args.vl_logits_to_keep,
-        obs_summary_tokens=args.obs_summary_tokens,
-        contrastive_multidepth=args.contrastive_multidepth,
-        contrastive_depth_offsets=tuple(getattr(args, "contrastive_depth_offsets_list", [0])),
-    )
-    return MultimodalValueModel(cfg, device=device)
-
-
-def _configure_memory_optimizations(model, args):
-    if args.allow_tf32 and torch.cuda.is_available():
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-
-    if args.disable_vl_cache and hasattr(model.backbone.model, "config") and hasattr(model.backbone.model.config, "use_cache"):
-        model.backbone.model.config.use_cache = False
-
-    if args.gradient_checkpointing:
-        fn = getattr(model.backbone.model, "gradient_checkpointing_enable", None)
-        if callable(fn):
-            try:
-                fn(gradient_checkpointing_kwargs={"use_reentrant": False})
-            except TypeError:
-                fn()
-        if hasattr(model.backbone.model, "enable_input_require_grads"):
-            try:
-                model.backbone.model.enable_input_require_grads()
-            except Exception:
-                pass
+    return parser.parse_args()
 
 
 def _resolve_vl_model_preset(args):
@@ -353,7 +144,7 @@ def _resolve_vl_model_preset(args):
 
 def _parse_lora_targets(args):
     if args.lora_target_modules:
-        return [t.strip() for t in args.lora_target_modules.split(",") if t.strip()]
+        return [item.strip() for item in args.lora_target_modules.split(",") if item.strip()]
     return ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 
 
@@ -363,10 +154,10 @@ def _apply_peft(model, args):
     try:
         from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
     except Exception as e:
-        raise RuntimeError("PEFT requested but 'peft' is not installed. `pip install peft`.") from e
+        raise RuntimeError("PEFT requested but `peft` is not installed.") from e
 
-    for p in model.backbone.model.parameters():
-        p.requires_grad = False
+    for param in model.backbone.model.parameters():
+        param.requires_grad = False
 
     if args.peft == "qlora":
         model.backbone.model = prepare_model_for_kbit_training(model.backbone.model)
@@ -383,25 +174,53 @@ def _apply_peft(model, args):
     return model
 
 
+def build_model(args, device):
+    cfg = ModelConfig(
+        vl_backend=args.vl_backend,
+        vl_model_name=args.vl_model_name,
+        vl_dtype=args.vl_dtype,
+        vl_max_text_len=args.vl_max_text_len,
+        freeze_vl=args.freeze_vl,
+        quantization_config=getattr(args, "quantization_config", None),
+        num_labels=args.num_labels,
+        classifier_dropout=args.classifier_dropout,
+        value_pooling=args.value_pooling,
+        logits_to_keep=args.vl_logits_to_keep,
+    )
+    return MultimodalBeliefModel(cfg, device=device)
+
+
+def _configure_memory_optimizations(model, args):
+    if args.allow_tf32 and torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
+    if args.disable_vl_cache and hasattr(model.backbone.model, "config") and hasattr(model.backbone.model.config, "use_cache"):
+        model.backbone.model.config.use_cache = False
+
+    if args.gradient_checkpointing:
+        fn = getattr(model.backbone.model, "gradient_checkpointing_enable", None)
+        if callable(fn):
+            try:
+                fn(gradient_checkpointing_kwargs={"use_reentrant": False})
+            except TypeError:
+                fn()
+        enable_inputs = getattr(model.backbone.model, "enable_input_require_grads", None)
+        if callable(enable_inputs):
+            try:
+                enable_inputs()
+            except Exception:
+                pass
+
+
 def _count_parameters(model):
     total = 0
     trainable = 0
-    for p in model.parameters():
-        n = p.numel()
-        total += n
-        if p.requires_grad:
-            trainable += n
+    for param in model.parameters():
+        total += param.numel()
+        if param.requires_grad:
+            trainable += param.numel()
     return total, trainable
-
-
-def _save_debug_video(batch, args, accelerator, tag="train"):
-    if not accelerator.is_main_process:
-        return
-    os.makedirs(args.debug_out_dir, exist_ok=True)
-    if "video" not in batch:
-        return
-    out_dir = os.path.join(args.debug_out_dir, f"{tag}_sample")
-    os.makedirs(out_dir, exist_ok=True)
 
 
 def _load_checkpoint_state(model, ckpt_state, args, accelerator):
@@ -409,305 +228,80 @@ def _load_checkpoint_state(model, ckpt_state, args, accelerator):
     try:
         unwrapped.load_state_dict(ckpt_state)
         return
-    except RuntimeError as e:
-        if args.peft not in {"lora", "qlora"}:
-            raise
-        accelerator.print(f"Strict checkpoint load failed under PEFT ({e}). Retrying with filtered non-strict load.")
-
-    # bitsandbytes quantized modules can expose version-dependent metadata keys.
-    quant_meta_tokens = ("absmax", "quant_map", "quant_state", "bitsandbytes__")
-    filtered_state = {k: v for k, v in ckpt_state.items() if not any(tok in k for tok in quant_meta_tokens)}
-
-    incompatible = unwrapped.load_state_dict(filtered_state, strict=False)
-    missing = list(getattr(incompatible, "missing_keys", []))
-    unexpected = list(getattr(incompatible, "unexpected_keys", []))
-
-    accelerator.print(
-        "Non-strict PEFT load complete: "
-        f"skipped_quant_meta={len(ckpt_state) - len(filtered_state)} "
-        f"missing_keys={len(missing)} unexpected_keys={len(unexpected)}"
-    )
-    if missing:
-        accelerator.print(f"First missing keys: {missing[:10]}")
-    if unexpected:
-        accelerator.print(f"First unexpected keys: {unexpected[:10]}")
-
-
-def _contrastive_pairwise_loss(scores, rewards, margin=0.0):
-    diff_r = rewards[:, None] - rewards[None, :]
-    diff_s = scores[:, None] - scores[None, :]
-    sign = diff_r.sign()
-    mask = sign.ne(0)
-    if mask.sum() == 0:
-        return scores.sum() * 0.0
-    signed = diff_s * sign
-    if margin != 0.0:
-        signed = signed - margin
-    loss = F.softplus(-signed)
-    return loss[mask].mean()
-
-
-def _contrastive_point_to_set_loss(embeddings, rewards, margin=0.0):
-    if embeddings.ndim != 2:
-        embeddings = embeddings.view(embeddings.shape[0], -1)
-    if embeddings.shape[0] < 2:
-        return embeddings.sum() * 0.0
-
-    bsz = embeddings.shape[0]
-    k = max(1, bsz // 2)
-    topk_idx = torch.topk(rewards.view(-1), k=k, largest=True).indices
-    desirable_set = embeddings[topk_idx]
-
-    dists = torch.cdist(embeddings, desirable_set, p=2)
-    scores = -dists.min(dim=1).values
-    return _contrastive_pairwise_loss(scores, rewards.view(-1), margin=margin)
-
-
-def _contrastive_infonce_loss(embeddings, rewards, temperature=0.1, topk_pos=0):
-    if embeddings.ndim != 2:
-        embeddings = embeddings.view(embeddings.shape[0], -1)
-    bsz = int(embeddings.shape[0])
-    if bsz < 3:
-        return embeddings.sum() * 0.0
-
-    if temperature <= 0:
-        raise ValueError("infonce_temperature must be > 0")
-
-    rewards = rewards.view(-1)
-    k = int(topk_pos) if int(topk_pos) > 0 else max(1, bsz // 2)
-    k = min(max(1, k), bsz)
-
-    # Reward-defined desirable pool.
-    topk_idx = torch.topk(rewards, k=k, largest=True).indices
-    desirable_mask = torch.zeros(bsz, dtype=torch.bool, device=embeddings.device)
-    desirable_mask[topk_idx] = True
-
-    z = F.normalize(embeddings, dim=-1)
-    sim = torch.matmul(z, z.t()) / float(temperature)  # [B, B]
-
-    losses = []
-    for i in range(bsz):
-        valid_neg_mask = torch.ones(bsz, dtype=torch.bool, device=embeddings.device)
-        valid_neg_mask[i] = False  # remove self from denominator
-        if valid_neg_mask.sum() == 0:
-            continue
-
-        pos_mask = desirable_mask.clone()
-        pos_mask[i] = False  # avoid trivial self-positive
-        if pos_mask.sum() == 0:
-            continue
-
-        # Select one positive from desirable pool: most similar desirable sample.
-        pos_candidates = pos_mask.nonzero(as_tuple=False).view(-1)
-        pos_sim = sim[i, pos_candidates]
-        pos_idx = pos_candidates[pos_sim.argmax()]
-
-        denom_idx = valid_neg_mask.nonzero(as_tuple=False).view(-1)
-        logits = sim[i, denom_idx]
-        target = (denom_idx == pos_idx).nonzero(as_tuple=False)
-        if target.numel() == 0:
-            continue
-        target = target.view(-1)[0]
-        losses.append(F.cross_entropy(logits.unsqueeze(0), target.unsqueeze(0)))
-
-    if not losses:
-        return embeddings.sum() * 0.0
-    return torch.stack(losses).mean()
-
-
-def _compute_contrastive_loss(embeddings, rewards, args):
-    if args.contrastive_objective == "infonce":
-        return _contrastive_infonce_loss(
-            embeddings,
-            rewards,
-            temperature=args.infonce_temperature,
-            topk_pos=args.infonce_topk_pos,
+    except RuntimeError:
+        incompatible = unwrapped.load_state_dict(ckpt_state, strict=False)
+        accelerator.print(
+            "Non-strict checkpoint load complete: "
+            f"missing_keys={len(getattr(incompatible, 'missing_keys', []))} "
+            f"unexpected_keys={len(getattr(incompatible, 'unexpected_keys', []))}"
         )
-    return _contrastive_point_to_set_loss(embeddings, rewards, margin=args.contrastive_margin)
 
 
-def _compute_multidepth_contrastive_loss(main_embeddings, depth_embeddings, rewards, args):
-    feats = []
-    if depth_embeddings:
-        feats.extend(depth_embeddings)
-    else:
-        feats.append(main_embeddings)
-
-    if args.contrastive_depth_weights_list:
-        weights = args.contrastive_depth_weights_list
-    else:
-        weights = [1.0 for _ in feats]
-
-    total_w = 0.0
-    total_loss = None
-    for w, feat in zip(weights, feats):
-        w = float(w)
-        if w <= 0.0:
-            continue
-        l = _compute_contrastive_loss(feat, rewards, args)
-        total_w += w
-        total_loss = (w * l) if total_loss is None else (total_loss + w * l)
-
-    if total_loss is None or total_w <= 0:
-        return main_embeddings.sum() * 0.0
-    return total_loss / total_w
-
-
-def run_epoch(model, loader, optimizer, accelerator, log_every, gamma, args, train=True, global_step=0):
+def run_epoch(model, loader, optimizer, accelerator, args, train, global_step):
     model.train() if train else model.eval()
-    raw_model = accelerator.unwrap_model(model)
-
-    loss_fn = nn.MSELoss()
     total_loss = 0.0
+    total_correct = 0
+    total_examples = 0
     step = 0
 
     for batch in loader:
         step += 1
-
-        def _move_inputs(inputs):
-            moved = {}
-            for k, v in inputs.items():
-                moved[k] = v.to(accelerator.device) if torch.is_tensor(v) else v
-            return moved
-
-        inputs = _move_inputs(batch["inputs"])
-        robot_obs = batch["robot_obs"].to(accelerator.device)
-        adj = batch["adj"].to(accelerator.device)
-        reward = batch["reward"].to(accelerator.device)
-        done = batch["done"].to(accelerator.device).float()
-        use_td = args.loss_type in {"td", "td_contrastive"} and args.return_mode == "td"
-        if use_td:
-            next_inputs = _move_inputs(batch["next_inputs"])
-            next_robot_obs = batch["next_robot_obs"].to(accelerator.device)
-            next_adj = batch["next_adj"].to(accelerator.device)
-        use_nstep_td = args.loss_type in {"td", "td_contrastive"} and args.return_mode == "nstep"
-        if use_nstep_td:
-            nstep_inputs = _move_inputs(batch["td_nstep_inputs"])
-            nstep_robot_obs = batch["td_nstep_robot_obs"].to(accelerator.device)
-            nstep_adj = batch["td_nstep_adj"].to(accelerator.device)
-            nstep_returns = batch["td_nstep_return"].to(accelerator.device)
-            nstep_done = batch["td_nstep_done"].to(accelerator.device).float()
-
-        if train and args.debug_save_video and not getattr(run_epoch, "_debug_saved", False):
-            _save_debug_video(batch, args, accelerator, tag="train")
-            run_epoch._debug_saved = True
+        labels = batch["labels"].to(accelerator.device)
+        inputs = {
+            key: value.to(accelerator.device) if torch.is_tensor(value) else value
+            for key, value in batch["inputs"].items()
+        }
 
         with accelerator.accumulate(model):
             with torch.set_grad_enabled(train):
-                next_pred = None
-                nstep_bootstrap_pred = None
-                if args.loss_type in {"td", "td_contrastive"} and args.return_mode == "td":
-                    with torch.no_grad():
-                        next_pred = raw_model(next_inputs, next_robot_obs, next_adj)
-                elif args.loss_type in {"td", "td_contrastive"} and args.return_mode == "nstep":
-                    with torch.no_grad():
-                        nstep_bootstrap_pred = raw_model(nstep_inputs, nstep_robot_obs, nstep_adj)
-
-                should_decode = (
-                    args.debug_decode_text
-                    and accelerator.is_main_process
-                    and (args.debug_decode_every > 0)
-                    and (step % args.debug_decode_every == 0)
+                outputs = model(inputs, return_features=False)
+                logits = outputs["logits"]
+                loss = torch.nn.functional.cross_entropy(
+                    logits,
+                    labels,
+                    label_smoothing=args.label_smoothing,
                 )
-                model_out = model(
-                    inputs,
-                    robot_obs,
-                    adj,
-                    return_debug=should_decode,
-                    return_features=args.loss_type in {"contrastive", "td_contrastive"},
-                    debug_max_tokens=args.debug_decode_max_tokens,
-                )
-                if isinstance(model_out, dict):
-                    pred = model_out["value"]
-                    vlm_feature = model_out.get("vlm_feature")
-                    vlm_multidepth_features = model_out.get("vlm_multidepth_features")
-                    debug_text = model_out.get("debug_text")
-                else:
-                    pred = model_out
-                    vlm_feature = None
-                    vlm_multidepth_features = None
-                    debug_text = None
-                contrastive_targets = (
-                    batch["returns"].to(accelerator.device)
-                    if args.return_mode == "nstep" and "returns" in batch
-                    else reward
-                )
-
-                if args.loss_type == "contrastive":
-                    if vlm_feature is None:
-                        raise RuntimeError("Contrastive loss requires model features; got None from model forward.")
-                    vlm_contrastive_loss = _compute_multidepth_contrastive_loss(
-                        vlm_feature, vlm_multidepth_features, contrastive_targets.view(-1), args
-                    )
-                    value_contrastive_loss = _contrastive_pairwise_loss(
-                        pred.view(-1), contrastive_targets.view(-1), margin=args.contrastive_margin
-                    )
-                    loss = args.lambda_c * vlm_contrastive_loss + args.lambda_value_c * value_contrastive_loss
-                else:
-                    if args.return_mode == "td":
-                        target = reward + gamma * (1.0 - done) * next_pred
-                    elif args.return_mode == "nstep":
-                        gamma_n = gamma ** int(args.n_step)
-                        target = nstep_returns + gamma_n * (1.0 - nstep_done) * nstep_bootstrap_pred
-                    else:
-                        target = batch["returns"].to(accelerator.device)
-                    td_loss = loss_fn(pred, target)
-                    if args.loss_type == "td_contrastive":
-                        if vlm_feature is None:
-                            raise RuntimeError("td_contrastive loss requires model features; got None from model forward.")
-                        contrastive_loss = _compute_multidepth_contrastive_loss(
-                            vlm_feature, vlm_multidepth_features, contrastive_targets.view(-1), args
-                        )
-                        loss = args.lambda_td * td_loss + args.lambda_c * contrastive_loss
-                    else:
-                        loss = td_loss
 
                 if train:
                     accelerator.backward(loss)
+                    if args.max_grad_norm > 0:
+                        accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
                     optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
 
-        if debug_text:
-            text0 = debug_text[0].replace("\n", " ").strip()
-            phase = "train" if train else "val"
-            accelerator.print(f"{phase} step={step} debug_decode[0]: {text0}")
+        preds = logits.argmax(dim=-1)
+        total_correct += (preds == labels).sum().item()
+        total_examples += labels.numel()
+        total_loss += loss.detach().item() * labels.size(0)
 
-        total_loss += loss.item()
-        if log_every > 0 and step % log_every == 0:
-            avg = total_loss / step
+        if args.log_every > 0 and step % args.log_every == 0:
+            avg_loss = total_loss / max(total_examples, 1)
+            avg_acc = total_correct / max(total_examples, 1)
             phase = "train" if train else "val"
-            accelerator.print(f"{phase} step={step} loss={avg:.4f}")
+            accelerator.print(f"{phase} step={step} loss={avg_loss:.4f} acc={avg_acc:.4f}")
             if args.wandb:
-                metrics = {f"{phase}/loss": avg}
+                metrics = {f"{phase}/loss": avg_loss, f"{phase}/acc": avg_acc}
                 if train:
                     metrics["train/lr"] = optimizer.param_groups[0]["lr"]
                     accelerator.log(metrics, step=global_step + step)
                 else:
                     accelerator.log(metrics, step=global_step)
 
-    avg_loss = total_loss / max(step, 1)
-    if args.wandb:
-        phase = "train" if train else "val"
-        metrics = {f"{phase}/epoch_loss": avg_loss}
-        accelerator.log(metrics, step=(global_step + step if train else global_step))
-
-    return avg_loss, (global_step + step if train else global_step)
+    avg_loss = total_loss / max(total_examples, 1)
+    avg_acc = total_correct / max(total_examples, 1)
+    return avg_loss, avg_acc, (global_step + step if train else global_step)
 
 
 def main():
     args = parse_args()
-    _resolve_contrastive_depth_args(args)
     _resolve_vl_model_preset(args)
     os.makedirs(args.save_dir, exist_ok=True)
 
     if args.detect_anomaly:
         torch.autograd.set_detect_anomaly(True)
 
-    if args.preprocess_in_loader:
-        args.video_preprocessed = True
-
     if args.peft == "qlora" and args.fsdp:
-        raise RuntimeError("FSDP + QLoRA is not supported. Use DDP (no --fsdp) or LoRA.")
+        raise RuntimeError("FSDP + QLoRA is not supported.")
 
     if args.peft == "qlora":
         try:
@@ -758,149 +352,122 @@ def main():
 
     ddp_kwargs = None
     if not args.fsdp and DistributedDataParallelKwargs is not None:
-        # Full fine-tuning can leave some backbone params outside the loss graph.
-        # PEFT with gradient checkpointing can also trip DDP unused-parameter
-        # detection when the checkpointed graph is partially pruned on a step.
-        auto_find_unused = (args.peft == "none") or (
-            args.peft in {"lora", "qlora"} and args.gradient_checkpointing
-        )
-        find_unused = bool(args.ddp_find_unused_parameters or auto_find_unused)
-        ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=find_unused)
+        ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=args.ddp_find_unused_parameters)
 
-    accelerator_kwargs = dict(
-        mixed_precision=args.mixed_precision,
-        fsdp_plugin=fsdp_plugin,
-        gradient_accumulation_steps=max(1, args.grad_accum_steps),
-        kwargs_handlers=[ddp_kwargs] if ddp_kwargs is not None else [],
-    )
-    # IterableDataset + variable-shaped samples across ranks can break with dispatch_batches=True.
+    dataloader_config = None
     if DataLoaderConfiguration is not None:
-        accelerator_kwargs["dataloader_config"] = DataLoaderConfiguration(dispatch_batches=False, split_batches=False)
-    else:
-        accel_params = inspect.signature(Accelerator).parameters
-        if "dispatch_batches" in accel_params:
-            accelerator_kwargs["dispatch_batches"] = False
-        if "split_batches" in accel_params:
-            accelerator_kwargs["split_batches"] = False
-    if args.wandb:
-        accelerator_kwargs["log_with"] = ["wandb"]
-    accelerator = Accelerator(**accelerator_kwargs)
+        dataloader_config = DataLoaderConfiguration(split_batches=False)
 
-    if args.detect_anomaly:
-        accelerator.print("Autograd anomaly detection enabled. Expect slower training and a more specific stack trace.")
+    accelerator = Accelerator(
+        mixed_precision=args.mixed_precision,
+        gradient_accumulation_steps=args.grad_accum_steps,
+        fsdp_plugin=fsdp_plugin,
+        kwargs_handlers=[ddp_kwargs] if ddp_kwargs is not None else None,
+        dataloader_config=dataloader_config,
+        log_with="wandb" if args.wandb else None,
+    )
 
     if args.wandb:
-        tags = [t.strip() for t in args.wandb_tags.split(",") if t.strip()]
-        wandb_kwargs = {}
+        init_kwargs = {"wandb": {"project": args.wandb_project}}
         if args.wandb_entity:
-            wandb_kwargs["entity"] = args.wandb_entity
+            init_kwargs["wandb"]["entity"] = args.wandb_entity
         if args.wandb_run_name:
-            wandb_kwargs["name"] = args.wandb_run_name
-        if tags:
-            wandb_kwargs["tags"] = tags
-        accelerator.init_trackers(project_name=args.wandb_project, config=vars(args), init_kwargs={"wandb": wandb_kwargs})
+            init_kwargs["wandb"]["name"] = args.wandb_run_name
+        if args.wandb_tags:
+            init_kwargs["wandb"]["tags"] = [item.strip() for item in args.wandb_tags.split(",") if item.strip()]
+        accelerator.init_trackers(project_name=args.wandb_project, init_kwargs=init_kwargs)
+
+    accelerator.print(f"dataset={args.dataset_name} train_split={args.train_split} val_split={args.val_split}")
+    train_loader, label_names = hf_video_loader(args, args.train_split, args.batch_size, args.num_workers, is_train=True)
+    val_loader = None
+    if args.val_split:
+        val_loader, val_label_names = hf_video_loader(args, args.val_split, args.batch_size, args.num_workers, is_train=False)
+        if label_names is None:
+            label_names = val_label_names
+
+    if args.num_labels <= 0:
+        if not label_names:
+            raise RuntimeError("Could not infer the number of labels from the dataset. Pass --num_labels explicitly.")
+        args.num_labels = len(label_names)
 
     model = build_model(args, device=accelerator.device)
     model = _apply_peft(model, args)
     _configure_memory_optimizations(model, args)
-    total_params, trainable_params = _count_parameters(model)
-    accelerator.print(
-        f"parameters total={total_params:,} trainable={trainable_params:,} "
-        f"peft={args.peft}"
-    )
-    if not args.fsdp and DistributedDataParallelKwargs is not None:
-        effective_find_unused = bool(
-            args.ddp_find_unused_parameters
-            or (args.peft == "none")
-            or (args.peft in {"lora", "qlora"} and args.gradient_checkpointing)
-        )
-        accelerator.print(
-            "DDP find_unused_parameters="
-            f"{effective_find_unused} "
-            "(auto-enabled for full fine-tuning and for PEFT with gradient checkpointing)"
-        )
 
-    if args.fsdp:
-        if args.mixed_precision == "bf16":
-            target_dtype = torch.bfloat16
-        elif args.mixed_precision == "fp16":
-            target_dtype = torch.float16
-        else:
-            target_dtype = torch.float32
-        model = model.to(dtype=target_dtype)
-        for p in model.parameters():
-            if p.dtype != target_dtype:
-                p.data = p.data.to(dtype=target_dtype)
-        for b in model.buffers():
-            if torch.is_floating_point(b) and b.dtype != target_dtype:
-                b.data = b.data.to(dtype=target_dtype)
+    total_params, trainable_params = _count_parameters(model)
+    accelerator.print(f"parameters total={total_params:,} trainable={trainable_params:,}")
 
     optimizer = torch.optim.AdamW(
-        (p for p in model.parameters() if p.requires_grad),
+        [param for param in model.parameters() if param.requires_grad],
         lr=args.lr,
         weight_decay=args.weight_decay,
     )
 
-    train_loader = webdataset_loader(args, args.train_shards, args.batch_size, args.num_workers)
-    val_loader = webdataset_loader(args, args.val_shards, args.batch_size, args.num_workers) if args.val_shards else None
-
+    model, optimizer, train_loader = accelerator.prepare(model, optimizer, train_loader)
     if val_loader is not None:
-        model, optimizer, train_loader, val_loader = accelerator.prepare(model, optimizer, train_loader, val_loader)
-    else:
-        model, optimizer, train_loader = accelerator.prepare(model, optimizer, train_loader)
+        val_loader = accelerator.prepare(val_loader)
 
-    start_epoch = 1
+    start_epoch = 0
     global_step = 0
-
     if args.resume_checkpoint:
-        ckpt_path = args.resume_checkpoint
-        if not os.path.isfile(ckpt_path):
-            raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
-        ckpt = torch.load(ckpt_path, map_location="cpu")
-
+        ckpt = torch.load(args.resume_checkpoint, map_location="cpu")
         _load_checkpoint_state(model, ckpt["model"], args, accelerator)
         if not args.load_model_only:
-            if "optimizer" not in ckpt:
-                raise KeyError("Checkpoint does not contain optimizer state. Use --load_model_only to ignore this.")
             optimizer.load_state_dict(ckpt["optimizer"])
-            start_epoch = int(ckpt.get("epoch", 0)) + 1
+            start_epoch = int(ckpt.get("epoch", -1)) + 1
             global_step = int(ckpt.get("global_step", 0))
+            accelerator.print(f"resumed checkpoint={args.resume_checkpoint} start_epoch={start_epoch}")
 
-        accelerator.print(
-            f"Resumed from {ckpt_path} (start_epoch={start_epoch}, global_step={global_step}, "
-            f"load_model_only={args.load_model_only})"
+    if accelerator.is_main_process and label_names:
+        with open(os.path.join(args.save_dir, "label_names.json"), "w", encoding="utf-8") as handle:
+            json.dump(label_names, handle, indent=2)
+
+    for epoch in range(start_epoch, args.epochs):
+        train_loss, train_acc, global_step = run_epoch(
+            model=model,
+            loader=train_loader,
+            optimizer=optimizer,
+            accelerator=accelerator,
+            args=args,
+            train=True,
+            global_step=global_step,
         )
-        accelerator.wait_for_everyone()
-
-    for epoch in range(start_epoch, args.epochs + 1):
-        train_loss, global_step = run_epoch(
-            model, train_loader, optimizer, accelerator, args.log_every, args.gamma, args, train=True, global_step=global_step
-        )
-        val_loss = None
-        if val_loader is not None:
-            val_loss, global_step = run_epoch(
-                model, val_loader, optimizer, accelerator, args.log_every, args.gamma, args, train=False, global_step=global_step
-            )
-
-        accelerator.print(f"epoch={epoch} train_loss={train_loss:.4f} val_loss={val_loss if val_loss is not None else 'n/a'}")
+        accelerator.print(f"epoch={epoch} train_loss={train_loss:.4f} train_acc={train_acc:.4f}")
         if args.wandb:
-            epoch_metrics = {"epoch": epoch, "train/epoch_loss": train_loss}
-            if val_loss is not None:
-                epoch_metrics["val/epoch_loss"] = val_loss
-            accelerator.log(epoch_metrics, step=global_step)
+            accelerator.log({"train/epoch_loss": train_loss, "train/epoch_acc": train_acc}, step=global_step)
 
-        if accelerator.is_main_process:
-            ckpt = {
-                "model": accelerator.get_state_dict(model),
-                "optimizer": optimizer.state_dict(),
-                "epoch": epoch,
-                "global_step": global_step,
-                "args": vars(args),
-            }
-            torch.save(ckpt, os.path.join(args.save_dir, f"ckpt_epoch_{epoch}.pt"))
+        if val_loader is not None:
+            with torch.no_grad():
+                val_loss, val_acc, _ = run_epoch(
+                    model=model,
+                    loader=val_loader,
+                    optimizer=optimizer,
+                    accelerator=accelerator,
+                    args=args,
+                    train=False,
+                    global_step=global_step,
+                )
+            accelerator.print(f"epoch={epoch} val_loss={val_loss:.4f} val_acc={val_acc:.4f}")
+            if args.wandb:
+                accelerator.log({"val/epoch_loss": val_loss, "val/epoch_acc": val_acc}, step=global_step)
+
         accelerator.wait_for_everyone()
+        if accelerator.is_main_process:
+            ckpt_path = os.path.join(args.save_dir, f"ckpt_epoch_{epoch}.pt")
+            torch.save(
+                {
+                    "model": accelerator.unwrap_model(model).state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "epoch": epoch,
+                    "global_step": global_step,
+                    "args": vars(args),
+                    "label_names": label_names,
+                },
+                ckpt_path,
+            )
+            accelerator.print(f"saved {ckpt_path}")
 
-    if args.wandb and hasattr(accelerator, "end_training"):
+    if args.wandb:
         accelerator.end_training()
 
 
