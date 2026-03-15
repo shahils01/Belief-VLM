@@ -11,6 +11,7 @@ class AttentionConfig:
                  num_attention_heads = 12,
                  num_hidden_layers  =12,
                  state_dim = 12,
+                 belief_dim = 3,
                  hidden_size = 768,
                  num_channels = 3,
                  image_size = 224,
@@ -24,6 +25,7 @@ class AttentionConfig:
         self.num_attention_heads = num_attention_heads
         self.num_hidden_layers = num_hidden_layers
         self.state_dim = state_dim
+        self.belief_dim = belief_dim
         self.hidden_size = hidden_size
         self.num_channels = num_channels
         self.image_size = image_size
@@ -62,10 +64,13 @@ class Embedding(nn.Module):
         # Embed the Propioreceptive state 
         self.state_embed = nn.Linear(config.state_dim, self.embed_dim)
 
+        # Belief Embedding:
+        self.belief_embed = nn.Linear(config.belief_dim, self.embed_dim)
+
         self.flatten = nn.Flatten(2)
 
         self.positional_embeddings = nn.Parameter(
-            torch.randn(1, self.num_positions, self.embed_dim),
+            torch.randn(1, self.num_positions +1, self.embed_dim),
             requires_grad=True
         )
 
@@ -77,7 +82,7 @@ class Embedding(nn.Module):
 
        
     
-    def forward(self, I_t, x_t):
+    def forward(self, I_t, x_t, b_t):
 
         _, _, height, width = I_t.shape # [B, C, H, W]
 
@@ -91,13 +96,20 @@ class Embedding(nn.Module):
         state_embeddings = state_embeddings.unsqueeze(1) #[B, 1, D]
         state_embeddings = state_embeddings.repeat(1, self.num_patches, 1) # [B, N, D]
 
+        # Prior Belief Embedding
+        belief_embeddings = self.belief_embed(b_t)
+        belief_embeddings = belief_embeddings.unsqueeze(1) + self.positional_embeddings[:, :1] # [B, 1, D]
+
+
         '''
-        Z = [p_i, Wx_{t}, PE(t)]
+        Z = [b_t, p_i, W*x_{t}, PE(t)]
         Embeddings =  patch features + state features + position embeds
         Each embedding has shape [batch, N, embed_dim]
         
         '''
-        embeddings = patch_embeddings + state_embeddings + self.positional_embeddings
+        patch_tokens = patch_embeddings + state_embeddings + self.positional_embeddings[:, 1:]
+
+        embeddings = torch.cat([belief_embeddings, patch_tokens], dim=1)
 
         return embeddings
 
@@ -165,12 +177,74 @@ class MultiHeadSelfAttention(nn.Module):
         x = x.transpose(1, 2).contiguous().view(batch_size, num_tokens, self.head * self.d_k)
 
 
-        pass
+        return self.proj_dropout(self.w_o(x))
+
+
+
+class AttentionPooling(nn.Module):
+
+    def __init__(self, config: AttentionConfig):
+        super().__init__()
+
+        self.embed_dim = config.hidden_size
+
+        # learned query vector dq
+        self.query = nn.Parameter(torch.randn(self.embed_dim))
+
+
+    def forward(self, t_i):
+        """
+        t_i : [B, N, D] patch tokens
+        """
+
+        # attention logits
+        scores = torch.matmul(t_i, self.query)     # [B, N]
+
+        alpha = torch.softmax(scores, dim=1)     # [B, N]
+
+        # weighted pooling
+        f_t = torch.sum(alpha.unsqueeze(-1) * t_i, dim=1)   # [B, D]
+
+        return f_t, alpha
+
+
+
+class TemporalContrastiveLoss(nn.Module):
+
+    def __init__(self, temperature=0.1, device = None):
+        super().__init__()
+        self.temperature = temperature
+        self.device = device
+
+    def forward(self, features):
+
+        # f_t: [B, T, D] t ~[0,1, ...,  T]
+        B, T, D = features.shape
+
+        features  = torch.nn.functional.normalize(features, dim=-1)
+
+        loss = 0.0
+
+        for t in range(T-1):
+
+            anchor = features[:, t] # [B, D]
+            positive = features[:, t+1] # [B, D]
+
+            # Similrity matrix [B, D] @ [B, D, T] = [B, T] (logits)
+            logits = torch.matmul(anchor, features.transpose(1,2))/ self.temperature
+
+            # Positive Index
+            labels = torch.full((B,), t+1, dtype=torch.long, device=self.device)
+
+            loss += torch.nn.functional.cross_entropy(logits, labels)
+
+        return loss / (T-1)
 
 
 
 
-class MLP(nn.module):
+
+class GaussianMLP(nn.module):
 
     def __init__(self, prior):
         
