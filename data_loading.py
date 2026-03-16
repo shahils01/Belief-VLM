@@ -234,9 +234,15 @@ class Ego4DConversationDataset(IterableDataset):
 
         if hasattr(dataset, "shard") and num_workers > 1:
             dataset = dataset.shard(num_shards=num_workers, index=worker_id, contiguous=False)
+
+        is_map_style = hasattr(dataset, "__len__")
         if self.is_train and hasattr(dataset, "shuffle"):
-            dataset = dataset.shuffle(seed=self.args.seed + worker_id, buffer_size=self.args.shuffle_buffer)
-        if hasattr(dataset, "__iter__") and not hasattr(dataset, "__len__"):
+            if is_map_style:
+                dataset = dataset.shuffle(seed=self.args.seed + worker_id)
+            else:
+                dataset = dataset.shuffle(seed=self.args.seed + worker_id, buffer_size=self.args.shuffle_buffer)
+
+        if hasattr(dataset, "__iter__") and not is_map_style:
             return iter(dataset)
         indices = range(worker_id, len(dataset), num_workers)
         return (dataset[idx] for idx in indices)
