@@ -13,6 +13,7 @@ class AttentionConfig:
                  state_dim = 12,
                  belief_dim = 3,
                  hidden_size = 768,
+                 latent_dim = 32,
                  num_channels = 3,
                  image_size = 224,
                  patch_size = 16,
@@ -27,6 +28,7 @@ class AttentionConfig:
         self.state_dim = state_dim
         self.belief_dim = belief_dim
         self.hidden_size = hidden_size
+        self.latent_dim = latent_dim
         self.num_channels = num_channels
         self.image_size = image_size
         self.patch_size = patch_size
@@ -70,7 +72,7 @@ class Embedding(nn.Module):
         self.flatten = nn.Flatten(2)
 
         self.positional_embeddings = nn.Parameter(
-            torch.randn(1, self.num_positions +1, self.embed_dim),
+            torch.randn(1, self.num_positions +2, self.embed_dim),
             requires_grad=True
         )
 
@@ -94,11 +96,12 @@ class Embedding(nn.Module):
         # State Embedings
         state_embeddings = self.state_embed(x_t) # [B, D]
         state_embeddings = state_embeddings.unsqueeze(1) #[B, 1, D]
-        state_embeddings = state_embeddings.repeat(1, self.num_patches, 1) # [B, N, D]
+        state_tokens = state_embeddings + self.positional_embeddings[:, 1:2]
+        # state_embeddings = state_embeddings.repeat(1, self.num_patches, 1) # [B, N, D]
 
         # Prior Belief Embedding
         belief_embeddings = self.belief_embed(b_t)
-        belief_embeddings = belief_embeddings.unsqueeze(1) + self.positional_embeddings[:, :1] # [B, 1, D]
+        belief_tokens = belief_embeddings.unsqueeze(1) + self.positional_embeddings[:, :1] # [B, 1, D]
 
 
         '''
@@ -107,11 +110,14 @@ class Embedding(nn.Module):
         Each embedding has shape [batch, N, embed_dim]
         
         '''
-        patch_tokens = patch_embeddings + state_embeddings + self.positional_embeddings[:, 1:]
+        patch_tokens = patch_embeddings  + self.positional_embeddings[:, 2:]
 
-        embeddings = torch.cat([belief_embeddings, patch_tokens], dim=1)
+        embeddings = torch.cat([belief_tokens, state_tokens,  patch_tokens], dim=1)
 
-        return embeddings
+        return embeddings, belief_tokens, state_tokens, patch_tokens
+
+
+
 
 
 class LayerNormalisation(nn.Module):
@@ -120,7 +126,7 @@ class LayerNormalisation(nn.Module):
         super().__init__()
 
         self.eps = config.layer_norm_eps
-        self.emed_dim = config.hidden_size
+        self.embed_dim = config.hidden_size
         self.alpha = nn.Parameter(torch.ones(self.embed_dim))
         self.bias = nn.Parameter(torch.zeros(self.embed_dim))
     
@@ -155,7 +161,7 @@ class MultiHeadSelfAttention(nn.Module):
     @staticmethod
     def attention(q, k, v, dropout:nn.Dropout = None):
         d_k = q.shape[-1]
-        scores = torch.matmul(q, k.transpose(-2, -1))/torch.sqrt(d_k)
+        scores = torch.matmul(q, k.transpose(-2, -1))/math.sqrt(d_k)
         scores = scores.softmax(dim = -1)
 
         if dropout is not None:
@@ -167,14 +173,14 @@ class MultiHeadSelfAttention(nn.Module):
 
         batch_size, num_tokens, _ = q.shape
 
-        query = self.w_q(q).view(batch_size, num_tokens, self.head, self.d_k).transpose(1, 2)
-        key = self.w_k(k).view(batch_size, num_tokens, self.head, self.d_k).transpose(1, 2)
-        value = self.w_v(v).view(batch_size, num_tokens, self.head, self.d_k).transpose(1, 2)
+        query = self.w_q(q).view(batch_size, num_tokens, self.num_heads, self.head_dim).transpose(1, 2)
+        key = self.w_k(k).view(batch_size, num_tokens, self.num_heads, self.head_dim).transpose(1, 2)
+        value = self.w_v(v).view(batch_size, num_tokens, self.num_heads, self.head_dim).transpose(1, 2)
 
         x, self.attention_score = MultiHeadSelfAttention.attention(query, key, value, self.attn_dropout)
 
         # Concatenate heads
-        x = x.transpose(1, 2).contiguous().view(batch_size, num_tokens, self.head * self.d_k)
+        x = x.transpose(1, 2).contiguous().view(batch_size, num_tokens, self.num_heads * self.head_dim)
 
 
         return self.proj_dropout(self.w_o(x))
@@ -206,6 +212,7 @@ class AttentionPooling(nn.Module):
         f_t = torch.sum(alpha.unsqueeze(-1) * t_i, dim=1)   # [B, D]
 
         return f_t, alpha
+
 
 
 
@@ -242,15 +249,135 @@ class TemporalContrastiveLoss(nn.Module):
 
 
 
+'''
+'''
 
+class GaussianPriorNet(nn.Module):
 
-class GaussianMLP(nn.module):
-
-    def __init__(self, prior):
-        
-        self.mlp = nn.Linear()
+    def __init__(self, config: AttentionConfig):
+        super().__init__()
+        self.mlp = nn.Linear(config.hidden_size, 2* config.latent_dim)
 
     
-    def forward(self, x):
-        mu, sigma = self.mlp()
-        return mu, sigma
+    def forward(self, b_t):
+        params = self.mlp(b_t.squeeze())
+        mu, log_sigma = params.chunk(2, dim=-1)
+        return mu, log_sigma
+    
+    # def sample_prior(self):
+    #     mu, log_sigma = self.forward()
+
+    #     eps = torch.randn_like(mu)
+    #     z_t = mu + torch.exp(log_sigma) * eps
+
+    #     return z_t
+
+
+
+class GaussianPosteriorNet(nn.Module):
+
+    def __init__(self,  config:AttentionConfig):
+        super().__init__()
+        self.mlp = nn.Linear(2* config.hidden_size, 2 *config.latent_dim)
+   
+    def forward(self, b_t, f_t):
+
+        # evidence: e_t = [b_t, f_t]
+        # b_t : [B, 1, D], f_t: [B, D]
+        e_t = torch.cat([b_t.squeeze(), f_t], dim=1)
+        params = self.mlp(e_t)
+        mu, log_sigma = params.chunk(2, dim=-1)
+        return mu, log_sigma
+    
+    # def sample_posterior(self):
+    #     mu, log_sigma = self.forward()
+
+    #     eps = torch.randn_like(mu)
+    #     z_t = mu + torch.exp(log_sigma) * eps
+
+    #     return z_t #[B, latent_dim]
+
+
+
+class GRUNet(nn.Module):
+
+    def __init__(self, input_size, hidden_size, num_layers = 2, dropout = 0.2, device = None):
+        super().__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.dropout = dropout
+        self.device = device
+
+        self.gru = nn.GRU(
+            input_size = self.input_size,
+            hidden_size = self.hidden_size,
+            num_layers = self.num_layers,
+            batch_first= True,
+            dropout= self.dropout,
+            device = self.device
+
+        )
+
+    def forward(self, b_prev, e_t, z_t):
+
+        # evidence: e_t = [b_t, f_t]
+        # b_t : [B, 1, D], f_t: [B, D]
+        # z_t : [B, latent_dim]
+        x = torch.cat([e_t, z_t], dim=-1)
+        x = x.unsqueeze(1)
+        
+        # GRU update
+        out, h = self.gru(x, b_prev)
+        
+        b_t = torch.relu(h[-1])
+
+        return b_t
+
+
+
+class ELBO_loss:
+
+    def __init__(self, beta=1.0, lambda_multi=0.5):
+        super().__init__()
+        
+        self.beta  = beta
+        self.lambda_multi = lambda_multi
+        self.mse = nn.MSELoss(reduction='mean')
+
+    def kl_divergence(self, mu_q, log_sigma_q, mu_p, log_sigma_p):
+
+
+        sigma_q = torch.exp(log_sigma_q)
+        sigma_p = torch.exp(log_sigma_p)
+
+        kl = torch.log(sigma_p / sigma_q) + \
+             (sigma_q**2 + (mu_q - mu_p)**2) / (2 * sigma_p**2) - 0.5
+
+        return kl.sum(dim=-1).mean()
+    
+    def forward(
+        self,
+        x_pred_1,
+        x_pred_5,
+        x_target_1,
+        x_target_5,
+        mu_q,
+        log_sigma_q,
+        mu_p,
+        log_sigma_p
+    ):
+
+        # one-step prediction loss
+        recon_1 = self.mse(x_pred_1, x_target_1)
+
+        # multi-step prediction loss
+        recon_5 = self.mse(x_pred_5, x_target_5)
+
+        # KL divergence
+        kl = self.kl_divergence(mu_q, log_sigma_q, mu_p, log_sigma_p)
+
+        # ELBO
+        loss = recon_1 + self.lambda_multi * recon_5 + self.beta * kl
+
+        return loss, recon_1, recon_5, kl
