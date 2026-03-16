@@ -2,6 +2,10 @@ VL_MODEL_PRESET="${VL_MODEL_PRESET:-internvl3_5_1b}"
 DATASET_NAME="${DATASET_NAME:-wofmanaf/ego4d-video}"
 VIDEO_ROOT="${VIDEO_ROOT:-}"
 
+# Required for this dataset in practice:
+# rows reference filenames like EGO_225484.npy, but the HF repo stores large archive parts.
+# Point VIDEO_ROOT at the locally extracted .npy directory.
+
 CMD=(
   accelerate launch --num_processes 2 train.py
   --dataset_name "$DATASET_NAME"

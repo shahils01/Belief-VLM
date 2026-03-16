@@ -10,7 +10,8 @@ Each sample is expected to contain:
 - `video`: a path-like string such as `EGO_1.npy`
 - `conversations`: user/assistant turns
 
-The loader resolves the `.npy` video file either from `--video_root` or by downloading it from the dataset repo with `huggingface_hub`.
+The loader resolves the `.npy` video file from `--video_root`.
+For `wofmanaf/ego4d-video`, this is effectively required because the Hugging Face repo stores the videos in large split archives rather than as standalone `.npy` files addressable by row.
 It samples `--video_frames` frames uniformly and masks the prompt tokens so the loss is applied only to the assistant answer.
 
 ## Loss
@@ -44,7 +45,8 @@ accelerate launch --num_processes 2 train.py \
   --save_dir checkpoints_belief_ego4d
 ```
 
-If you already downloaded the `.npy` files locally, pass `--video_root /path/to/ego4d_npy` to avoid per-sample hub fetches.
+Pass `--video_root /path/to/ego4d_npy`.
+For this dataset, HF-only per-sample download does not work because rows reference filenames like `EGO_225484.npy` while the repo stores archive parts such as `ego4d_video.z01`, `ego4d_video.z02`, and so on.
 
 ## Notes
 - `wofmanaf/ego4d-video` is not a classification dataset, so the old label-classifier path has been replaced with generative SFT.

@@ -104,16 +104,36 @@ def resolve_video_path(args, video_ref: str) -> str:
             return candidate
     try:
         from huggingface_hub import hf_hub_download
+        try:
+            from huggingface_hub.errors import EntryNotFoundError, RemoteEntryNotFoundError
+        except Exception:
+            EntryNotFoundError = RemoteEntryNotFoundError = tuple()
     except Exception as e:
         raise RuntimeError(
             "Could not resolve the Ego4D video file. Install `huggingface_hub` or pass --video_root pointing to the downloaded .npy files."
         ) from e
-    return hf_hub_download(
-        repo_id=args.dataset_name,
-        filename=video_ref,
-        repo_type="dataset",
-        revision=args.dataset_revision,
-    )
+    try:
+        return hf_hub_download(
+            repo_id=args.dataset_name,
+            filename=video_ref,
+            repo_type="dataset",
+            revision=args.dataset_revision,
+        )
+    except Exception as e:
+        msg = str(e)
+        if (
+            "404" in msg
+            or "Not Found" in msg
+            or (EntryNotFoundError and isinstance(e, EntryNotFoundError))
+            or (RemoteEntryNotFoundError and isinstance(e, RemoteEntryNotFoundError))
+        ):
+            raise RuntimeError(
+                f"Video file `{video_ref}` was referenced by the dataset row but does not exist as a standalone file "
+                f"in the HF dataset repo `{args.dataset_name}`. This repo appears to store the videos inside large "
+                "archive parts (for example `ego4d_video.z01`, `ego4d_video.z02`, ...), so HF-only per-sample "
+                "download will not work. Extract the archive locally and rerun with `--video_root /path/to/extracted_npy`."
+            ) from e
+        raise
 
 
 def _normalize_turn_role(role: str) -> str:
