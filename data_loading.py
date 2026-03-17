@@ -158,19 +158,19 @@ def build_sft_example(processor, frames, prompt, answer, vl_backend, max_text_le
 
     try:
         processor_kwargs = {
+            "text": [full_with_media],
             "videos": [frames],
             "return_tensors": "pt",
         }
-        processor_kwargs["text"] = [""]
         processor_kwargs["padding"] = "longest"
         processor_kwargs["truncation"] = False
         inputs = processor(**processor_kwargs)
     except TypeError:
         processor_kwargs = {
+            "text": [full_with_media],
             "images": [frames],
             "return_tensors": "pt",
         }
-        processor_kwargs["text"] = [""]
         processor_kwargs["padding"] = "longest"
         processor_kwargs["truncation"] = False
         inputs = processor(**processor_kwargs)
