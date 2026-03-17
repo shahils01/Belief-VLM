@@ -1,7 +1,7 @@
 VL_MODEL_PRESET="${VL_MODEL_PRESET:-internvl3_5_1b}"
 VIDEO_ROOT="${VIDEO_ROOT:-/scratch/shahils/hd_epic_dataset/videos/HD-EPIC/Videos}"
 ANNOTATION_PATH="${ANNOTATION_PATH:-}"
-METADATA_ROOT="${METADATA_ROOT:-/scratch/shahils/hd_epic_dataset/HD-EPIC Intermediate Data}"
+METADATA_ROOT="${METADATA_ROOT:-/scratch/shahils/hd_epic_dataset/HD-EPIC_Intermediate_Data}"
 QUESTION_COLUMN="${QUESTION_COLUMN:-question}"
 ANSWER_COLUMN="${ANSWER_COLUMN:-answer}"
 VIDEO_ID_COLUMN="${VIDEO_ID_COLUMN:-video_id}"
