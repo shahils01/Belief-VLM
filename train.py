@@ -346,7 +346,10 @@ def main():
 
     dataloader_config = None
     if DataLoaderConfiguration is not None:
-        dataloader_config = DataLoaderConfiguration(split_batches=False)
+        dataloader_config = DataLoaderConfiguration(
+            split_batches=False,
+            dispatch_batches=False,
+        )
 
     accelerator = Accelerator(
         mixed_precision=args.mixed_precision,
