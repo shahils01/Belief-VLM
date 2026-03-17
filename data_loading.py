@@ -7,6 +7,7 @@ from typing import Iterable
 import cv2
 import numpy as np
 import torch
+import torch.nn.functional as F
 from PIL import Image
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
@@ -111,10 +112,6 @@ def build_sft_example(processor, frames, prompt, answer, vl_backend, max_text_le
     if tokenizer is None:
         raise RuntimeError("The selected processor does not expose a tokenizer.")
 
-    tokenizer = getattr(processor, "tokenizer", None)
-    if tokenizer.pad_token is None and tokenizer.eos_token is not None:
-        tokenizer.pad_token = tokenizer.eos_token
-
     prompt_text = f"User: {prompt}\nAssistant:"
     full_text = f"{prompt_text} {answer}".strip()
 
@@ -132,29 +129,33 @@ def build_sft_example(processor, frames, prompt, answer, vl_backend, max_text_le
             return f"<image>\n{text}"
         return text
 
-    prompt_with_media = _add_media_token(prompt_text)
-    full_with_media = _add_media_token(full_text)
-
-    prompt_with_media = _add_media_token(prompt_text)
-    full_with_media = _add_media_token(full_text)
-
-    prompt_ids = tokenizer(
-        prompt_with_media,
-        return_tensors="pt",
-        padding=False,
-        truncation=True,
-        max_length=max_text_len,
-        add_special_tokens=True,
-    )["input_ids"][0]
-
-    text_inputs = tokenizer(
-        [full_with_media],
-        return_tensors="pt",
-        padding="max_length",
-        truncation=True,
-        max_length=max_text_len,
-        add_special_tokens=True,
-    )
+    if vl_backend == "internvl" and hasattr(processor, "apply_chat_template"):
+        user_message = {
+            "role": "user",
+            "content": [
+                {"type": "video"},
+                {"type": "text", "text": prompt},
+            ],
+        }
+        prompt_with_media = processor.apply_chat_template(
+            [user_message],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        full_with_media = processor.apply_chat_template(
+            [
+                user_message,
+                {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": answer}],
+                },
+            ],
+            tokenize=False,
+            add_generation_prompt=False,
+        )
+    else:
+        prompt_with_media = _add_media_token(prompt_text)
+        full_with_media = _add_media_token(full_text)
 
     try:
         processor_kwargs = {
@@ -175,14 +176,19 @@ def build_sft_example(processor, frames, prompt, answer, vl_backend, max_text_le
         processor_kwargs["truncation"] = False
         inputs = processor(**processor_kwargs)
 
+    prompt_ids = tokenizer(
+        prompt_with_media,
+        return_tensors="pt",
+        padding=False,
+        truncation=False,
+        add_special_tokens=True,
+    )["input_ids"][0]
+
     packed = {}
     for key, value in dict(inputs).items():
         if torch.is_tensor(value) and value.dim() > 0 and value.shape[0] == 1:
             value = value.squeeze(0)
         packed[key] = value
-
-    packed["input_ids"] = text_inputs["input_ids"].squeeze(0)
-    packed["attention_mask"] = text_inputs["attention_mask"].squeeze(0)
 
     pad_token_id = tokenizer.pad_token_id
     if pad_token_id is None:
@@ -465,6 +471,13 @@ def _stack_inputs(items):
         if torch.is_tensor(values[0]):
             if key == "pixel_values" and values[0].dim() == 4:
                 output[key] = torch.cat(values, dim=0)
+            elif key in {"input_ids", "attention_mask"}:
+                max_len = max(int(v.shape[0]) for v in values)
+                pad_value = 0
+                if key == "input_ids":
+                    pad_value = 0
+                padded = [F.pad(v, (0, max_len - int(v.shape[0])), value=pad_value) for v in values]
+                output[key] = torch.stack(padded, dim=0)
             else:
                 output[key] = torch.stack(values, dim=0)
         else:
@@ -473,9 +486,14 @@ def _stack_inputs(items):
 
 
 def collate_sft_batch(batch):
+    max_len = max(int(item["labels"].shape[0]) for item in batch)
+    labels = [
+        F.pad(item["labels"], (0, max_len - int(item["labels"].shape[0])), value=-100)
+        for item in batch
+    ]
     return {
         "inputs": _stack_inputs([item["inputs"] for item in batch]),
-        "labels": torch.stack([item["labels"] for item in batch], dim=0),
+        "labels": torch.stack(labels, dim=0),
     }
 
 
