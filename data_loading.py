@@ -132,23 +132,33 @@ def build_sft_example(processor, frames, prompt, answer, vl_backend, max_text_le
     full_with_media = _add_media_token(full_text)
 
     try:
-        inputs = processor(
-            text=[full_with_media],
-            videos=[frames],
-            return_tensors="pt",
-            padding="max_length",
-            truncation=True,
-            max_length=max_text_len,
-        )
+        processor_kwargs = {
+            "text": [full_with_media],
+            "videos": [frames],
+            "return_tensors": "pt",
+        }
+        if vl_backend == "internvl":
+            processor_kwargs["padding"] = "longest"
+            processor_kwargs["truncation"] = False
+        else:
+            processor_kwargs["padding"] = "max_length"
+            processor_kwargs["truncation"] = True
+            processor_kwargs["max_length"] = max_text_len
+        inputs = processor(**processor_kwargs)
     except TypeError:
-        inputs = processor(
-            text=[full_with_media],
-            images=[frames],
-            return_tensors="pt",
-            padding="max_length",
-            truncation=True,
-            max_length=max_text_len,
-        )
+        processor_kwargs = {
+            "text": [full_with_media],
+            "images": [frames],
+            "return_tensors": "pt",
+        }
+        if vl_backend == "internvl":
+            processor_kwargs["padding"] = "longest"
+            processor_kwargs["truncation"] = False
+        else:
+            processor_kwargs["padding"] = "max_length"
+            processor_kwargs["truncation"] = True
+            processor_kwargs["max_length"] = max_text_len
+        inputs = processor(**processor_kwargs)
 
     prompt_ids = tokenizer(
         prompt_with_media,
@@ -366,14 +376,11 @@ def _build_prompt_answer_from_metadata(record):
         )
         return "; ".join(parts)
 
-    prompt = (
-        "Summarize the egocentric video using the wearer trajectory and gaze behaviour. "
-        "Report what happens at the start, middle, and end."
-    )
-    answer = " | ".join(
+    prompt = "Summarize the wearer motion and gaze at the start, middle, and end of this egocentric video."
+    answer = "; ".join(
         [
-            f"video_id={record['video_id']}",
-            f"num_frames={len(entries)}",
+            f"id={record['video_id']}",
+            f"frames={len(entries)}",
             _frame_summary(sampled[0], "start"),
             _frame_summary(sampled[len(sampled) // 2], "middle"),
             _frame_summary(sampled[-1], "end"),
