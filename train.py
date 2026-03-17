@@ -31,14 +31,15 @@ except Exception:
     CPUOffload = None
     size_based_auto_wrap_policy = None
 
-from data_loading import ego4d_video_loader
+from data_loading import build_train_loader
 from model import ModelConfig, MultimodalBeliefModel
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--dataset_name", type=str, default="wofmanaf/ego4d-video")
+    parser.add_argument("--dataset_type", type=str, default="hd_epic_local", choices=["hd_epic_local"])
+    parser.add_argument("--dataset_name", type=str, default="hd_epic_local")
     parser.add_argument("--dataset_config", type=str, default="")
     parser.add_argument("--dataset_revision", type=str, default="main")
     parser.add_argument("--dataset_split", type=str, default="train")
@@ -50,8 +51,17 @@ def parse_args():
     parser.add_argument("--no_trust_remote_code_dataset", dest="trust_remote_code_dataset", action="store_false")
     parser.add_argument("--video_column", type=str, default="video")
     parser.add_argument("--video_root", type=str, default="")
+    parser.add_argument("--video_extension", type=str, default="mp4")
+    parser.add_argument("--annotation_path", type=str, default="")
+    parser.add_argument("--metadata_root", type=str, default="")
     parser.add_argument("--conversations_column", type=str, default="conversations")
     parser.add_argument("--id_column", type=str, default="id")
+    parser.add_argument("--video_id_column", type=str, default="video_id")
+    parser.add_argument("--video_path_column", type=str, default="video_path")
+    parser.add_argument("--participant_column", type=str, default="participant_id")
+    parser.add_argument("--question_column", type=str, default="question")
+    parser.add_argument("--answer_column", type=str, default="answer")
+    parser.add_argument("--options_column", type=str, default="options")
     parser.add_argument("--max_samples_per_split", type=int, default=0)
     parser.add_argument("--shuffle_buffer", type=int, default=256)
 
@@ -74,14 +84,14 @@ def parse_args():
     parser.add_argument(
         "--vl_backend",
         type=str,
-        default="llava_video",
+        default="internvl",
         choices=["llava_video", "internvl"],
     )
-    parser.add_argument("--vl_model_name", type=str, default="llava-hf/llava-onevision-qwen2-0.5b-ov-hf")
+    parser.add_argument("--vl_model_name", type=str, default="OpenGVLab/InternVL3_5-1B-HF")
     parser.add_argument(
         "--vl_model_preset",
         type=str,
-        default="llava_onevision_0p5b",
+        default="internvl3_5_1b",
         choices=["custom", "llava_next_video_7b", "llava_onevision_0p5b", "internvl3_5_1b", "internvl3_5_2b", "internvl3_5_4b", "internvl3_5_8b"],
     )
     parser.add_argument("--vl_dtype", type=str, default="bfloat16", choices=["float16", "bfloat16", "float32"])
@@ -361,9 +371,12 @@ def main():
             init_kwargs["wandb"]["tags"] = [item.strip() for item in args.wandb_tags.split(",") if item.strip()]
         accelerator.init_trackers(project_name=args.wandb_project, init_kwargs=init_kwargs)
 
-    accelerator.print(f"dataset={args.dataset_name} split={args.dataset_split} train_alias={args.train_split} val_alias={args.val_split}")
-    train_loader = ego4d_video_loader(args, args.train_split, args.batch_size, args.num_workers, is_train=True)
-    val_loader = ego4d_video_loader(args, args.val_split, args.batch_size, args.num_workers, is_train=False) if args.val_ratio > 0 else None
+    accelerator.print(
+        f"dataset_type={args.dataset_type} dataset={args.dataset_name} "
+        f"train_alias={args.train_split} val_alias={args.val_split}"
+    )
+    train_loader = build_train_loader(args, args.train_split, args.batch_size, args.num_workers, is_train=True)
+    val_loader = build_train_loader(args, args.val_split, args.batch_size, args.num_workers, is_train=False) if args.val_ratio > 0 else None
 
     model = build_model(args, device=accelerator.device)
     model = _apply_peft(model, args)

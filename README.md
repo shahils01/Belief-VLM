@@ -1,54 +1,83 @@
 # Belief-VLM
 
-`Belief-VLM` is now configured for supervised multimodal fine-tuning on `wofmanaf/ego4d-video`.
-The training objective is causal language modeling over the assistant response in each `conversations` sample, conditioned on the video plus the user prompt.
+`Belief-VLM` is now wired for local HD-EPIC training with an InternVL backbone.
+The training objective is causal language modeling over a text target conditioned on video frames.
 
-## Data format
-The current loader targets the Hugging Face dataset `wofmanaf/ego4d-video`.
-Each sample is expected to contain:
-- `id`
-- `video`: a path-like string such as `EGO_1.npy`
-- `conversations`: user/assistant turns
+## HD-EPIC modes
 
-The loader resolves the `.npy` video file from `--video_root`.
-For `wofmanaf/ego4d-video`, this is effectively required because the Hugging Face repo stores the videos in large split archives rather than as standalone `.npy` files addressable by row.
-It samples `--video_frames` frames uniformly and masks the prompt tokens so the loss is applied only to the assistant answer.
+The current pipeline supports two HD-EPIC modes.
 
-## Loss
-Training uses standard causal LM cross-entropy with label masking:
+1. Preferred: local annotation supervision
+- Provide `--annotation_path` with records containing a video id/path plus question/answer fields.
+- The model trains on `video + prompt -> answer`.
+
+2. Fallback: metadata-derived supervision
+- If `--annotation_path` is omitted, the loader pairs local MP4 files with `framewise_info.jsonl`.
+- It then generates a structured target text describing start/middle/end gaze and device motion.
+- This lets you train the framework immediately with the data you already downloaded.
+
+## Required local data
+
+- `--video_root`
+  Example: `/scratch/shahils/hd_epic_dataset/videos/HD-EPIC/Videos`
+- `--metadata_root`
+  Example: `/scratch/shahils/hd_epic_dataset/HD-EPIC Intermediate Data`
+
+The loader expects videos at:
 
 ```text
-L = CrossEntropy(next_token_logits, assistant_tokens_only)
+<video_root>/<participant>/<video_id>.mp4
 ```
 
-This is the correct objective for `ego4d-video` because the supervision is free-form text, not class IDs.
+and metadata at:
 
-## Train/val split
-The dataset exposes only a `train` split on Hugging Face.
-This code creates a deterministic validation holdout from that split using `--val_ratio` and the sample `id`.
+```text
+<metadata_root>/<participant>/<video_id>/framewise_info.jsonl
+```
+
+## Loss
+
+Training uses standard causal LM cross-entropy with prompt masking:
+
+```text
+L = CrossEntropy(next_token_logits, target_tokens_only)
+```
 
 ## Training
-Example DDP run:
+
+Example DDP run with metadata-derived supervision:
 
 ```bash
-accelerate launch --num_processes 2 train.py \
-  --dataset_name wofmanaf/ego4d-video \
-  --dataset_split train \
-  --val_ratio 0.01 \
-  --batch_size 1 \
-  --video_frames 8 \
-  --mixed_precision bf16 \
-  --grad_accum_steps 16 \
-  --vl_model_preset llava_onevision_0p5b \
-  --peft qlora \
-  --gradient_checkpointing \
-  --save_dir checkpoints_belief_ego4d
+cd /home/i2r/shahil_ws/Belief-VLM
+bash train_ddp.sh
 ```
 
-Pass `--video_root /path/to/ego4d_npy`.
-For this dataset, HF-only per-sample download does not work because rows reference filenames like `EGO_225484.npy` while the repo stores archive parts such as `ego4d_video.z01`, `ego4d_video.z02`, and so on.
+Example DDP run with an annotation manifest:
+
+```bash
+ANNOTATION_PATH=/path/to/hd_epic_manifest.jsonl \
+VIDEO_ROOT=/scratch/shahils/hd_epic_dataset/videos/HD-EPIC/Videos \
+METADATA_ROOT=/scratch/shahils/hd_epic_dataset/HD-EPIC Intermediate Data \
+bash train_ddp.sh
+```
+
+## Annotation manifest format
+
+If you have a local supervision file, a minimal JSONL record looks like:
+
+```json
+{"video_id":"P08-20240613-122900","participant_id":"P08","question":"What is the wearer doing?","answer":"The wearer walks through a room and looks around."}
+```
+
+The loader is configurable with:
+- `--question_column`
+- `--answer_column`
+- `--video_id_column`
+- `--video_path_column`
+- `--participant_column`
 
 ## Notes
-- `wofmanaf/ego4d-video` is not a classification dataset, so the old label-classifier path has been replaced with generative SFT.
-- The loader expects each `.npy` file to contain a time-major frame array. If the actual file layout differs, the frame decoder in `data_loading.py` will need one more adjustment.
-- For large models, `--peft qlora` or `--peft lora` is the practical starting point.
+
+- HD-EPIC intermediate metadata alone is not benchmark supervision, but it is enough to create a structured text target and train the VLM pipeline end-to-end.
+- The metadata fallback is a bootstrapping mode, not the final belief-modeling objective.
+- InternVL is the default backbone now.

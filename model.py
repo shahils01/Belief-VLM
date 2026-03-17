@@ -8,8 +8,8 @@ import torch.nn as nn
 
 @dataclass
 class ModelConfig:
-    vl_backend: str = "llava_video"
-    vl_model_name: str = "llava-hf/llava-onevision-qwen2-0.5b-ov-hf"
+    vl_backend: str = "internvl"
+    vl_model_name: str = "OpenGVLab/InternVL3_5-1B-HF"
     vl_dtype: str = "bfloat16"
     freeze_vl: bool = False
     quantization_config: Optional[Any] = None

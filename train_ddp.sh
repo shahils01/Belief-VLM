@@ -1,15 +1,23 @@
 VL_MODEL_PRESET="${VL_MODEL_PRESET:-internvl3_5_1b}"
-DATASET_NAME="${DATASET_NAME:-wofmanaf/ego4d-video}"
-VIDEO_ROOT="${VIDEO_ROOT:-}"
-
-# Required for this dataset in practice:
-# rows reference filenames like EGO_225484.npy, but the HF repo stores large archive parts.
-# Point VIDEO_ROOT at the locally extracted .npy directory.
+VIDEO_ROOT="${VIDEO_ROOT:-/scratch/shahils/hd_epic_dataset/videos/HD-EPIC/Videos}"
+ANNOTATION_PATH="${ANNOTATION_PATH:-}"
+METADATA_ROOT="${METADATA_ROOT:-/scratch/shahils/hd_epic_dataset/HD-EPIC Intermediate Data}"
+QUESTION_COLUMN="${QUESTION_COLUMN:-question}"
+ANSWER_COLUMN="${ANSWER_COLUMN:-answer}"
+VIDEO_ID_COLUMN="${VIDEO_ID_COLUMN:-video_id}"
+PARTICIPANT_COLUMN="${PARTICIPANT_COLUMN:-participant_id}"
 
 CMD=(
   accelerate launch --num_processes 2 train.py
-  --dataset_name "$DATASET_NAME"
-  --dataset_split train
+  --dataset_type hd_epic_local
+  --video_root "$VIDEO_ROOT"
+  --metadata_root "$METADATA_ROOT"
+  --annotation_path "$ANNOTATION_PATH"
+  --video_extension mp4
+  --question_column "$QUESTION_COLUMN"
+  --answer_column "$ANSWER_COLUMN"
+  --video_id_column "$VIDEO_ID_COLUMN"
+  --participant_column "$PARTICIPANT_COLUMN"
   --val_ratio 0.01
   --batch_size 1
   --num_workers 0
@@ -22,11 +30,7 @@ CMD=(
   --vl_model_preset "$VL_MODEL_PRESET"
   --peft qlora
   --gradient_checkpointing
-  --save_dir checkpoints_belief_ego4d_ddp
+  --save_dir checkpoints_belief_hd_epic_ddp
 )
-
-if [ -n "$VIDEO_ROOT" ]; then
-  CMD+=(--video_root "$VIDEO_ROOT")
-fi
 
 "${CMD[@]}"
