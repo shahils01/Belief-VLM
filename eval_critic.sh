@@ -1,4 +1,4 @@
-VL_MODEL_PRESET="${VL_MODEL_PRESET:-llava_onevision_0p5b}"  # llava_onevision_0p5b / llava_next_video_7b / internvl3_5_{1b,2b,4b,8b}
+VL_MODEL_PRESET="${VL_MODEL_PRESET:-internvl3_5_1b}"
 
 accelerate launch --num_processes 1 eval_critic.py \
   --eval_shards "https://huggingface.co/datasets/shulnak09/OFFROAD_MARL/tree/main/Varied_Traversability_new/*.tar" \

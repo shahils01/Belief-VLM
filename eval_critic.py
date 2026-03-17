@@ -133,18 +133,16 @@ def parse_args():
     p.add_argument(
         "--vl_backend",
         type=str,
-        default="llava_video",
-        choices=["deepseek_vl", "deepseek_vl2", "llava_video", "internvl"],
+        default="internvl",
+        choices=["internvl"],
     )
-    p.add_argument("--vl_model_name", type=str, default="llava-hf/llava-onevision-qwen2-0.5b-ov-hf")
+    p.add_argument("--vl_model_name", type=str, default="OpenGVLab/InternVL3_5-1B-HF")
     p.add_argument(
         "--vl_model_preset",
         type=str,
-        default="llava_onevision_0p5b",
+        default="internvl3_5_1b",
         choices=[
             "custom",
-            "llava_next_video_7b",
-            "llava_onevision_0p5b",
             "internvl3_5_1b",
             "internvl3_5_2b",
             "internvl3_5_4b",

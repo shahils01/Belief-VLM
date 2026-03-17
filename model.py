@@ -16,7 +16,7 @@ class ModelConfig:
     use_cache: bool = False
 
 
-class LLaVAVideoBackbone(nn.Module):
+class InternVLBackbone(nn.Module):
     @staticmethod
     def _normalize_media_size(image_size):
         if isinstance(image_size, (tuple, list)):
@@ -64,24 +64,14 @@ class LLaVAVideoBackbone(nn.Module):
                 from transformers.models.auto.modeling_auto import AutoModelForImageTextToText
             except Exception:
                 AutoModelForImageTextToText = None
-            try:
-                from transformers.models.auto.modeling_auto import AutoModelForVision2Seq
-            except Exception:
-                AutoModelForVision2Seq = None
-            try:
-                from transformers.models.llava_next_video import LlavaNextVideoForConditionalGeneration
-            except Exception:
-                LlavaNextVideoForConditionalGeneration = None
-            try:
-                from transformers.models.llava_onevision import LlavaOnevisionForConditionalGeneration
-            except Exception:
-                LlavaOnevisionForConditionalGeneration = None
         except Exception as e:
             raise ImportError("HF multimodal backbones require transformers installed.") from e
 
-        trust_remote_code = cfg.vl_backend == "internvl"
+        if cfg.vl_backend != "internvl":
+            raise RuntimeError(f"Unsupported vl_backend={cfg.vl_backend}. Belief-VLM now supports InternVL only.")
+
+        trust_remote_code = True
         cfg_hf = AutoConfig.from_pretrained(cfg.vl_model_name, trust_remote_code=trust_remote_code)
-        model_type = str(getattr(cfg_hf, "model_type", "")).lower()
 
         self.processor = AutoProcessor.from_pretrained(cfg.vl_model_name, trust_remote_code=trust_remote_code)
         self.tokenizer = getattr(self.processor, "tokenizer", None) or AutoTokenizer.from_pretrained(
@@ -94,24 +84,9 @@ class LLaVAVideoBackbone(nn.Module):
         if cfg.quantization_config is not None:
             model_kwargs["quantization_config"] = cfg.quantization_config
 
-        if cfg.vl_backend == "internvl":
-            model_kwargs["trust_remote_code"] = True
-            if AutoModelForImageTextToText is not None:
-                self.model = AutoModelForImageTextToText.from_pretrained(cfg.vl_model_name, **model_kwargs)
-            elif AutoModelForVision2Seq is not None:
-                self.model = AutoModelForVision2Seq.from_pretrained(cfg.vl_model_name, **model_kwargs)
-            else:
-                self.model = AutoModelForCausalLM.from_pretrained(cfg.vl_model_name, **model_kwargs)
-        elif model_type == "llava_next_video":
-            if LlavaNextVideoForConditionalGeneration is None:
-                raise ImportError("This transformers build does not provide LlavaNextVideoForConditionalGeneration.")
-            self.model = LlavaNextVideoForConditionalGeneration.from_pretrained(cfg.vl_model_name, **model_kwargs)
-        elif model_type == "llava_onevision":
-            if LlavaOnevisionForConditionalGeneration is None:
-                raise ImportError("This transformers build does not provide LlavaOnevisionForConditionalGeneration.")
-            self.model = LlavaOnevisionForConditionalGeneration.from_pretrained(cfg.vl_model_name, **model_kwargs)
-        elif AutoModelForVision2Seq is not None:
-            self.model = AutoModelForVision2Seq.from_pretrained(cfg.vl_model_name, **model_kwargs)
+        model_kwargs["trust_remote_code"] = True
+        if AutoModelForImageTextToText is not None:
+            self.model = AutoModelForImageTextToText.from_pretrained(cfg.vl_model_name, **model_kwargs)
         else:
             self.model = AutoModelForCausalLM.from_pretrained(cfg.vl_model_name, **model_kwargs)
 
@@ -141,7 +116,7 @@ class MultimodalBeliefModel(nn.Module):
     def __init__(self, cfg: ModelConfig, device: torch.device):
         super().__init__()
         self.cfg = cfg
-        self.backbone = LLaVAVideoBackbone(cfg, device=device)
+        self.backbone = InternVLBackbone(cfg, device=device)
         try:
             self._backbone_forward_params = set(inspect.signature(self.backbone.model.forward).parameters.keys())
         except Exception:

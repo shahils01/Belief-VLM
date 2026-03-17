@@ -85,14 +85,14 @@ def parse_args():
         "--vl_backend",
         type=str,
         default="internvl",
-        choices=["llava_video", "internvl"],
+        choices=["internvl"],
     )
     parser.add_argument("--vl_model_name", type=str, default="OpenGVLab/InternVL3_5-1B-HF")
     parser.add_argument(
         "--vl_model_preset",
         type=str,
         default="internvl3_5_1b",
-        choices=["custom", "llava_next_video_7b", "llava_onevision_0p5b", "internvl3_5_1b", "internvl3_5_2b", "internvl3_5_4b", "internvl3_5_8b"],
+        choices=["custom", "internvl3_5_1b", "internvl3_5_2b", "internvl3_5_4b", "internvl3_5_8b"],
     )
     parser.add_argument("--vl_dtype", type=str, default="bfloat16", choices=["float16", "bfloat16", "float32"])
     parser.add_argument("--vl_max_text_len", type=int, default=256)
@@ -126,13 +126,7 @@ def parse_args():
 
 
 def _resolve_vl_model_preset(args):
-    if args.vl_model_preset == "llava_next_video_7b":
-        args.vl_backend = "llava_video"
-        args.vl_model_name = "llava-hf/LLaVA-NeXT-Video-7B-32K-hf"
-    elif args.vl_model_preset == "llava_onevision_0p5b":
-        args.vl_backend = "llava_video"
-        args.vl_model_name = "llava-hf/llava-onevision-qwen2-0.5b-ov-hf"
-    elif args.vl_model_preset == "internvl3_5_1b":
+    if args.vl_model_preset == "internvl3_5_1b":
         args.vl_backend = "internvl"
         args.vl_model_name = "OpenGVLab/InternVL3_5-1B-HF"
     elif args.vl_model_preset == "internvl3_5_2b":
