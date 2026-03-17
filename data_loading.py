@@ -455,10 +455,6 @@ class LocalHD_EPICDataset(IterableDataset):
             yield {
                 "inputs": {k: v for k, v in packed.items() if k not in {"labels", "prompt_text", "answer_text"}},
                 "labels": packed["labels"],
-                "prompt_text": packed["prompt_text"],
-                "answer_text": packed["answer_text"],
-                "sample_id": sample_id,
-                "video_ref": video_path,
             }
 
 
@@ -480,10 +476,6 @@ def collate_sft_batch(batch):
     return {
         "inputs": _stack_inputs([item["inputs"] for item in batch]),
         "labels": torch.stack([item["labels"] for item in batch], dim=0),
-        "prompt_text": [item["prompt_text"] for item in batch],
-        "answer_text": [item["answer_text"] for item in batch],
-        "sample_id": [item["sample_id"] for item in batch],
-        "video_ref": [item["video_ref"] for item in batch],
     }
 
 

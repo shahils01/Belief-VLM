@@ -267,10 +267,6 @@ def run_epoch(model, loader, optimizer, accelerator, args, train, global_step):
         total_loss += loss.detach().item() * batch_size
         total_examples += batch_size
 
-        if (not train) and step == 1 and accelerator.is_main_process:
-            accelerator.print(f"val preview prompt: {batch['prompt_text'][0]}")
-            accelerator.print(f"val preview target: {batch['answer_text'][0]}")
-
         if args.log_every > 0 and step % args.log_every == 0:
             avg_loss = total_loss / max(total_examples, 1)
             phase = "train" if train else "val"
