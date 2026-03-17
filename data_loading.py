@@ -111,6 +111,10 @@ def build_sft_example(processor, frames, prompt, answer, vl_backend, max_text_le
     if tokenizer is None:
         raise RuntimeError("The selected processor does not expose a tokenizer.")
 
+    tokenizer = getattr(processor, "tokenizer", None)
+    if tokenizer.pad_token is None and tokenizer.eos_token is not None:
+        tokenizer.pad_token = tokenizer.eos_token
+
     prompt_text = f"User: {prompt}\nAssistant:"
     full_text = f"{prompt_text} {answer}".strip()
 
@@ -131,34 +135,8 @@ def build_sft_example(processor, frames, prompt, answer, vl_backend, max_text_le
     prompt_with_media = _add_media_token(prompt_text)
     full_with_media = _add_media_token(full_text)
 
-    try:
-        processor_kwargs = {
-            "text": [full_with_media],
-            "videos": [frames],
-            "return_tensors": "pt",
-        }
-        if vl_backend == "internvl":
-            processor_kwargs["padding"] = "longest"
-            processor_kwargs["truncation"] = False
-        else:
-            processor_kwargs["padding"] = "max_length"
-            processor_kwargs["truncation"] = True
-            processor_kwargs["max_length"] = max_text_len
-        inputs = processor(**processor_kwargs)
-    except TypeError:
-        processor_kwargs = {
-            "text": [full_with_media],
-            "images": [frames],
-            "return_tensors": "pt",
-        }
-        if vl_backend == "internvl":
-            processor_kwargs["padding"] = "longest"
-            processor_kwargs["truncation"] = False
-        else:
-            processor_kwargs["padding"] = "max_length"
-            processor_kwargs["truncation"] = True
-            processor_kwargs["max_length"] = max_text_len
-        inputs = processor(**processor_kwargs)
+    prompt_with_media = _add_media_token(prompt_text)
+    full_with_media = _add_media_token(full_text)
 
     prompt_ids = tokenizer(
         prompt_with_media,
@@ -169,11 +147,42 @@ def build_sft_example(processor, frames, prompt, answer, vl_backend, max_text_le
         add_special_tokens=True,
     )["input_ids"][0]
 
+    text_inputs = tokenizer(
+        [full_with_media],
+        return_tensors="pt",
+        padding="max_length",
+        truncation=True,
+        max_length=max_text_len,
+        add_special_tokens=True,
+    )
+
+    try:
+        processor_kwargs = {
+            "videos": [frames],
+            "return_tensors": "pt",
+        }
+        processor_kwargs["text"] = [""]
+        processor_kwargs["padding"] = "longest"
+        processor_kwargs["truncation"] = False
+        inputs = processor(**processor_kwargs)
+    except TypeError:
+        processor_kwargs = {
+            "images": [frames],
+            "return_tensors": "pt",
+        }
+        processor_kwargs["text"] = [""]
+        processor_kwargs["padding"] = "longest"
+        processor_kwargs["truncation"] = False
+        inputs = processor(**processor_kwargs)
+
     packed = {}
     for key, value in dict(inputs).items():
         if torch.is_tensor(value) and value.dim() > 0 and value.shape[0] == 1:
             value = value.squeeze(0)
         packed[key] = value
+
+    packed["input_ids"] = text_inputs["input_ids"].squeeze(0)
+    packed["attention_mask"] = text_inputs["attention_mask"].squeeze(0)
 
     pad_token_id = tokenizer.pad_token_id
     if pad_token_id is None:
