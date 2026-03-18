@@ -343,6 +343,20 @@ def _get_nested(record, path):
     return current
 
 
+def _get_hd_epic_video_entry(record):
+    inputs = record.get("inputs")
+    if not isinstance(inputs, dict):
+        return None
+    for key in ("video1", "video_1", "video", "clip"):
+        value = inputs.get(key)
+        if isinstance(value, dict):
+            return value
+    for key, value in inputs.items():
+        if isinstance(value, dict) and "id" in value:
+            return value
+    return None
+
+
 def _resolve_hd_epic_video_path(args, record):
     direct = _get_first(record, [args.video_path_column, "video_path", "clip_path", "path"])
     if direct:
@@ -356,7 +370,9 @@ def _resolve_hd_epic_video_path(args, record):
 
     video_id = _get_first(record, [args.video_id_column, "video_id", "clip_id", "uid", "video_uid"])
     if not video_id:
-        video_id = _get_nested(record, ["inputs", "video1", "id"])
+        video_entry = _get_hd_epic_video_entry(record)
+        if video_entry is not None:
+            video_id = video_entry.get("id")
     if not video_id:
         raise RuntimeError(
             f"Could not resolve a video path for record. Set --video_id_column/--video_path_column. Keys: {sorted(record.keys())}"
@@ -381,8 +397,9 @@ def _resolve_hd_epic_video_path(args, record):
 
 
 def _resolve_hd_epic_clip_window(record):
-    start_time = _get_nested(record, ["inputs", "video1", "start_time"])
-    end_time = _get_nested(record, ["inputs", "video1", "end_time"])
+    video_entry = _get_hd_epic_video_entry(record)
+    start_time = video_entry.get("start_time") if video_entry is not None else None
+    end_time = video_entry.get("end_time") if video_entry is not None else None
     if start_time in (None, ""):
         start_time = _get_first(record, ["start_time", "clip_start_time", "video_start_time"])
     if end_time in (None, ""):
