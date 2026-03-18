@@ -8,7 +8,7 @@ VIDEO_ID_COLUMN="${VIDEO_ID_COLUMN:-video_id}"
 PARTICIPANT_COLUMN="${PARTICIPANT_COLUMN:-participant_id}"
 
 CMD=(
-  accelerate launch --num_processes 8 train.py
+  accelerate launch --num_processes 1 train.py
   --dataset_type hd_epic_local
   --video_root "$VIDEO_ROOT"
   --metadata_root "$METADATA_ROOT"

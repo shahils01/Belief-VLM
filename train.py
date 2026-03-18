@@ -249,13 +249,13 @@ def run_epoch(model, loader, optimizer, accelerator, args, train, global_step):
         with accelerator.accumulate(model):
             with torch.set_grad_enabled(train):
                 outputs = model(inputs, labels=labels)
-                # debug_ids = accelerator.unwrap_model(model).generate(
-                #     inputs, max_new_tokens=args.eval_max_new_tokens
-                # )
-                # debug_text = accelerator.unwrap_model(model).backbone.tokenizer.batch_decode(
-                #     debug_ids, skip_special_tokens=False
-                # )
-                # accelerator.print(debug_text)
+                debug_ids = accelerator.unwrap_model(model).generate(
+                    inputs, max_new_tokens=args.eval_max_new_tokens
+                )
+                debug_text = accelerator.unwrap_model(model).backbone.tokenizer.batch_decode(
+                    debug_ids, skip_special_tokens=False
+                )
+                accelerator.print(debug_text)
                 loss = outputs["loss"]
                 if train:
                     accelerator.backward(loss)
