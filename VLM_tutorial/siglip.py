@@ -82,13 +82,69 @@ class SiglipVisionEmbeddings(nn.Module):
 
 class SiglipMLP(nn.Module):
 
-    def __init__(self, config:SiglipVisionConfig)
+    def __init__(self, config:SiglipVisionConfig):
         super().__init__()
 
         self.fc1 = nn.Linear(config.hidden_size, config.intermediate_size)
         self.fc2 = nn.Linear(config.intermediate_size, config.hidden_size)
 
-    def forward(self, hidden_state):
+    def forward(self, hidden_states):
+        hidden_states = self.fc1(hidden_states)
+
+        # Apply Non-linear activation Gelu
+        hidden_states = nn.functional.gelu(hidden_states, approximate="tanh")
+
+        hidden_states = self.fc2(hidden_states)
+        return hidden_states
+
+
+class SiglipAttention(nn.Module):
+
+    ''' 
+    ViT : contextual embeddings [B, N, D] -> [B, N, D] , but the contextual embeddings capture 
+    info about other patches as well. It is different in language model. In language model, each
+    token will have information of previous tokens. [t_2] -> [t_2, t_1]; [t_3] -> [t_3, t_2, t_1].
+    I -> [I]
+    like -> [I Like]
+    pizza -> [I like Pizza]
+    '''
+
+
+    def __init__(self, config:SiglipVisionConfig):
+        super().__init__()
+
+        self.config = config
+        self.embed_dim = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        self.head_dim = self.embed_dim // self.num_heads
+        self.scale = self.head_dim ** -0.5
+        self.attn_dropout = nn.Dropout(p=config.attention_dropout)
+        self.proj_dropout = nn.Dropout(p=config.proj_dropout)
+
+        assert self.embed_dim % self.num_heads == 0 
+
+        self.k_proj = nn.Linear(self.embed_dim, self.embed_dim)
+        self.v_proj = nn.Linear(self.embed_dim, self.embed_dim)
+        self.q_proj = nn.Linear(self.embed_dim, self.embed_dim)
+        self.out_proj = nn.Linear(self.embed_dim, self.embed_dim)
+
+
+    def forward(self, hidden_states):
+
+        # Shape: [B, N, D]
+        batch_size, seq_length, _ = hidden_states.size()
+
+        # Shapes remain unchanges (adding parameters only): [B, N, D] 
+        query_states = self.q_proj(hidden_states)
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
+
+        ''' 
+        [B, N, D]  @ [D, D] -> [B, N, D] -> [B, N, N-head,  D_head]        
+        '''
+        query_states = query_states.view(batch_size,  seq_length, self.num_heads, self.head_dim).transpose(1,2)
+        key_states = key_states.view(batch_size,  seq_length, self.num_heads, self.head_dim).transpose(1,2)
+        value_states = value_states.view(batch_size,  seq_length, self.num_heads, self.head_dim).transpose(1,2)
 
 
 class SiglipEncoderLayer(nn.Module):
