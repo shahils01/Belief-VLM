@@ -2,6 +2,7 @@ import csv
 import hashlib
 import json
 import os
+from glob import glob
 from typing import Iterable
 
 import cv2
@@ -122,7 +123,8 @@ def decode_mp4_frames(video_path: str, num_frames: int, start_time_sec=None, end
     clip_frame_count = max(1, end_frame - start_frame + 1)
     wanted = {start_frame + idx for idx in _sample_frame_indices(clip_frame_count, num_frames)}
     frames = []
-    cur = 0
+    cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+    cur = start_frame
     while True:
         ok, frame = cap.read()
         if not ok:
@@ -243,12 +245,34 @@ def _stable_fold(value: str, seed: int) -> float:
     return int(digest[:8], 16) / 0xFFFFFFFF
 
 
-def _load_records(args):
-    path = args.annotation_path
-    if not path:
-        raise RuntimeError(
-            "HD-EPIC training requires --annotation_path pointing to a local json/jsonl/csv supervision file."
-        )
+def _expand_annotation_paths(path_spec: str):
+    if not path_spec:
+        return []
+
+    raw_parts = [part.strip() for part in path_spec.split(",") if part.strip()]
+    if not raw_parts:
+        raw_parts = [path_spec]
+
+    expanded = []
+    for part in raw_parts:
+        if os.path.isdir(part):
+            expanded.extend(sorted(glob(os.path.join(part, "*.json"))))
+            expanded.extend(sorted(glob(os.path.join(part, "*.jsonl"))))
+            expanded.extend(sorted(glob(os.path.join(part, "*.csv"))))
+        else:
+            expanded.append(part)
+
+    # Preserve order while removing duplicates.
+    deduped = []
+    seen = set()
+    for path in expanded:
+        if path not in seen:
+            deduped.append(path)
+            seen.add(path)
+    return deduped
+
+
+def _load_single_records(path: str):
     if not os.path.isfile(path):
         raise FileNotFoundError(f"Annotation file not found: {path}")
 
@@ -285,6 +309,27 @@ def _load_records(args):
             return list(csv.DictReader(handle))
 
     raise RuntimeError("Unsupported annotation file format. Use .json, .jsonl, or .csv")
+
+
+def _load_records(args):
+    path = args.annotation_path
+    if not path:
+        raise RuntimeError(
+            "HD-EPIC training requires --annotation_path pointing to a local json/jsonl/csv supervision file."
+        )
+    paths = _expand_annotation_paths(path)
+    if not paths:
+        raise FileNotFoundError(f"No annotation files found for: {path}")
+
+    records = []
+    for one_path in paths:
+        task_name = os.path.splitext(os.path.basename(one_path))[0]
+        for record in _load_single_records(one_path):
+            if isinstance(record, dict):
+                record = dict(record)
+                record.setdefault("task_name", task_name)
+            records.append(record)
+    return records
 
 
 def _discover_hd_epic_records(args):
