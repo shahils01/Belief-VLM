@@ -351,9 +351,27 @@ def _get_hd_epic_video_entry(record):
         value = inputs.get(key)
         if isinstance(value, dict):
             return value
-    for key, value in inputs.items():
-        if isinstance(value, dict) and "id" in value:
-            return value
+
+    def _find_video_entry(obj):
+        if isinstance(obj, dict):
+            if "id" in obj and any(key in obj for key in ("start_time", "end_time", "path", "video_path")):
+                return obj
+            if "id" in obj:
+                return obj
+            for value in obj.values():
+                found = _find_video_entry(value)
+                if found is not None:
+                    return found
+        elif isinstance(obj, list):
+            for value in obj:
+                found = _find_video_entry(value)
+                if found is not None:
+                    return found
+        return None
+
+    found = _find_video_entry(inputs)
+    if found is not None:
+        return found
     return None
 
 
