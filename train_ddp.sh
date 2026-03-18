@@ -1,6 +1,6 @@
 VL_MODEL_PRESET="${VL_MODEL_PRESET:-internvl3_5_2b}"
 VIDEO_ROOT="${VIDEO_ROOT:-/scratch/shahils/hd_epic_dataset/videos/HD-EPIC/Videos}"
-ANNOTATION_PATH="${ANNOTATION_PATH:-}"
+ANNOTATION_PATH="${ANNOTATION_PATH:-/scratch/shahils/hd_epic_dataset/hd-epic-annotations/vqa-benchmark/fine_grained_why_recognition.json}"
 METADATA_ROOT="${METADATA_ROOT:-/scratch/shahils/hd_epic_dataset/HD-EPIC Intermediate Data}"
 QUESTION_COLUMN="${QUESTION_COLUMN:-question}"
 ANSWER_COLUMN="${ANSWER_COLUMN:-answer}"
@@ -10,7 +10,7 @@ DEBUG_GENERATE="${DEBUG_GENERATE:-0}"
 DEBUG_GENERATE_EVERY="${DEBUG_GENERATE_EVERY:-0}"
 
 CMD=(
-  accelerate launch --num_processes 1 train.py
+  accelerate launch --num_processes 8 train.py
   --dataset_type hd_epic_local
   --video_root "$VIDEO_ROOT"
   --metadata_root "$METADATA_ROOT"
