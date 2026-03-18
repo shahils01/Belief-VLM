@@ -56,6 +56,30 @@ def _sample_frame_indices(num_frames: int, num_samples: int):
     return np.linspace(0, num_frames - 1, num=num_samples, dtype=np.int64).tolist()
 
 
+def _parse_timecode_seconds(value):
+    if value in (None, ""):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip()
+    if not text:
+        return None
+    parts = text.split(":")
+    try:
+        if len(parts) == 3:
+            hours = float(parts[0])
+            minutes = float(parts[1])
+            seconds = float(parts[2])
+            return hours * 3600.0 + minutes * 60.0 + seconds
+        if len(parts) == 2:
+            minutes = float(parts[0])
+            seconds = float(parts[1])
+            return minutes * 60.0 + seconds
+        return float(text)
+    except ValueError:
+        return None
+
+
 def _frame_to_pil(frame):
     if isinstance(frame, Image.Image):
         return frame.convert("RGB")
@@ -77,22 +101,33 @@ def _frame_to_pil(frame):
     return Image.fromarray(frame).convert("RGB")
 
 
-def decode_mp4_frames(video_path: str, num_frames: int):
+def decode_mp4_frames(video_path: str, num_frames: int, start_time_sec=None, end_time_sec=None):
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise RuntimeError(f"Could not open video: {video_path}")
 
     frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
     if frame_count <= 0:
         cap.release()
         raise RuntimeError(f"Video has no readable frames: {video_path}")
 
-    wanted = set(_sample_frame_indices(frame_count, num_frames))
+    start_frame = 0
+    end_frame = frame_count - 1
+    if fps > 0.0:
+        if start_time_sec is not None:
+            start_frame = max(0, min(frame_count - 1, int(start_time_sec * fps)))
+        if end_time_sec is not None:
+            end_frame = max(start_frame, min(frame_count - 1, int(end_time_sec * fps)))
+    clip_frame_count = max(1, end_frame - start_frame + 1)
+    wanted = {start_frame + idx for idx in _sample_frame_indices(clip_frame_count, num_frames)}
     frames = []
     cur = 0
     while True:
         ok, frame = cap.read()
         if not ok:
+            break
+        if cur > end_frame:
             break
         if cur in wanted:
             frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -232,6 +267,13 @@ def _load_records(args):
         if isinstance(obj, list):
             return obj
         if isinstance(obj, dict):
+            if obj and all(isinstance(value, dict) for value in obj.values()):
+                records = []
+                for sample_id, value in obj.items():
+                    item = dict(value)
+                    item.setdefault("id", sample_id)
+                    records.append(item)
+                return records
             for key in ("data", "samples", "annotations", "items"):
                 value = obj.get(key)
                 if isinstance(value, list):
@@ -292,6 +334,15 @@ def _get_first(record, keys):
     return None
 
 
+def _get_nested(record, path):
+    current = record
+    for key in path:
+        if not isinstance(current, dict) or key not in current:
+            return None
+        current = current[key]
+    return current
+
+
 def _resolve_hd_epic_video_path(args, record):
     direct = _get_first(record, [args.video_path_column, "video_path", "clip_path", "path"])
     if direct:
@@ -304,6 +355,8 @@ def _resolve_hd_epic_video_path(args, record):
                 return candidate
 
     video_id = _get_first(record, [args.video_id_column, "video_id", "clip_id", "uid", "video_uid"])
+    if not video_id:
+        video_id = _get_nested(record, ["inputs", "video1", "id"])
     if not video_id:
         raise RuntimeError(
             f"Could not resolve a video path for record. Set --video_id_column/--video_path_column. Keys: {sorted(record.keys())}"
@@ -327,15 +380,36 @@ def _resolve_hd_epic_video_path(args, record):
     )
 
 
+def _resolve_hd_epic_clip_window(record):
+    start_time = _get_nested(record, ["inputs", "video1", "start_time"])
+    end_time = _get_nested(record, ["inputs", "video1", "end_time"])
+    if start_time in (None, ""):
+        start_time = _get_first(record, ["start_time", "clip_start_time", "video_start_time"])
+    if end_time in (None, ""):
+        end_time = _get_first(record, ["end_time", "clip_end_time", "video_end_time"])
+    return _parse_timecode_seconds(start_time), _parse_timecode_seconds(end_time)
+
+
 def _build_prompt_answer(args, record):
     prompt = _get_first(record, [args.question_column, "question", "prompt", "instruction", "query"])
     answer = _get_first(record, [args.answer_column, "answer", "response", "label", "caption", "narration"])
-
+    choices = _get_first(record, [args.options_column, "options", "choices", "answer_options"])
+    correct_idx = _get_first(record, ["correct_idx", "answer_idx", "label_idx"])
     prompt = _normalize_text(prompt) or DEFAULT_PROMPT
     answer = _normalize_text(answer)
-    options = _get_first(record, [args.options_column, "options", "choices", "answer_options"])
-    if options:
-        options_text = _normalize_text(options)
+    if not answer and choices and correct_idx not in (None, ""):
+        normalized_choices = list(choices) if isinstance(choices, (list, tuple)) else [choices]
+        try:
+            idx = int(correct_idx)
+            if 0 <= idx < len(normalized_choices):
+                answer = _normalize_text(normalized_choices[idx])
+            elif 1 <= idx <= len(normalized_choices):
+                answer = _normalize_text(normalized_choices[idx - 1])
+        except (TypeError, ValueError):
+            pass
+
+    if choices:
+        options_text = _normalize_text(choices)
         if options_text:
             prompt = f"{prompt}\nOptions:\n{options_text}"
 
@@ -447,7 +521,13 @@ class LocalHD_EPICDataset(IterableDataset):
                 prompt, answer = _build_prompt_answer(self.args, record)
             else:
                 prompt, answer = _build_prompt_answer_from_metadata(record)
-            frames = decode_mp4_frames(video_path, self.args.video_frames)
+            start_time_sec, end_time_sec = _resolve_hd_epic_clip_window(record)
+            frames = decode_mp4_frames(
+                video_path,
+                self.args.video_frames,
+                start_time_sec=start_time_sec,
+                end_time_sec=end_time_sec,
+            )
             packed = build_sft_example(
                 processor=self.processor,
                 frames=frames,
