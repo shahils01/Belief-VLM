@@ -6,6 +6,8 @@ QUESTION_COLUMN="${QUESTION_COLUMN:-question}"
 ANSWER_COLUMN="${ANSWER_COLUMN:-answer}"
 VIDEO_ID_COLUMN="${VIDEO_ID_COLUMN:-video_id}"
 PARTICIPANT_COLUMN="${PARTICIPANT_COLUMN:-participant_id}"
+DEBUG_GENERATE="${DEBUG_GENERATE:-0}"
+DEBUG_GENERATE_EVERY="${DEBUG_GENERATE_EVERY:-0}"
 
 CMD=(
   accelerate launch --num_processes 1 train.py
@@ -32,6 +34,10 @@ CMD=(
   --save_dir checkpoints_belief_hd_epic_ddp_07
   --resume_checkpoint "/scratch/shahils/Belief-VLM/checkpoints_belief_hd_epic_ddp/ckpt_epoch_23.pt"
 )
+
+if [[ "$DEBUG_GENERATE" == "1" ]]; then
+  CMD+=(--debug_generate --debug_generate_every "$DEBUG_GENERATE_EVERY")
+fi
 
 "${CMD[@]}"
 

@@ -115,6 +115,8 @@ def parse_args():
     parser.add_argument("--load_model_only", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--eval_max_new_tokens", type=int, default=64)
+    parser.add_argument("--debug_generate", action="store_true")
+    parser.add_argument("--debug_generate_every", type=int, default=0)
 
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--wandb_project", type=str, default="belief-vlm")
@@ -249,13 +251,16 @@ def run_epoch(model, loader, optimizer, accelerator, args, train, global_step):
         with accelerator.accumulate(model):
             with torch.set_grad_enabled(train):
                 outputs = model(inputs, labels=labels)
-                debug_ids = accelerator.unwrap_model(model).generate(
-                    inputs, max_new_tokens=args.eval_max_new_tokens
-                )
-                debug_text = accelerator.unwrap_model(model).backbone.tokenizer.batch_decode(
-                    debug_ids, skip_special_tokens=False
-                )
-                accelerator.print(debug_text)
+                if args.debug_generate and args.debug_generate_every > 0 and step % args.debug_generate_every == 0:
+                    debug_ids = accelerator.unwrap_model(model).generate(
+                        inputs, max_new_tokens=args.eval_max_new_tokens
+                    )
+                    prompt_len = int(inputs["input_ids"].shape[1])
+                    debug_new_tokens = debug_ids[:, prompt_len:]
+                    debug_text = accelerator.unwrap_model(model).backbone.tokenizer.batch_decode(
+                        debug_new_tokens, skip_special_tokens=True
+                    )
+                    accelerator.print(f"debug_text step={step}: {debug_text}")
                 loss = outputs["loss"]
                 if train:
                     accelerator.backward(loss)
