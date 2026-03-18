@@ -21,7 +21,7 @@ from train import _apply_peft, _configure_memory_optimizations, _resolve_vl_mode
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate HD-EPIC VQA multiple-choice accuracy.")
-    parser.add_argument("--checkpoint", type=str, required=True)
+    parser.add_argument("--checkpoint", type=str, default="")
     parser.add_argument("--annotation_path", type=str, required=True)
     parser.add_argument("--video_root", type=str, required=True)
     parser.add_argument("--video_extension", type=str, default="mp4")
@@ -130,22 +130,24 @@ def _build_quant_config(args):
 
 
 def _load_model(checkpoint_path, args, device):
-    ckpt = torch.load(checkpoint_path, map_location="cpu")
     args.quantization_config = _build_quant_config(args)
     _resolve_vl_model_preset(args)
     model = build_model(args, device=device)
     model = _apply_peft(model, args)
     _configure_memory_optimizations(model, args)
-    state_dict = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
-    try:
-        model.load_state_dict(state_dict)
-    except RuntimeError:
-        incompatible = model.load_state_dict(state_dict, strict=False)
-        print(
-            "Non-strict checkpoint load complete: "
-            f"missing_keys={len(getattr(incompatible, 'missing_keys', []))} "
-            f"unexpected_keys={len(getattr(incompatible, 'unexpected_keys', []))}"
-        )
+    ckpt = None
+    if checkpoint_path:
+        ckpt = torch.load(checkpoint_path, map_location="cpu")
+        state_dict = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
+        try:
+            model.load_state_dict(state_dict)
+        except RuntimeError:
+            incompatible = model.load_state_dict(state_dict, strict=False)
+            print(
+                "Non-strict checkpoint load complete: "
+                f"missing_keys={len(getattr(incompatible, 'missing_keys', []))} "
+                f"unexpected_keys={len(getattr(incompatible, 'unexpected_keys', []))}"
+            )
     model.eval()
     return model, ckpt
 
@@ -194,7 +196,7 @@ def _sequence_nll(logits, labels):
 
 def evaluate(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    ckpt = torch.load(args.checkpoint, map_location="cpu")
+    ckpt = torch.load(args.checkpoint, map_location="cpu") if args.checkpoint else {}
     ckpt_args = ckpt.get("args", {}) if isinstance(ckpt, dict) else {}
     merged_args = _merge_args(args, ckpt_args)
     model, _ = _load_model(args.checkpoint, merged_args, device=device)
