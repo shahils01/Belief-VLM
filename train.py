@@ -249,6 +249,7 @@ def run_epoch(model, loader, optimizer, accelerator, args, train, global_step):
         with accelerator.accumulate(model):
             with torch.set_grad_enabled(train):
                 outputs = model(inputs, labels=labels)
+                # print(model.generate(inputs))
                 loss = outputs["loss"]
                 if train:
                     accelerator.backward(loss)
