@@ -232,7 +232,8 @@ def evaluate(args):
     ckpt_args = ckpt.get("args", {}) if isinstance(ckpt, dict) else {}
     merged_args = _merge_args(args, ckpt_args)
     if merged_args.use_future_predictor:
-        if not merged_args.future_predictor_checkpoint:
+        has_bundled_predictor = getattr(merged_args, "future_predictor_bundle", None) is not None
+        if not merged_args.future_predictor_checkpoint and not has_bundled_predictor:
             raise RuntimeError("--use_future_predictor requires --future_predictor_checkpoint.")
         if int(merged_args.future_frames) <= 0:
             raise RuntimeError("--use_future_predictor requires --future_frames > 0.")
