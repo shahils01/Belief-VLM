@@ -319,7 +319,7 @@ class GRUNet(nn.Module):
 
         )
 
-    def forward(self, b_prev, e_t, z_t):
+    def forward(self, b_prev, e_t, z_t, return_hidden=False):
 
         # evidence: e_t = [b_t, f_t]
         # b_t : [B, 1, D], f_t: [B, D]
@@ -332,6 +332,8 @@ class GRUNet(nn.Module):
         
         b_t = torch.relu(h[-1])
 
+        if return_hidden:
+            return b_t, h
         return b_t
 
 
@@ -381,3 +383,145 @@ class ELBO_loss:
         loss = recon_1 + self.lambda_multi * recon_5 + self.beta * kl
 
         return loss, recon_1, recon_5, kl
+
+
+class RecursiveBeliefNetwork(nn.Module):
+    """
+    Recursive latent state-space belief model:
+    - Prior p(z_t | b_{t-1})
+    - Posterior q(z_t | b_{t-1}, f_t)
+    - Belief update b_t = GRU(b_{t-1}, [f_t, z_t])
+    - Decoder predicts next visual embedding from [b_t, z_t]
+    """
+
+    def __init__(
+        self,
+        config: AttentionConfig,
+        visual_dim: int,
+        beta: float = 1.0,
+        recon_weight: float = 1.0,
+        temporal_nce_weight: float = 0.0,
+        device=None,
+    ):
+        super().__init__()
+        self.config = config
+        self.visual_dim = visual_dim
+        self.beta = beta
+        self.recon_weight = recon_weight
+        self.temporal_nce_weight = temporal_nce_weight
+        self.device = device
+
+        self.visual_proj = nn.Linear(visual_dim, config.hidden_size)
+        self.state_proj = nn.Linear(config.state_dim, config.hidden_size)
+        self.belief_token_proj = nn.Linear(config.hidden_size, config.hidden_size)
+
+        self.attention = MultiHeadSelfAttention(config)
+        self.pool = AttentionPooling(config)
+
+        self.prior_net = GaussianPriorNet(config)
+        self.posterior_net = GaussianPosteriorNet(config)
+        self.gru = GRUNet(
+            input_size=config.hidden_size + config.latent_dim,
+            hidden_size=config.hidden_size,
+            num_layers=2,
+            dropout=config.proj_dropout,
+            device=device,
+        )
+
+        self.decoder = nn.Sequential(
+            nn.Linear(config.hidden_size + config.latent_dim, config.hidden_size),
+            nn.GELU(),
+            nn.Linear(config.hidden_size, visual_dim),
+        )
+        self.temporal_loss = TemporalContrastiveLoss(temperature=0.1, device=device)
+        self.recon = nn.MSELoss(reduction="mean")
+
+    def _reparameterize(self, mu, log_sigma):
+        eps = torch.randn_like(mu)
+        return mu + torch.exp(log_sigma) * eps
+
+    def _kl_divergence(self, mu_q, log_sigma_q, mu_p, log_sigma_p):
+        sigma_q = torch.exp(log_sigma_q)
+        sigma_p = torch.exp(log_sigma_p)
+        kl = torch.log(sigma_p / sigma_q) + (sigma_q**2 + (mu_q - mu_p) ** 2) / (2 * sigma_p**2) - 0.5
+        return kl.sum(dim=-1)
+
+    def forward(self, visual_seq, state_seq=None):
+        # visual_seq: [B, T, visual_dim]
+        batch_size, time_steps, _ = visual_seq.shape
+        device = visual_seq.device
+        if state_seq is None:
+            state_seq = torch.zeros(batch_size, time_steps, self.config.state_dim, device=device, dtype=visual_seq.dtype)
+
+        hidden_state = torch.zeros(
+            self.gru.num_layers,
+            batch_size,
+            self.config.hidden_size,
+            device=device,
+            dtype=visual_seq.dtype,
+        )
+        belief_prev = hidden_state[-1]
+
+        pred_next_list = []
+        target_next_list = []
+        kl_list = []
+        pooled_features = []
+        belief_traj = []
+
+        # iterate until T-1 since target is x_{t+1}
+        for t in range(max(time_steps - 1, 0)):
+            v_t = self.visual_proj(visual_seq[:, t])               # [B, D]
+            x_t = self.state_proj(state_seq[:, t])                 # [B, D]
+            b_tok = self.belief_token_proj(belief_prev)            # [B, D]
+
+            tokens = torch.stack([b_tok, x_t, v_t], dim=1)         # [B, 3, D]
+            attn_tokens = self.attention(tokens, tokens, tokens)   # [B, 3, D]
+            f_t, _ = self.pool(attn_tokens[:, 2:, :])              # [B, D]
+
+            mu_p, log_sigma_p = self.prior_net(belief_prev)
+            mu_q, log_sigma_q = self.posterior_net(belief_prev.unsqueeze(1), f_t)
+            z_t = self._reparameterize(mu_q, log_sigma_q)
+
+            belief_t, hidden_state = self.gru(hidden_state, f_t, z_t, return_hidden=True)
+            belief_prev = belief_t
+
+            pred_next = self.decoder(torch.cat([belief_t, z_t], dim=-1))
+            target_next = visual_seq[:, t + 1]
+
+            pred_next_list.append(pred_next)
+            target_next_list.append(target_next)
+            kl_list.append(self._kl_divergence(mu_q, log_sigma_q, mu_p, log_sigma_p))
+            pooled_features.append(f_t)
+            belief_traj.append(belief_t)
+
+        if len(pred_next_list) == 0:
+            zero = visual_seq.new_zeros(())
+            return {
+                "loss": zero,
+                "recon_loss": zero,
+                "kl_loss": zero,
+                "temporal_nce_loss": zero,
+                "pred_next": visual_seq.new_zeros(batch_size, 0, self.visual_dim),
+                "target_next": visual_seq.new_zeros(batch_size, 0, self.visual_dim),
+                "belief_traj": visual_seq.new_zeros(batch_size, 0, self.config.hidden_size),
+            }
+
+        pred_next = torch.stack(pred_next_list, dim=1)
+        target_next = torch.stack(target_next_list, dim=1)
+        kl_loss = torch.stack(kl_list, dim=1).mean()
+        recon_loss = self.recon(pred_next, target_next)
+
+        temporal_nce_loss = visual_seq.new_zeros(())
+        if self.temporal_nce_weight > 0 and len(pooled_features) > 1:
+            temporal_nce_loss = self.temporal_loss(torch.stack(pooled_features, dim=1))
+
+        total = self.recon_weight * recon_loss + self.beta * kl_loss + self.temporal_nce_weight * temporal_nce_loss
+        return {
+            "loss": total,
+            "recon_loss": recon_loss,
+            "kl_loss": kl_loss,
+            "temporal_nce_loss": temporal_nce_loss,
+            "pred_next": pred_next,
+            "target_next": target_next,
+            "belief_traj": torch.stack(belief_traj, dim=1),
+        }
