@@ -3,6 +3,7 @@ ANNOTATION_PATH="${ANNOTATION_PATH:-/scratch/shahils/hd_epic_dataset/hd-epic-ann
 VIDEO_ROOT="${VIDEO_ROOT:-/scratch/shahils/hd_epic_dataset/videos/HD-EPIC/Videos}"
 MAX_SAMPLES="${MAX_SAMPLES:-0}"
 PRINT_SAMPLES="${PRINT_SAMPLES:-10}"
+PROGRESS_EVERY="${PROGRESS_EVERY:-50}"
 SAVE_PREDICTIONS="${SAVE_PREDICTIONS:-}"
 VL_MODEL_PRESET="${VL_MODEL_PRESET:-internvl3_5_2b}"
 
@@ -12,6 +13,7 @@ CMD=(
   --video_root "$VIDEO_ROOT"
   --max_samples "$MAX_SAMPLES"
   --print_samples "$PRINT_SAMPLES"
+  --progress_every "$PROGRESS_EVERY"
   --vl_model_preset "$VL_MODEL_PRESET"
   --video_frames "20"
 )

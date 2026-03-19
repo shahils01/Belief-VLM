@@ -46,6 +46,7 @@ def parse_args():
     parser.add_argument("--allow_tf32", action="store_true")
     parser.add_argument("--max_samples", type=int, default=0)
     parser.add_argument("--print_samples", type=int, default=10)
+    parser.add_argument("--progress_every", type=int, default=50)
     parser.add_argument("--save_predictions", type=str, default="")
     return parser.parse_args()
 
@@ -282,13 +283,23 @@ def evaluate(args):
                 f"pred_choice={choices[pred_idx]}\n"
                 f"gt_choice={choices[correct_idx]}\n"
             )
+        if args.progress_every > 0 and total % args.progress_every == 0:
+            running_accuracy = correct / max(total, 1)
+            print(
+                f"progress samples={total} accuracy={running_accuracy:.4f} "
+                f"({correct}/{total}) = {running_accuracy * 100.0:.2f}%"
+            )
 
     accuracy = correct / max(total, 1)
-    print(f"overall_accuracy={accuracy:.4f} ({correct}/{total})")
+    print(f"overall_accuracy={accuracy:.4f} ({correct}/{total}) = {accuracy * 100.0:.2f}%")
     for task_name in sorted(by_task.keys()):
         task_correct = by_task[task_name]["correct"]
         task_total = by_task[task_name]["total"]
-        print(f"task={task_name} accuracy={task_correct / max(task_total, 1):.4f} ({task_correct}/{task_total})")
+        task_accuracy = task_correct / max(task_total, 1)
+        print(
+            f"task={task_name} accuracy={task_accuracy:.4f} "
+            f"({task_correct}/{task_total}) = {task_accuracy * 100.0:.2f}%"
+        )
 
     if args.save_predictions:
         with open(args.save_predictions, "w", encoding="utf-8") as handle:
