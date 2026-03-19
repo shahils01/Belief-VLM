@@ -140,7 +140,7 @@ class SiglipAttention(nn.Module):
         value_states = self.v_proj(hidden_states)
 
         ''' 
-        [B, N, D]  @ [D, D] -> [B, N, D] -> [B, N, N-head,  D_head]        
+        [B, N, D]  @ [D, D] -> [B, N, D] -> [B, N, N_head,  D_head]        
         '''
         query_states = query_states.view(batch_size,  seq_length, self.num_heads, self.head_dim).transpose(1,2)
         key_states = key_states.view(batch_size,  seq_length, self.num_heads, self.head_dim).transpose(1,2)
@@ -181,7 +181,7 @@ class SiglipEncoderLayer(nn.Module):
 
 class SiglipVisionTransformer(nn.Module):
 
-    def __init_(self, config: SiglipVisionConfig):
+    def __init__(self, config: SiglipVisionConfig):
         super().__init__()
         self.config = config
         embed_dim = config.hidden_size
