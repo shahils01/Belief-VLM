@@ -154,8 +154,26 @@ class SiglipAttention(nn.Module):
         attn_weights = (torch.matmul(query_states, key_states.transpose(2,3)) * self.scale)
 
         '''
-        Attention Masking: We also have  
+        Attention Masking: We also have  maks for future cells where we 
+        give -ve Inf weights to the future cells which vecome zero after applying
+        softmax.
         '''
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+
+        attn_weights = nn.functional.dropout(attn_weights, p=self.attn_dropout, training=self.training)
+
+        # (QK.T) * V
+        attn_outputs = torch.matmul(attn_weights, value_states)
+
+        attn_outputs = attn_outputs.transpose(1,2).contiguous()
+        attn_outputs = attn_outputs.reshape(batch_size, seq_length, self.embed_dim)
+
+        '''
+        W_o (out proj): Projection to learn the mixing of different heads 
+        '''
+        attn_outputs = self.out_proj(attn_outputs)
+
+        return attn_outputs, attn_weights
 
 
 class SiglipEncoderLayer(nn.Module):
@@ -188,7 +206,25 @@ class SiglipEncoderLayer(nn.Module):
 
         return hidden_states
 
+class SiglipEncoder(nn.Module):
 
+    def __init__(self, config:SiglipVisionConfig):
+        super().__init__()
+        self.config = config
+        self.layers = nn.ModuleList(
+            [SiglipEncoderLayer(config) for _ in range(config.num_hidden_layers)]
+        )
+
+    def forward(self, 
+                input_embeds):
+        
+        hidden_states = input_embeds
+        for encoder_layer in self.layers:
+
+            hidden_states = encoder_layer(hidden_states)
+
+        return hidden_states
+    
 
 class SiglipVisionTransformer(nn.Module):
 

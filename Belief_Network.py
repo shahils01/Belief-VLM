@@ -235,13 +235,13 @@ class TemporalContrastiveLoss(nn.Module):
         for t in range(T-1):
 
             anchor = features[:, t] # [B, D]
-            positive = features[:, t+1] # [B, D]
 
-            # Similrity matrix [B, D] @ [B, D, T] = [B, T] (logits)
-            logits = torch.matmul(anchor, features.transpose(1,2))/ self.temperature
+            # Similarity per sample across time: logits[b, tau] = <anchor[b], features[b, tau]>
+            # Shape: [B, T]
+            logits = torch.einsum("bd,btd->bt", anchor, features) / self.temperature
 
             # Positive Index
-            labels = torch.full((B,), t+1, dtype=torch.long, device=self.device)
+            labels = torch.full((B,), t+1, dtype=torch.long, device=features.device)
 
             loss += torch.nn.functional.cross_entropy(logits, labels)
 

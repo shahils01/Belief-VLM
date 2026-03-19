@@ -71,6 +71,8 @@ def parse_args():
     return parser.parse_args()
 
 
+
+
 def build_visual_backbone(args, device):
     cfg = ModelConfig(
         vl_backend=args.vl_backend,
@@ -93,6 +95,8 @@ def build_visual_backbone(args, device):
     for param in model.parameters():
         param.requires_grad = False
     return model
+
+
 
 
 class BeliefVideoDataset(Dataset):
