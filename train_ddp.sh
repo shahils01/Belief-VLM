@@ -13,7 +13,7 @@ FUTURE_PREDICTOR_CHECKPOINT="${FUTURE_PREDICTOR_CHECKPOINT:-/scratch/shahils/Bel
 FUTURE_FRAMES="${FUTURE_FRAMES:-8}"
 
 CMD=(
-  accelerate launch --num_processes 8 train.py
+  accelerate launch --num_processes 4 train.py
   --dataset_type hd_epic_local
   --video_root "$VIDEO_ROOT"
   --metadata_root "$METADATA_ROOT"
@@ -35,7 +35,7 @@ CMD=(
   --vl_model_preset "$VL_MODEL_PRESET"
   --gradient_checkpointing
   --save_dir checkpoints_belief_hd_epic_ddp_bundles
-  --resume_checkpoint "/scratch/shahils/Belief-VLM/checkpoints_belief_hd_epic_ddp_bundles/ckpt_epoch_13.pt"
+  --resume_checkpoint "/scratch/shahils/Belief-VLM/checkpoints_belief_hd_epic_ddp/ckpt_epoch_110.pt"
   --load_model_only
   --wandb
 )
