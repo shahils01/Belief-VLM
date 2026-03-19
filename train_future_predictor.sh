@@ -15,11 +15,11 @@ accelerate launch --num_processes 1 train_future_predictor.py \
   --future_duration_sec "$FUTURE_DURATION_SEC" \
   --batch_size 2 \
   --num_workers 4 \
-  --epochs 10 \
+  --epochs 500 \
   --log_every 20 \
   --mixed_precision bf16 \
   --allow_tf32 \
   --vl_model_preset "$VL_MODEL_PRESET" \
   --gradient_checkpointing \
   --save_dir /scratch/shahils/Belief-VLM/checkpoints_future_predictor \
-  # --resume_checkpoint /scratch/shahils/Belief-VLM/checkpoints_future_predictor/ckpt_epoch_3.pt
+  --resume_checkpoint /scratch/shahils/Belief-VLM/checkpoints_future_predictor/ckpt_epoch_9.pt \  
