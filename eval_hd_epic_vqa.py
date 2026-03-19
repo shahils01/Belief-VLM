@@ -120,7 +120,22 @@ def _merge_args(cli_args, ckpt_args):
     merged.setdefault("gradient_checkpointing", False)
     merged.setdefault("disable_vl_cache", False)
     merged.setdefault("allow_tf32", False)
+    merged["future_predictor_bundle"] = getattr(cli_args, "future_predictor_bundle", None)
     return SimpleNamespace(**merged)
+
+
+def _restore_bundled_future_predictor_args(args, ckpt):
+    if not isinstance(ckpt, dict):
+        return
+    bundle = ckpt.get("future_predictor")
+    if bundle is None:
+        return
+    args.use_future_predictor = True
+    if not getattr(args, "future_predictor_checkpoint", ""):
+        args.future_predictor_bundle = bundle
+    bundle_args = bundle.get("args", {})
+    if int(getattr(args, "future_frames", 0) or 0) <= 0:
+        args.future_frames = int(bundle_args.get("future_frames", args.future_frames or 0))
 
 
 def _build_quant_config(args):
@@ -213,6 +228,7 @@ def _sequence_nll(logits, labels):
 def evaluate(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     ckpt = torch.load(args.checkpoint, map_location="cpu") if args.checkpoint else {}
+    _restore_bundled_future_predictor_args(args, ckpt)
     ckpt_args = ckpt.get("args", {}) if isinstance(ckpt, dict) else {}
     merged_args = _merge_args(args, ckpt_args)
     if merged_args.use_future_predictor:

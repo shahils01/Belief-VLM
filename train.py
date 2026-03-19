@@ -186,6 +186,7 @@ def build_model(args, device):
         quantization_config=getattr(args, "quantization_config", None),
         use_cache=not args.disable_vl_cache,
         future_predictor_checkpoint=args.future_predictor_checkpoint if args.use_future_predictor else "",
+        future_predictor_bundle=getattr(args, "future_predictor_bundle", None) if args.use_future_predictor else None,
         future_context_frames=args.video_frames if args.use_future_predictor else 0,
         future_frames=args.future_frames if args.use_future_predictor else 0,
     )
@@ -237,6 +238,20 @@ def _load_checkpoint_state(model, ckpt_state, accelerator):
             f"missing_keys={len(getattr(incompatible, 'missing_keys', []))} "
             f"unexpected_keys={len(getattr(incompatible, 'unexpected_keys', []))}"
         )
+
+
+def _restore_bundled_future_predictor_args(args, ckpt):
+    if not isinstance(ckpt, dict):
+        return
+    bundle = ckpt.get("future_predictor")
+    if bundle is None:
+        return
+    args.use_future_predictor = True
+    if not getattr(args, "future_predictor_checkpoint", ""):
+        args.future_predictor_bundle = bundle
+    bundle_args = bundle.get("args", {})
+    if int(getattr(args, "future_frames", 0) or 0) <= 0:
+        args.future_frames = int(bundle_args.get("future_frames", args.future_frames or 0))
 
 
 
@@ -394,6 +409,11 @@ def main():
     train_loader = build_train_loader(args, args.train_split, args.batch_size, args.num_workers, is_train=True)
     val_loader = build_train_loader(args, args.val_split, args.batch_size, args.num_workers, is_train=False) if args.val_ratio > 0 else None
 
+    resume_ckpt = None
+    if args.resume_checkpoint:
+        resume_ckpt = torch.load(args.resume_checkpoint, map_location="cpu")
+        _restore_bundled_future_predictor_args(args, resume_ckpt)
+
     model = build_model(args, device=accelerator.device)
     model = _apply_peft(model, args)
     _configure_memory_optimizations(model, args)
@@ -414,7 +434,7 @@ def main():
     start_epoch = 0
     global_step = 0
     if args.resume_checkpoint:
-        ckpt = torch.load(args.resume_checkpoint, map_location="cpu")
+        ckpt = resume_ckpt
         _load_checkpoint_state(model, ckpt["model"], accelerator)
         if not args.load_model_only:
             optimizer.load_state_dict(ckpt["optimizer"])
@@ -453,14 +473,16 @@ def main():
 
         accelerator.wait_for_everyone()
         if accelerator.is_main_process:
+            unwrapped = accelerator.unwrap_model(model)
             ckpt_path = os.path.join(args.save_dir, f"ckpt_epoch_{epoch}.pt")
             torch.save(
                 {
-                    "model": accelerator.unwrap_model(model).state_dict(),
+                    "model": unwrapped.state_dict(),
                     "optimizer": optimizer.state_dict(),
                     "epoch": epoch,
                     "global_step": global_step,
                     "args": vars(args),
+                    "future_predictor": unwrapped.export_future_predictor_bundle(),
                 },
                 ckpt_path,
             )

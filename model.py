@@ -18,6 +18,7 @@ class ModelConfig:
     quantization_config: Optional[Any] = None
     use_cache: bool = False
     future_predictor_checkpoint: str = ""
+    future_predictor_bundle: Optional[Any] = None
     future_context_frames: int = 0
     future_frames: int = 0
 
@@ -220,13 +221,12 @@ class MultimodalBeliefModel(nn.Module):
         self._future_frames = int(cfg.future_frames or 0)
         self._future_context_frames = int(cfg.future_context_frames or 0)
         self._image_token_id = int(getattr(self.backbone.model.config, "image_token_id", -1))
-        if cfg.future_predictor_checkpoint:
+        if cfg.future_predictor_bundle is not None:
+            self._init_future_conditioning_from_bundle(cfg.future_predictor_bundle)
+        elif cfg.future_predictor_checkpoint:
             self._init_future_conditioning(cfg.future_predictor_checkpoint)
 
-    def _init_future_conditioning(self, checkpoint_path: str):
-        ckpt = torch.load(checkpoint_path, map_location="cpu")
-        saved_args = ckpt.get("args", {})
-        predictor_state = ckpt.get("predictor", {})
+    def _build_future_predictor_from_state(self, predictor_state, saved_args):
         embed_dim = int(saved_args["predictor_embed_dim"]) if "predictor_embed_dim" in saved_args else int(saved_args.get("embed_dim", 0))
         if embed_dim <= 0:
             input_proj_weight = predictor_state.get("input_proj.weight")
@@ -266,6 +266,34 @@ class MultimodalBeliefModel(nn.Module):
         self.future_adapter = FutureTokenAdapter(predictor_cfg.embed_dim).to(self.backbone.device)
         self._future_context_frames = int(self._future_context_frames or predictor_cfg.max_context_frames)
         self._future_frames = int(self._future_frames or predictor_cfg.max_future_frames)
+
+    def _init_future_conditioning(self, checkpoint_path: str):
+        ckpt = torch.load(checkpoint_path, map_location="cpu")
+        saved_args = ckpt.get("args", {})
+        predictor_state = ckpt.get("predictor", {})
+        self._build_future_predictor_from_state(predictor_state, saved_args)
+
+    def _init_future_conditioning_from_bundle(self, bundle):
+        saved_args = bundle.get("args", {})
+        predictor_state = bundle.get("predictor", {})
+        self._build_future_predictor_from_state(predictor_state, saved_args)
+
+    def export_future_predictor_bundle(self):
+        if self.future_predictor is None:
+            return None
+        predictor = self.future_predictor
+        return {
+            "predictor": predictor.state_dict(),
+            "args": {
+                "predictor_embed_dim": int(predictor.cfg.embed_dim),
+                "predictor_hidden_dim": int(predictor.cfg.hidden_dim),
+                "predictor_layers": int(predictor.cfg.num_layers),
+                "predictor_heads": int(predictor.cfg.num_heads),
+                "predictor_dropout": float(predictor.cfg.dropout),
+                "video_frames": int(predictor.cfg.max_context_frames),
+                "future_frames": int(predictor.cfg.max_future_frames),
+            },
+        }
 
     def _inject_image_features(self, input_ids, attention_mask, labels, image_features, extra_features=None):
         batch_size, _, hidden_dim = image_features.shape
