@@ -226,19 +226,38 @@ class MultimodalBeliefModel(nn.Module):
     def _init_future_conditioning(self, checkpoint_path: str):
         ckpt = torch.load(checkpoint_path, map_location="cpu")
         saved_args = ckpt.get("args", {})
+        predictor_state = ckpt.get("predictor", {})
+        embed_dim = int(saved_args["predictor_embed_dim"]) if "predictor_embed_dim" in saved_args else int(saved_args.get("embed_dim", 0))
+        if embed_dim <= 0:
+            input_proj_weight = predictor_state.get("input_proj.weight")
+            output_proj_weight = predictor_state.get("output_proj.weight")
+            if input_proj_weight is not None:
+                embed_dim = int(input_proj_weight.shape[1])
+            elif output_proj_weight is not None:
+                embed_dim = int(output_proj_weight.shape[0])
+        max_context_frames = int(saved_args.get("video_frames", self._future_context_frames or 0))
+        if max_context_frames <= 0:
+            context_pos_embed = predictor_state.get("context_pos_embed")
+            if context_pos_embed is not None:
+                max_context_frames = int(context_pos_embed.shape[1])
+        max_future_frames = int(saved_args.get("future_frames", self._future_frames or 0))
+        if max_future_frames <= 0:
+            future_queries = predictor_state.get("future_queries")
+            if future_queries is not None:
+                max_future_frames = int(future_queries.shape[1])
         predictor_cfg = FuturePredictorConfig(
-            embed_dim=int(saved_args["predictor_embed_dim"]) if "predictor_embed_dim" in saved_args else int(saved_args.get("embed_dim", 0)),
+            embed_dim=embed_dim,
             hidden_dim=int(saved_args.get("predictor_hidden_dim", 1024)),
             num_layers=int(saved_args.get("predictor_layers", 2)),
             num_heads=int(saved_args.get("predictor_heads", 8)),
             dropout=float(saved_args.get("predictor_dropout", 0.1)),
-            max_context_frames=int(saved_args.get("video_frames", self._future_context_frames or 8)),
-            max_future_frames=int(saved_args.get("future_frames", self._future_frames or 8)),
+            max_context_frames=max_context_frames or 8,
+            max_future_frames=max_future_frames or 8,
         )
         if predictor_cfg.embed_dim <= 0:
             raise RuntimeError("Future predictor checkpoint is missing embed-dimension metadata.")
         predictor = FuturePredictionTransformer(predictor_cfg)
-        predictor.load_state_dict(ckpt["predictor"])
+        predictor.load_state_dict(predictor_state)
         predictor.to(self.backbone.device)
         predictor.eval()
         for param in predictor.parameters():
