@@ -194,6 +194,9 @@ def _resolve_correct_choice_index(record, num_choices):
 
 
 def _sequence_nll(logits, labels):
+    seq_len = min(int(logits.shape[1]), int(labels.shape[1]))
+    logits = logits[:, :seq_len, :]
+    labels = labels[:, :seq_len]
     shift_logits = logits[:, :-1, :].float().contiguous()
     shift_labels = labels[:, 1:].contiguous()
     token_losses = F.cross_entropy(
