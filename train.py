@@ -102,6 +102,8 @@ def parse_args():
     parser.add_argument("--future_frames", type=int, default=0)
     parser.add_argument("--use_belief_network", action="store_true")
     parser.add_argument("--belief_network_checkpoint", type=str, default="")
+    parser.add_argument("--finetune_belief_network", action="store_true")
+    parser.add_argument("--belief_aux_weight", type=float, default=0.0)
 
     parser.add_argument("--peft", type=str, default="none", choices=["none", "lora", "qlora"])
     parser.add_argument("--lora_r", type=int, default=16)
@@ -191,6 +193,8 @@ def build_model(args, device):
         future_predictor_bundle=getattr(args, "future_predictor_bundle", None) if args.use_future_predictor else None,
         belief_network_checkpoint=args.belief_network_checkpoint if args.use_belief_network else "",
         belief_network_bundle=getattr(args, "belief_network_bundle", None) if args.use_belief_network else None,
+        train_belief_network=args.finetune_belief_network if args.use_belief_network else False,
+        belief_aux_weight=args.belief_aux_weight if args.use_belief_network else 0.0,
         future_context_frames=args.video_frames if args.use_future_predictor else 0,
         future_frames=args.future_frames if args.use_future_predictor else 0,
     )
@@ -273,6 +277,10 @@ def _restore_bundled_belief_network_args(args, ckpt):
 def run_epoch(model, loader, optimizer, accelerator, args, train, global_step):
     model.train() if train else model.eval()
     total_loss = 0.0
+    total_belief_loss = 0.0
+    total_belief_recon = 0.0
+    total_belief_kl = 0.0
+    total_belief_nce = 0.0
     total_examples = 0
     step = 0
 
@@ -307,14 +315,33 @@ def run_epoch(model, loader, optimizer, accelerator, args, train, global_step):
 
         batch_size = labels.size(0)
         total_loss += loss.detach().item() * batch_size
+        if "belief_loss" in outputs:
+            total_belief_loss += outputs["belief_loss"].detach().item() * batch_size
+            total_belief_recon += outputs["belief_recon_loss"].detach().item() * batch_size
+            total_belief_kl += outputs["belief_kl_loss"].detach().item() * batch_size
+            total_belief_nce += outputs["belief_temporal_nce_loss"].detach().item() * batch_size
         total_examples += batch_size
 
         if args.log_every > 0 and step % args.log_every == 0:
             avg_loss = total_loss / max(total_examples, 1)
             phase = "train" if train else "val"
-            accelerator.print(f"{phase} step={step} loss={avg_loss:.4f}")
+            if total_belief_loss > 0.0 or "belief_loss" in outputs:
+                accelerator.print(
+                    f"{phase} step={step} loss={avg_loss:.4f} "
+                    f"belief={total_belief_loss / max(total_examples, 1):.4f} "
+                    f"recon={total_belief_recon / max(total_examples, 1):.4f} "
+                    f"kl={total_belief_kl / max(total_examples, 1):.4f} "
+                    f"nce={total_belief_nce / max(total_examples, 1):.4f}"
+                )
+            else:
+                accelerator.print(f"{phase} step={step} loss={avg_loss:.4f}")
             if args.wandb:
                 metrics = {f"{phase}/loss": avg_loss}
+                if total_belief_loss > 0.0 or "belief_loss" in outputs:
+                    metrics[f"{phase}/belief_loss"] = total_belief_loss / max(total_examples, 1)
+                    metrics[f"{phase}/belief_recon_loss"] = total_belief_recon / max(total_examples, 1)
+                    metrics[f"{phase}/belief_kl_loss"] = total_belief_kl / max(total_examples, 1)
+                    metrics[f"{phase}/belief_temporal_nce_loss"] = total_belief_nce / max(total_examples, 1)
                 if train:
                     metrics["train/lr"] = optimizer.param_groups[0]["lr"]
                     accelerator.log(metrics, step=global_step + step)

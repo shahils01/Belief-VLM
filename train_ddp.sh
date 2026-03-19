@@ -14,6 +14,8 @@ FUTURE_PREDICTOR_CHECKPOINT="${FUTURE_PREDICTOR_CHECKPOINT:-/scratch/shahils/Bel
 FUTURE_FRAMES="${FUTURE_FRAMES:-8}"
 USE_BELIEF_NETWORK="${USE_BELIEF_NETWORK:-0}"
 BELIEF_NETWORK_CHECKPOINT="${BELIEF_NETWORK_CHECKPOINT:-}"
+FINETUNE_BELIEF_NETWORK="${FINETUNE_BELIEF_NETWORK:-0}"
+BELIEF_AUX_WEIGHT="${BELIEF_AUX_WEIGHT:-0.1}"
 
 CMD=(
   accelerate launch --num_processes 4 train.py
@@ -53,6 +55,9 @@ fi
 
 if [[ "$PREDICTIVE_MODULE" == "belief" || "$USE_BELIEF_NETWORK" == "1" ]]; then
   CMD+=(--use_belief_network --belief_network_checkpoint "$BELIEF_NETWORK_CHECKPOINT")
+  if [[ "$FINETUNE_BELIEF_NETWORK" == "1" ]]; then
+    CMD+=(--finetune_belief_network --belief_aux_weight "$BELIEF_AUX_WEIGHT")
+  fi
 fi
 
 "${CMD[@]}"

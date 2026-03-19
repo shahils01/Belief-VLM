@@ -21,6 +21,8 @@ class ModelConfig:
     future_predictor_bundle: Optional[Any] = None
     belief_network_checkpoint: str = ""
     belief_network_bundle: Optional[Any] = None
+    train_belief_network: bool = False
+    belief_aux_weight: float = 0.0
     future_context_frames: int = 0
     future_frames: int = 0
 
@@ -222,6 +224,8 @@ class MultimodalBeliefModel(nn.Module):
         self.future_adapter = None
         self.belief_network = None
         self.belief_adapter = None
+        self._train_belief_network = bool(cfg.train_belief_network)
+        self._belief_aux_weight = float(cfg.belief_aux_weight)
         self._future_frames = int(cfg.future_frames or 0)
         self._future_context_frames = int(cfg.future_context_frames or 0)
         self._image_token_id = int(getattr(self.backbone.model.config, "image_token_id", -1))
@@ -333,9 +337,12 @@ class MultimodalBeliefModel(nn.Module):
         )
         belief_net.load_state_dict(belief_state)
         belief_net.to(self.backbone.device)
-        belief_net.eval()
-        for param in belief_net.parameters():
-            param.requires_grad = False
+        if self._train_belief_network:
+            belief_net.train()
+        else:
+            belief_net.eval()
+            for param in belief_net.parameters():
+                param.requires_grad = False
         self.belief_network = belief_net
         self.belief_adapter = FutureTokenAdapter(visual_dim).to(self.backbone.device)
 
@@ -520,13 +527,14 @@ class MultimodalBeliefModel(nn.Module):
             image_features=current_tokens,
             extra_features=belief_tokens,
         )
-        return self.backbone.model(
+        backbone_outputs = self.backbone.model(
             input_ids=None,
             inputs_embeds=inputs_embeds,
             attention_mask=new_attention_mask,
             labels=new_labels,
             **forward_kwargs,
         )
+        return backbone_outputs, belief_outputs
 
     def forward(self, inputs, labels=None):
         model_inputs = self.backbone._move_inputs_to_device(inputs)
@@ -537,12 +545,23 @@ class MultimodalBeliefModel(nn.Module):
         if self.future_predictor is not None:
             outputs = self._forward_with_future(model_inputs, labels, forward_kwargs)
         elif self.belief_network is not None:
-            outputs = self._forward_with_belief(model_inputs, labels, forward_kwargs)
+            outputs, belief_outputs = self._forward_with_belief(model_inputs, labels, forward_kwargs)
         else:
             if labels is not None:
                 model_inputs["labels"] = labels
             outputs = self.backbone.model(**model_inputs, **forward_kwargs)
-        return {"loss": outputs.loss, "logits": outputs.logits}
+            belief_outputs = None
+        total_loss = outputs.loss
+        result = {"loss": total_loss, "logits": outputs.logits}
+        if belief_outputs is not None:
+            result["belief_loss"] = belief_outputs["loss"]
+            result["belief_recon_loss"] = belief_outputs["recon_loss"]
+            result["belief_kl_loss"] = belief_outputs["kl_loss"]
+            result["belief_temporal_nce_loss"] = belief_outputs["temporal_nce_loss"]
+            if self._train_belief_network and labels is not None and self._belief_aux_weight > 0.0:
+                total_loss = total_loss + self._belief_aux_weight * belief_outputs["loss"]
+                result["loss"] = total_loss
+        return result
 
     @torch.no_grad()
     def generate(self, inputs, max_new_tokens=64):
