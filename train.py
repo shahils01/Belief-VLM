@@ -393,7 +393,7 @@ def main():
     )
 
     if args.wandb:
-        init_kwargs = {"wandb": {"project": args.wandb_project}}
+        init_kwargs = {"wandb": {}}
         if args.wandb_entity:
             init_kwargs["wandb"]["entity"] = args.wandb_entity
         if args.wandb_run_name:
