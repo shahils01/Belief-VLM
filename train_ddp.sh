@@ -36,6 +36,7 @@ CMD=(
   --gradient_checkpointing
   --save_dir checkpoints_belief_hd_epic_ddp_07
   --resume_checkpoint "/scratch/shahils/Belief-VLM/checkpoints_belief_hd_epic_ddp/ckpt_epoch_110.pt"
+  --load_model_only
 )
 
 if [[ "$DEBUG_GENERATE" == "1" ]]; then
