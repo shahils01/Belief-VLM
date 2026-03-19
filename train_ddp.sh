@@ -9,8 +9,8 @@ PARTICIPANT_COLUMN="${PARTICIPANT_COLUMN:-participant_id}"
 DEBUG_GENERATE="${DEBUG_GENERATE:-0}"
 DEBUG_GENERATE_EVERY="${DEBUG_GENERATE_EVERY:-0}"
 USE_FUTURE_PREDICTOR="${USE_FUTURE_PREDICTOR:-0}"
-FUTURE_PREDICTOR_CHECKPOINT="${FUTURE_PREDICTOR_CHECKPOINT:-}"
-FUTURE_FRAMES="${FUTURE_FRAMES:-0}"
+FUTURE_PREDICTOR_CHECKPOINT="${FUTURE_PREDICTOR_CHECKPOINT:-/scratch/shahils/Belief-VLM/checkpoints_future_predictor/ckpt_epoch_5.pt}"
+FUTURE_FRAMES="${FUTURE_FRAMES:-8}"
 
 CMD=(
   accelerate launch --num_processes 8 train.py
@@ -25,7 +25,7 @@ CMD=(
   --participant_column "$PARTICIPANT_COLUMN"
   --val_ratio 0.01
   --batch_size 2
-  --num_workers 16
+  --num_workers 4
   --video_frames 20
   --grad_accum_steps 16
   --mixed_precision bf16
@@ -35,7 +35,7 @@ CMD=(
   --vl_model_preset "$VL_MODEL_PRESET"
   --gradient_checkpointing
   --save_dir checkpoints_belief_hd_epic_ddp_07
-  --resume_checkpoint "/scratch/shahils/Belief-VLM/checkpoints_belief_hd_epic_ddp_07/ckpt_epoch_26.pt"
+  --resume_checkpoint "/scratch/shahils/Belief-VLM/checkpoints_belief_hd_epic_ddp/ckpt_epoch_110.pt"
 )
 
 if [[ "$DEBUG_GENERATE" == "1" ]]; then

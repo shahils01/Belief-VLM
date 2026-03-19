@@ -29,7 +29,7 @@ def parse_args():
 
     parser.add_argument("--video_frames", type=int, default=8)
     parser.add_argument("--future_frames", type=int, default=8)
-    parser.add_argument("--future_offset_sec", type=float, default=2.0)
+    parser.add_argument("--future_offset_sec", type=float, default=0.0)
     parser.add_argument("--future_duration_sec", type=float, default=0.0)
 
     parser.add_argument("--batch_size", type=int, default=2)
