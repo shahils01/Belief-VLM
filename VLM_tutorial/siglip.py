@@ -146,6 +146,8 @@ class SiglipAttention(nn.Module):
         key_states = key_states.view(batch_size,  seq_length, self.num_heads, self.head_dim).transpose(1,2)
         value_states = value_states.view(batch_size,  seq_length, self.num_heads, self.head_dim).transpose(1,2)
 
+        # [B, num_heads, seq_len, seq_len]
+        attn_weights = (torch.matmul(query_states, key_states.transpose(2,3)) * self.scale)
 
 class SiglipEncoderLayer(nn.Module):
 

@@ -1,11 +1,16 @@
+import csv
 import hashlib
+import json
 import os
-from typing import Iterable, Optional
+from glob import glob
+from typing import Iterable
 
+import cv2
 import numpy as np
 import torch
+import torch.nn.functional as F
 from PIL import Image
-from torch.utils.data import DataLoader, IterableDataset, get_worker_info
+from torch.utils.data import DataLoader, Dataset, IterableDataset, get_worker_info
 
 
 DEFAULT_PROMPT = "Describe what is happening in this egocentric video."
@@ -44,15 +49,45 @@ def build_vlm_processor(args):
     return processor
 
 
+def _sample_frame_indices(num_frames: int, num_samples: int):
+    if num_frames <= 0:
+        raise ValueError("num_frames must be positive.")
+    if num_frames <= num_samples:
+        return list(range(num_frames))
+    return np.linspace(0, num_frames - 1, num=num_samples, dtype=np.int64).tolist()
+
+
+def _parse_timecode_seconds(value):
+    if value in (None, ""):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip()
+    if not text:
+        return None
+    parts = text.split(":")
+    try:
+        if len(parts) == 3:
+            hours = float(parts[0])
+            minutes = float(parts[1])
+            seconds = float(parts[2])
+            return hours * 3600.0 + minutes * 60.0 + seconds
+        if len(parts) == 2:
+            minutes = float(parts[0])
+            seconds = float(parts[1])
+            return minutes * 60.0 + seconds
+        return float(text)
+    except ValueError:
+        return None
+
+
 def _frame_to_pil(frame):
     if isinstance(frame, Image.Image):
         return frame.convert("RGB")
-
     if torch.is_tensor(frame):
         frame = frame.detach().cpu().numpy()
     else:
         frame = np.asarray(frame)
-
     if frame.ndim == 3 and frame.shape[0] in (1, 3):
         frame = np.transpose(frame, (1, 2, 0))
     if frame.ndim == 2:
@@ -67,81 +102,46 @@ def _frame_to_pil(frame):
     return Image.fromarray(frame).convert("RGB")
 
 
-def _sample_frame_indices(num_frames: int, num_samples: int):
-    if num_frames <= 0:
-        raise ValueError("num_frames must be positive.")
-    if num_frames <= num_samples:
-        return list(range(num_frames))
-    return np.linspace(0, num_frames - 1, num=num_samples, dtype=np.int64).tolist()
+def decode_mp4_frames(video_path: str, num_frames: int, start_time_sec=None, end_time_sec=None):
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open video: {video_path}")
 
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+    if frame_count <= 0:
+        cap.release()
+        raise RuntimeError(f"Video has no readable frames: {video_path}")
 
-def _load_npy_video(video_path: str):
-    array = np.load(video_path, allow_pickle=False)
-    if array.ndim == 5 and array.shape[0] == 1:
-        array = array[0]
-    if array.ndim not in (3, 4):
-        raise ValueError(f"Unsupported video array shape {array.shape} from {video_path}")
-    return array
+    start_frame = 0
+    end_frame = frame_count - 1
+    if fps > 0.0:
+        if start_time_sec is not None:
+            start_frame = max(0, min(frame_count - 1, int(start_time_sec * fps)))
+        if end_time_sec is not None:
+            end_frame = max(start_frame, min(frame_count - 1, int(end_time_sec * fps)))
+    clip_frame_count = max(1, end_frame - start_frame + 1)
+    wanted = {start_frame + idx for idx in _sample_frame_indices(clip_frame_count, num_frames)}
+    frames = []
+    cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+    cur = start_frame
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        if cur > end_frame:
+            break
+        if cur in wanted:
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frames.append(Image.fromarray(frame))
+        cur += 1
+    cap.release()
 
-
-def _decode_npy_frames(video_array, num_frames: int):
-    if video_array.ndim == 3:
-        video_array = video_array[None, ...]
-    total_frames = int(video_array.shape[0])
-    frame_indices = _sample_frame_indices(total_frames, num_frames)
-    frames = [_frame_to_pil(video_array[idx]) for idx in frame_indices]
-    if len(frames) < num_frames and frames:
+    if not frames:
+        raise RuntimeError(f"Failed to decode any frames from {video_path}")
+    if len(frames) < num_frames:
         frames.extend([frames[-1]] * (num_frames - len(frames)))
     return frames
-
-
-def resolve_video_path(args, video_ref: str) -> str:
-    if os.path.isfile(video_ref):
-        return video_ref
-    if args.video_root:
-        candidate = os.path.join(args.video_root, video_ref)
-        if os.path.isfile(candidate):
-            return candidate
-    try:
-        from huggingface_hub import hf_hub_download
-    except Exception as e:
-        raise RuntimeError(
-            "Could not resolve the Ego4D video file. Install `huggingface_hub` or pass --video_root pointing to the downloaded .npy files."
-        ) from e
-    return hf_hub_download(
-        repo_id=args.dataset_name,
-        filename=video_ref,
-        repo_type="dataset",
-        revision=args.dataset_revision,
-    )
-
-
-def _normalize_turn_role(role: str) -> str:
-    role = str(role).strip().lower()
-    if role in {"human", "user"}:
-        return "user"
-    if role in {"gpt", "assistant"}:
-        return "assistant"
-    return role
-
-
-def parse_conversations(conversations) -> tuple[str, str]:
-    if not conversations:
-        return DEFAULT_PROMPT, ""
-    user_turns = []
-    assistant_turns = []
-    for turn in conversations:
-        if not isinstance(turn, dict):
-            continue
-        role = _normalize_turn_role(turn.get("from", turn.get("role", "")))
-        value = str(turn.get("value", turn.get("content", ""))).strip()
-        if role == "user" and value:
-            user_turns.append(value)
-        elif role == "assistant" and value:
-            assistant_turns.append(value)
-    prompt = "\n".join(user_turns).strip() or DEFAULT_PROMPT
-    answer = "\n".join(assistant_turns).strip()
-    return prompt, answer
 
 
 def build_sft_example(processor, frames, prompt, answer, vl_backend, max_text_len):
@@ -166,34 +166,58 @@ def build_sft_example(processor, frames, prompt, answer, vl_backend, max_text_le
             return f"<image>\n{text}"
         return text
 
-    prompt_with_media = _add_media_token(prompt_text)
-    full_with_media = _add_media_token(full_text)
+    if vl_backend == "internvl" and hasattr(processor, "apply_chat_template"):
+        user_message = {
+            "role": "user",
+            "content": [
+                {"type": "video"},
+                {"type": "text", "text": prompt},
+            ],
+        }
+        prompt_with_media = processor.apply_chat_template(
+            [user_message],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        full_with_media = processor.apply_chat_template(
+            [
+                user_message,
+                {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": answer}],
+                },
+            ],
+            tokenize=False,
+            add_generation_prompt=False,
+        )
+    else:
+        prompt_with_media = _add_media_token(prompt_text)
+        full_with_media = _add_media_token(full_text)
 
     try:
-        inputs = processor(
-            text=full_with_media,
-            videos=frames,
-            return_tensors="pt",
-            padding="max_length",
-            truncation=True,
-            max_length=max_text_len,
-        )
+        processor_kwargs = {
+            "text": [full_with_media],
+            "videos": [frames],
+            "return_tensors": "pt",
+        }
+        processor_kwargs["padding"] = "longest"
+        processor_kwargs["truncation"] = False
+        inputs = processor(**processor_kwargs)
     except TypeError:
-        inputs = processor(
-            text=full_with_media,
-            images=frames,
-            return_tensors="pt",
-            padding="max_length",
-            truncation=True,
-            max_length=max_text_len,
-        )
+        processor_kwargs = {
+            "text": [full_with_media],
+            "images": [frames],
+            "return_tensors": "pt",
+        }
+        processor_kwargs["padding"] = "longest"
+        processor_kwargs["truncation"] = False
+        inputs = processor(**processor_kwargs)
 
     prompt_ids = tokenizer(
         prompt_with_media,
         return_tensors="pt",
         padding=False,
-        truncation=True,
-        max_length=max_text_len,
+        truncation=False,
         add_special_tokens=True,
     )["input_ids"][0]
 
@@ -203,8 +227,11 @@ def build_sft_example(processor, frames, prompt, answer, vl_backend, max_text_le
             value = value.squeeze(0)
         packed[key] = value
 
+    pad_token_id = tokenizer.pad_token_id
+    if pad_token_id is None:
+        pad_token_id = tokenizer.eos_token_id
     labels = packed["input_ids"].clone()
-    labels[labels == tokenizer.pad_token_id] = -100
+    labels[labels == pad_token_id] = -100
     prompt_len = min(int(prompt_ids.numel()), int(labels.numel()))
     labels[:prompt_len] = -100
     packed["labels"] = labels
@@ -218,28 +245,352 @@ def _stable_fold(value: str, seed: int) -> float:
     return int(digest[:8], 16) / 0xFFFFFFFF
 
 
-class Ego4DConversationDataset(IterableDataset):
-    def __init__(self, dataset, processor, args, split_name: str, is_train: bool):
-        self.dataset = dataset
+def _expand_annotation_paths(path_spec: str):
+    if not path_spec:
+        return []
+
+    raw_parts = [part.strip() for part in path_spec.split(",") if part.strip()]
+    if not raw_parts:
+        raw_parts = [path_spec]
+
+    expanded = []
+    for part in raw_parts:
+        if os.path.isdir(part):
+            expanded.extend(sorted(glob(os.path.join(part, "*.json"))))
+            expanded.extend(sorted(glob(os.path.join(part, "*.jsonl"))))
+            expanded.extend(sorted(glob(os.path.join(part, "*.csv"))))
+        else:
+            expanded.append(part)
+
+    # Preserve order while removing duplicates.
+    deduped = []
+    seen = set()
+    for path in expanded:
+        if path not in seen:
+            deduped.append(path)
+            seen.add(path)
+    return deduped
+
+
+def _load_single_records(path: str):
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"Annotation file not found: {path}")
+
+    if path.endswith(".jsonl"):
+        records = []
+        with open(path, "r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if line:
+                    records.append(json.loads(line))
+        return records
+
+    if path.endswith(".json"):
+        with open(path, "r", encoding="utf-8") as handle:
+            obj = json.load(handle)
+        if isinstance(obj, list):
+            return obj
+        if isinstance(obj, dict):
+            if obj and all(isinstance(value, dict) for value in obj.values()):
+                records = []
+                for sample_id, value in obj.items():
+                    item = dict(value)
+                    item.setdefault("id", sample_id)
+                    records.append(item)
+                return records
+            for key in ("data", "samples", "annotations", "items"):
+                value = obj.get(key)
+                if isinstance(value, list):
+                    return value
+        raise RuntimeError("JSON annotation file must be a list or contain one of: data/samples/annotations/items.")
+
+    if path.endswith(".csv"):
+        with open(path, "r", encoding="utf-8", newline="") as handle:
+            return list(csv.DictReader(handle))
+
+    raise RuntimeError("Unsupported annotation file format. Use .json, .jsonl, or .csv")
+
+
+def _load_records(args):
+    path = args.annotation_path
+    if not path:
+        raise RuntimeError(
+            "HD-EPIC training requires --annotation_path pointing to a local json/jsonl/csv supervision file."
+        )
+    paths = _expand_annotation_paths(path)
+    if not paths:
+        raise FileNotFoundError(f"No annotation files found for: {path}")
+
+    records = []
+    for one_path in paths:
+        task_name = os.path.splitext(os.path.basename(one_path))[0]
+        for record in _load_single_records(one_path):
+            if isinstance(record, dict):
+                record = dict(record)
+                record.setdefault("task_name", task_name)
+            records.append(record)
+    return records
+
+
+def _discover_hd_epic_records(args):
+    if not args.video_root or not args.metadata_root:
+        raise RuntimeError(
+            "HD-EPIC auto-discovery requires both --video_root and --metadata_root when --annotation_path is not set."
+        )
+
+    records = []
+    for root, _, files in os.walk(args.video_root):
+        for filename in files:
+            if not filename.lower().endswith(f".{args.video_extension.lower()}"):
+                continue
+            video_path = os.path.join(root, filename)
+            video_id = os.path.splitext(filename)[0]
+            participant = video_id.split("-", 1)[0]
+            metadata_path = os.path.join(args.metadata_root, participant, video_id, "framewise_info.jsonl")
+            if not os.path.isfile(metadata_path):
+                continue
+            records.append(
+                {
+                    "id": video_id,
+                    "video_id": video_id,
+                    "participant_id": participant,
+                    "video_path": video_path,
+                    "metadata_path": metadata_path,
+                }
+            )
+
+    if not records:
+        raise RuntimeError("No HD-EPIC video/metadata pairs were found. Check --video_root and --metadata_root.")
+    return sorted(records, key=lambda item: item["video_id"])
+
+
+def _normalize_text(value):
+    if value is None:
+        return ""
+    if isinstance(value, (list, tuple)):
+        return "\n".join(_normalize_text(item) for item in value if item is not None).strip()
+    return str(value).strip()
+
+
+def _get_first(record, keys):
+    for key in keys:
+        if key and key in record and record[key] not in (None, ""):
+            return record[key]
+    return None
+
+
+def _get_nested(record, path):
+    current = record
+    for key in path:
+        if not isinstance(current, dict) or key not in current:
+            return None
+        current = current[key]
+    return current
+
+
+def _get_hd_epic_video_entry(record):
+    inputs = record.get("inputs")
+    if not isinstance(inputs, dict):
+        return None
+    for key in ("video1", "video_1", "video", "clip"):
+        value = inputs.get(key)
+        if isinstance(value, dict):
+            return value
+
+    def _find_video_entry(obj):
+        if isinstance(obj, dict):
+            if "id" in obj and any(key in obj for key in ("start_time", "end_time", "path", "video_path")):
+                return obj
+            if "id" in obj:
+                return obj
+            for value in obj.values():
+                found = _find_video_entry(value)
+                if found is not None:
+                    return found
+        elif isinstance(obj, list):
+            for value in obj:
+                found = _find_video_entry(value)
+                if found is not None:
+                    return found
+        return None
+
+    found = _find_video_entry(inputs)
+    if found is not None:
+        return found
+    return None
+
+
+def _resolve_hd_epic_video_path(args, record):
+    direct = _get_first(record, [args.video_path_column, "video_path", "clip_path", "path"])
+    if direct:
+        direct = str(direct)
+        if os.path.isfile(direct):
+            return direct
+        if args.video_root:
+            candidate = os.path.join(args.video_root, direct)
+            if os.path.isfile(candidate):
+                return candidate
+
+    video_id = _get_first(record, [args.video_id_column, "video_id", "clip_id", "uid", "video_uid"])
+    if not video_id:
+        video_entry = _get_hd_epic_video_entry(record)
+        if video_entry is not None:
+            video_id = video_entry.get("id")
+    if not video_id:
+        raise RuntimeError(
+            f"Could not resolve a video path for record. Set --video_id_column/--video_path_column. Keys: {sorted(record.keys())}"
+        )
+    video_id = str(video_id)
+    participant = _get_first(record, [args.participant_column, "participant_id", "participant", "user_id"])
+    if not participant:
+        participant = video_id.split("-", 1)[0]
+
+    candidate = os.path.join(args.video_root, str(participant), f"{video_id}.{args.video_extension}")
+    if os.path.isfile(candidate):
+        return candidate
+
+    alt = os.path.join(args.video_root, f"{video_id}.{args.video_extension}")
+    if os.path.isfile(alt):
+        return alt
+
+    raise FileNotFoundError(
+        f"Could not find video for video_id={video_id}. Tried {candidate} and {alt}. "
+        "Check --video_root, --video_extension, and the annotation columns."
+    )
+
+
+def _resolve_hd_epic_clip_window(record):
+    video_entry = _get_hd_epic_video_entry(record)
+    start_time = video_entry.get("start_time") if video_entry is not None else None
+    end_time = video_entry.get("end_time") if video_entry is not None else None
+    if start_time in (None, ""):
+        start_time = _get_first(record, ["start_time", "clip_start_time", "video_start_time"])
+    if end_time in (None, ""):
+        end_time = _get_first(record, ["end_time", "clip_end_time", "video_end_time"])
+    return _parse_timecode_seconds(start_time), _parse_timecode_seconds(end_time)
+
+
+def _resolve_hd_epic_future_window(record, future_offset_sec: float, future_duration_sec: float):
+    start_time_sec, end_time_sec = _resolve_hd_epic_clip_window(record)
+    if end_time_sec is None:
+        raise RuntimeError("Future prediction requires annotation records with clip end times.")
+    current_duration = 0.0
+    if start_time_sec is not None:
+        current_duration = max(0.0, end_time_sec - start_time_sec)
+    duration = future_duration_sec if future_duration_sec > 0 else current_duration
+    if duration <= 0:
+        duration = 1.0
+    future_start = end_time_sec + max(0.0, future_offset_sec)
+    future_end = future_start + duration
+    return future_start, future_end
+
+
+def _build_prompt_answer(args, record):
+    prompt = _get_first(record, [args.question_column, "question", "prompt", "instruction", "query"])
+    answer = _get_first(record, [args.answer_column, "answer", "response", "label", "caption", "narration"])
+    choices = _get_first(record, [args.options_column, "options", "choices", "answer_options"])
+    correct_idx = _get_first(record, ["correct_idx", "answer_idx", "label_idx"])
+    prompt = _normalize_text(prompt) or DEFAULT_PROMPT
+    answer = _normalize_text(answer)
+    if not answer and choices and correct_idx not in (None, ""):
+        normalized_choices = list(choices) if isinstance(choices, (list, tuple)) else [choices]
+        try:
+            idx = int(correct_idx)
+            if 0 <= idx < len(normalized_choices):
+                answer = _normalize_text(normalized_choices[idx])
+            elif 1 <= idx <= len(normalized_choices):
+                answer = _normalize_text(normalized_choices[idx - 1])
+        except (TypeError, ValueError):
+            pass
+
+    if choices:
+        options_text = _normalize_text(choices)
+        if options_text:
+            prompt = f"{prompt}\nOptions:\n{options_text}"
+
+    if not answer:
+        raise RuntimeError(
+            "The selected annotation record does not contain a target answer. "
+            "Set --answer_column to a valid field in your HD-EPIC annotation file."
+        )
+    return prompt, answer
+
+
+def _round_list(values, ndigits=3):
+    return [round(float(v), ndigits) for v in values]
+
+
+def _extract_translation(transform):
+    if not isinstance(transform, list) or len(transform) < 3:
+        return None
+    try:
+        return [float(transform[0][3]), float(transform[1][3]), float(transform[2][3])]
+    except Exception:
+        return None
+
+
+def _build_prompt_answer_from_metadata(record):
+    metadata_path = record.get("metadata_path")
+    if not metadata_path or not os.path.isfile(metadata_path):
+        raise RuntimeError(f"Missing metadata file for record: {record.get('video_id', 'unknown')}")
+
+    entries = []
+    with open(metadata_path, "r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if line:
+                entries.append(json.loads(line))
+    if not entries:
+        raise RuntimeError(f"Metadata file has no entries: {metadata_path}")
+
+    sample_idxs = _sample_frame_indices(len(entries), min(3, len(entries)))
+    sampled = [entries[idx] for idx in sample_idxs]
+
+    def _frame_summary(entry, tag):
+        parts = [f"{tag}_frame={entry.get('frame_index', -1)}"]
+        gaze = entry.get("gaze_centre_in_pixels")
+        parts.append(f"{tag}_gaze={_round_list(gaze, 1)}" if gaze is not None else f"{tag}_gaze=none")
+        translation = _extract_translation(entry.get("T_world_device"))
+        parts.append(
+            f"{tag}_position={_round_list(translation, 3)}" if translation is not None else f"{tag}_position=none"
+        )
+        gaze_dir = entry.get("gaze_direction_in_world")
+        parts.append(
+            f"{tag}_gaze_dir={_round_list(gaze_dir, 3)}" if gaze_dir is not None else f"{tag}_gaze_dir=none"
+        )
+        return "; ".join(parts)
+
+    prompt = "Summarize the wearer motion and gaze at the start, middle, and end of this egocentric video."
+    answer = "; ".join(
+        [
+            f"id={record['video_id']}",
+            f"frames={len(entries)}",
+            _frame_summary(sampled[0], "start"),
+            _frame_summary(sampled[len(sampled) // 2], "middle"),
+            _frame_summary(sampled[-1], "end"),
+        ]
+    )
+    return prompt, answer
+
+
+class LocalHD_EPICDataset(IterableDataset):
+    def __init__(self, records, processor, args, split_name: str, is_train: bool):
+        self.records = records
         self.processor = processor
         self.args = args
         self.split_name = split_name
         self.is_train = is_train
 
-    def _iter_dataset(self) -> Iterable:
-        dataset = self.dataset
+    def _iter_records(self):
         worker = get_worker_info()
         worker_id = worker.id if worker is not None else 0
         num_workers = worker.num_workers if worker is not None else 1
-
-        if hasattr(dataset, "shard") and num_workers > 1:
-            dataset = dataset.shard(num_shards=num_workers, index=worker_id, contiguous=False)
-        if self.is_train and hasattr(dataset, "shuffle"):
-            dataset = dataset.shuffle(seed=self.args.seed + worker_id, buffer_size=self.args.shuffle_buffer)
-        if hasattr(dataset, "__iter__") and not hasattr(dataset, "__len__"):
-            return iter(dataset)
-        indices = range(worker_id, len(dataset), num_workers)
-        return (dataset[idx] for idx in indices)
+        indices = list(range(worker_id, len(self.records), num_workers))
+        if self.is_train and indices:
+            generator = np.random.default_rng(self.args.seed + worker_id)
+            generator.shuffle(indices)
+        for idx in indices:
+            yield self.records[idx]
 
     def _keep_sample(self, sample_id: str) -> bool:
         val_ratio = max(0.0, min(0.5, float(self.args.val_ratio)))
@@ -251,17 +602,27 @@ class Ego4DConversationDataset(IterableDataset):
 
     def __iter__(self):
         sample_count = 0
-        for sample in self._iter_dataset():
-            sample_id = str(sample.get(self.args.id_column, sample.get("id", sample_count)))
+        for record in self._iter_records():
+            sample_id = str(
+                _get_first(record, [self.args.id_column, "id", "sample_id", "uid", "video_id"]) or sample_count
+            )
             if not self._keep_sample(sample_id):
                 continue
             if self.args.max_samples_per_split > 0 and sample_count >= self.args.max_samples_per_split:
                 break
 
-            prompt, answer = parse_conversations(sample.get(self.args.conversations_column))
-            video_ref = str(sample[self.args.video_column])
-            video_path = resolve_video_path(self.args, video_ref)
-            frames = _decode_npy_frames(_load_npy_video(video_path), self.args.video_frames)
+            video_path = _resolve_hd_epic_video_path(self.args, record)
+            if self.args.annotation_path:
+                prompt, answer = _build_prompt_answer(self.args, record)
+            else:
+                prompt, answer = _build_prompt_answer_from_metadata(record)
+            start_time_sec, end_time_sec = _resolve_hd_epic_clip_window(record)
+            frames = decode_mp4_frames(
+                video_path,
+                self.args.video_frames,
+                start_time_sec=start_time_sec,
+                end_time_sec=end_time_sec,
+            )
             packed = build_sft_example(
                 processor=self.processor,
                 frames=frames,
@@ -270,15 +631,74 @@ class Ego4DConversationDataset(IterableDataset):
                 vl_backend=self.args.vl_backend,
                 max_text_len=self.args.vl_max_text_len,
             )
+
             sample_count += 1
             yield {
                 "inputs": {k: v for k, v in packed.items() if k not in {"labels", "prompt_text", "answer_text"}},
                 "labels": packed["labels"],
-                "prompt_text": packed["prompt_text"],
-                "answer_text": packed["answer_text"],
-                "sample_id": sample_id,
-                "video_ref": video_ref,
             }
+
+
+class HD_EPICFuturePredictionDataset(Dataset):
+    def __init__(self, records, args, split_name: str, is_train: bool):
+        self.args = args
+        selected = []
+        for idx, record in enumerate(records):
+            sample_id = str(_get_first(record, [args.id_column, "id", "sample_id", "uid", "video_id"]) or idx)
+            val_ratio = max(0.0, min(0.5, float(args.val_ratio)))
+            if val_ratio > 0.0:
+                fold = _stable_fold(sample_id, args.seed)
+                in_val = fold < val_ratio
+                if is_train and in_val:
+                    continue
+                if (not is_train) and (not in_val):
+                    continue
+            selected.append(record)
+            if args.max_samples_per_split > 0 and len(selected) >= args.max_samples_per_split:
+                break
+        self.records = selected
+        self.split_name = split_name
+        self.is_train = is_train
+
+    def __len__(self):
+        return len(self.records)
+
+    def __getitem__(self, index):
+        record = self.records[index]
+        video_path = _resolve_hd_epic_video_path(self.args, record)
+        context_start_sec, context_end_sec = _resolve_hd_epic_clip_window(record)
+        future_start_sec, future_end_sec = _resolve_hd_epic_future_window(
+            record,
+            future_offset_sec=self.args.future_offset_sec,
+            future_duration_sec=self.args.future_duration_sec,
+        )
+        context_frames = decode_mp4_frames(
+            video_path,
+            self.args.video_frames,
+            start_time_sec=context_start_sec,
+            end_time_sec=context_end_sec,
+        )
+        future_frames = decode_mp4_frames(
+            video_path,
+            self.args.future_frames,
+            start_time_sec=future_start_sec,
+            end_time_sec=future_end_sec,
+        )
+        return {
+            "id": str(_get_first(record, [self.args.id_column, "id", "sample_id", "uid", "video_id"]) or index),
+            "task_name": str(record.get("task_name", "unknown")),
+            "video_path": video_path,
+            "context_frames": context_frames,
+            "future_frames": future_frames,
+            "context_window": torch.tensor(
+                [context_start_sec or 0.0, context_end_sec or 0.0],
+                dtype=torch.float32,
+            ),
+            "future_window": torch.tensor(
+                [future_start_sec or 0.0, future_end_sec or 0.0],
+                dtype=torch.float32,
+            ),
+        }
 
 
 def _stack_inputs(items):
@@ -288,6 +708,13 @@ def _stack_inputs(items):
         if torch.is_tensor(values[0]):
             if key == "pixel_values" and values[0].dim() == 4:
                 output[key] = torch.cat(values, dim=0)
+            elif key in {"input_ids", "attention_mask"}:
+                max_len = max(int(v.shape[0]) for v in values)
+                pad_value = 0
+                if key == "input_ids":
+                    pad_value = 0
+                padded = [F.pad(v, (0, max_len - int(v.shape[0])), value=pad_value) for v in values]
+                output[key] = torch.stack(padded, dim=0)
             else:
                 output[key] = torch.stack(values, dim=0)
         else:
@@ -295,39 +722,61 @@ def _stack_inputs(items):
     return output
 
 
-def collate_ego4d_batch(batch):
+def collate_sft_batch(batch):
+    max_len = max(int(item["labels"].shape[0]) for item in batch)
+    labels = [
+        F.pad(item["labels"], (0, max_len - int(item["labels"].shape[0])), value=-100)
+        for item in batch
+    ]
     return {
         "inputs": _stack_inputs([item["inputs"] for item in batch]),
-        "labels": torch.stack([item["labels"] for item in batch], dim=0),
-        "prompt_text": [item["prompt_text"] for item in batch],
-        "answer_text": [item["answer_text"] for item in batch],
-        "sample_id": [item["sample_id"] for item in batch],
-        "video_ref": [item["video_ref"] for item in batch],
+        "labels": torch.stack(labels, dim=0),
     }
 
 
-def _load_split(args, split: str):
-    from datasets import load_dataset
-
-    load_kwargs = {
-        "name": args.dataset_config or None,
-        "split": args.dataset_split,
-        "streaming": args.streaming,
+def collate_future_batch(batch):
+    return {
+        "ids": [item["id"] for item in batch],
+        "task_names": [item["task_name"] for item in batch],
+        "video_paths": [item["video_path"] for item in batch],
+        "context_frames": [item["context_frames"] for item in batch],
+        "future_frames": [item["future_frames"] for item in batch],
+        "context_window": torch.stack([item["context_window"] for item in batch], dim=0),
+        "future_window": torch.stack([item["future_window"] for item in batch], dim=0),
     }
-    if args.trust_remote_code_dataset:
-        load_kwargs["trust_remote_code"] = True
-    return load_dataset(args.dataset_name, **load_kwargs)
 
 
-def ego4d_video_loader(args, split: str, batch_size: int, num_workers: int, is_train: bool):
-    dataset = _load_split(args, split)
+def build_train_loader(args, split: str, batch_size: int, num_workers: int, is_train: bool):
     processor = build_vlm_processor(args)
-    wrapped = Ego4DConversationDataset(dataset=dataset, processor=processor, args=args, split_name=split, is_train=is_train)
-    loader = DataLoader(
-        wrapped,
+
+    if args.dataset_type == "hd_epic_local":
+        records = _load_records(args) if args.annotation_path else _discover_hd_epic_records(args)
+        dataset = LocalHD_EPICDataset(
+            records=records, processor=processor, args=args, split_name=split, is_train=is_train
+        )
+    else:
+        raise RuntimeError(
+            f"Unsupported dataset_type={args.dataset_type}. "
+            "HD-EPIC integration uses --dataset_type hd_epic_local."
+        )
+
+    return DataLoader(
+        dataset,
         batch_size=batch_size,
         num_workers=num_workers,
-        collate_fn=collate_ego4d_batch,
+        collate_fn=collate_sft_batch,
         pin_memory=torch.cuda.is_available(),
     )
-    return loader
+
+
+def build_future_prediction_loader(args, split: str, batch_size: int, num_workers: int, is_train: bool):
+    records = _load_records(args)
+    dataset = HD_EPICFuturePredictionDataset(records=records, args=args, split_name=split, is_train=is_train)
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        shuffle=is_train,
+        collate_fn=collate_future_batch,
+        pin_memory=torch.cuda.is_available(),
+    )
