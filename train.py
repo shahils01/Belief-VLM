@@ -324,6 +324,9 @@ def main():
         torch.autograd.set_detect_anomaly(True)
     if args.peft == "qlora" and args.fsdp:
         raise RuntimeError("FSDP + QLoRA is not supported.")
+    if args.use_future_predictor and not args.ddp_find_unused_parameters:
+        args.ddp_find_unused_parameters = True
+        print("Enabling DDP find_unused_parameters for future-conditioned training.")
 
     if args.peft == "qlora":
         try:
