@@ -67,7 +67,7 @@ def parse_args():
 
     parser.add_argument("--beta", type=float, default=1.0)
     parser.add_argument("--recon_weight", type=float, default=1.0)
-    parser.add_argument("--temporal_nce_weight", type=float, default=0.0)
+    parser.add_argument("--temporal_nce_weight", type=float, default=1.0)
     return parser.parse_args()
 
 

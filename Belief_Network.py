@@ -476,13 +476,14 @@ class RecursiveBeliefNetwork(nn.Module):
 
             tokens = torch.stack([b_tok, x_t, v_t], dim=1)         # [B, 3, D]
             attn_tokens = self.attention(tokens, tokens, tokens)   # [B, 3, D]
-            f_t, _ = self.pool(attn_tokens[:, 2:, :])              # [B, D]
+            f_t = attn_tokens[:, 2:, :]                            # [B, D]
+            e_t, _ = self.pool(f_t)                                # [B, D]
 
             mu_p, log_sigma_p = self.prior_net(belief_prev)
-            mu_q, log_sigma_q = self.posterior_net(belief_prev.unsqueeze(1), f_t)
+            mu_q, log_sigma_q = self.posterior_net(belief_prev.unsqueeze(1), e_t)
             z_t = self._reparameterize(mu_q, log_sigma_q)
 
-            belief_t, hidden_state = self.gru(hidden_state, f_t, z_t, return_hidden=True)
+            belief_t, hidden_state = self.gru(hidden_state, e_t, z_t, return_hidden=True)
             belief_prev = belief_t
 
             pred_next = self.decoder(torch.cat([belief_t, z_t], dim=-1))
@@ -491,7 +492,7 @@ class RecursiveBeliefNetwork(nn.Module):
             pred_next_list.append(pred_next)
             target_next_list.append(target_next)
             kl_list.append(self._kl_divergence(mu_q, log_sigma_q, mu_p, log_sigma_p))
-            pooled_features.append(f_t)
+            pooled_features.append(e_t)
             belief_traj.append(belief_t)
 
         if len(pred_next_list) == 0:
@@ -509,6 +510,8 @@ class RecursiveBeliefNetwork(nn.Module):
         pred_next = torch.stack(pred_next_list, dim=1)
         target_next = torch.stack(target_next_list, dim=1)
         kl_loss = torch.stack(kl_list, dim=1).mean()
+        print('pred_next shape: ', pred_next.shape)
+        print('target_next shape: ', target_next.shape)
         recon_loss = self.recon(pred_next, target_next)
 
         temporal_nce_loss = visual_seq.new_zeros(())

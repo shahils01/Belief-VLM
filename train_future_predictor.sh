@@ -13,7 +13,7 @@ accelerate launch --num_processes 1 train_future_predictor.py \
   --future_frames "$FUTURE_FRAMES" \
   --future_offset_sec "$FUTURE_OFFSET_SEC" \
   --future_duration_sec "$FUTURE_DURATION_SEC" \
-  --batch_size 64 \
+  --batch_size 32 \
   --num_workers 4 \
   --epochs 500 \
   --log_every 20 \
