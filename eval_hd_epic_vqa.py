@@ -44,7 +44,7 @@ def parse_args():
     parser.add_argument("--gradient_checkpointing", action="store_true")
     parser.add_argument("--disable_vl_cache", action="store_true")
     parser.add_argument("--allow_tf32", action="store_true")
-    parser.add_argument("--max_samples", type=int, default=0)
+    parser.add_argument("--max_samples", type=int, default=100)
     parser.add_argument("--print_samples", type=int, default=10)
     parser.add_argument("--progress_every", type=int, default=50)
     parser.add_argument("--save_predictions", type=str, default="")
