@@ -44,6 +44,8 @@ def parse_args():
     parser.add_argument("--use_future_predictor", action="store_true")
     parser.add_argument("--future_predictor_checkpoint", type=str, default="")
     parser.add_argument("--future_frames", type=int, default=None)
+    parser.add_argument("--use_belief_network", action="store_true")
+    parser.add_argument("--belief_network_checkpoint", type=str, default="")
     parser.add_argument("--freeze_vl", action="store_true")
     parser.add_argument("--gradient_checkpointing", action="store_true")
     parser.add_argument("--disable_vl_cache", action="store_true")
@@ -100,6 +102,9 @@ def _merge_args(cli_args, ckpt_args):
     if cli_args.use_future_predictor:
         merged["use_future_predictor"] = True
         merged["future_predictor_checkpoint"] = cli_args.future_predictor_checkpoint
+    if cli_args.use_belief_network:
+        merged["use_belief_network"] = True
+        merged["belief_network_checkpoint"] = cli_args.belief_network_checkpoint
 
     merged.setdefault("vl_backend", "internvl")
     merged.setdefault("vl_model_preset", "internvl3_5_1b")
@@ -112,6 +117,8 @@ def _merge_args(cli_args, ckpt_args):
     merged.setdefault("use_future_predictor", False)
     merged.setdefault("future_predictor_checkpoint", "")
     merged.setdefault("future_frames", 0)
+    merged.setdefault("use_belief_network", False)
+    merged.setdefault("belief_network_checkpoint", "")
     merged.setdefault("lora_r", 16)
     merged.setdefault("lora_alpha", 32)
     merged.setdefault("lora_dropout", 0.05)
@@ -121,6 +128,7 @@ def _merge_args(cli_args, ckpt_args):
     merged.setdefault("disable_vl_cache", False)
     merged.setdefault("allow_tf32", False)
     merged["future_predictor_bundle"] = getattr(cli_args, "future_predictor_bundle", None)
+    merged["belief_network_bundle"] = getattr(cli_args, "belief_network_bundle", None)
     return SimpleNamespace(**merged)
 
 
@@ -136,6 +144,17 @@ def _restore_bundled_future_predictor_args(args, ckpt):
     bundle_args = bundle.get("args", {})
     if int(getattr(args, "future_frames", 0) or 0) <= 0:
         args.future_frames = int(bundle_args.get("future_frames", args.future_frames or 0))
+
+
+def _restore_bundled_belief_network_args(args, ckpt):
+    if not isinstance(ckpt, dict):
+        return
+    bundle = ckpt.get("belief_network")
+    if bundle is None:
+        return
+    args.use_belief_network = True
+    if not getattr(args, "belief_network_checkpoint", ""):
+        args.belief_network_bundle = bundle
 
 
 def _build_quant_config(args):
@@ -229,14 +248,21 @@ def evaluate(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     ckpt = torch.load(args.checkpoint, map_location="cpu") if args.checkpoint else {}
     _restore_bundled_future_predictor_args(args, ckpt)
+    _restore_bundled_belief_network_args(args, ckpt)
     ckpt_args = ckpt.get("args", {}) if isinstance(ckpt, dict) else {}
     merged_args = _merge_args(args, ckpt_args)
+    if merged_args.use_future_predictor and merged_args.use_belief_network:
+        raise RuntimeError("Use only one of --use_future_predictor or --use_belief_network.")
     if merged_args.use_future_predictor:
         has_bundled_predictor = getattr(merged_args, "future_predictor_bundle", None) is not None
         if not merged_args.future_predictor_checkpoint and not has_bundled_predictor:
             raise RuntimeError("--use_future_predictor requires --future_predictor_checkpoint.")
         if int(merged_args.future_frames) <= 0:
             raise RuntimeError("--use_future_predictor requires --future_frames > 0.")
+    if merged_args.use_belief_network:
+        has_bundled_belief = getattr(merged_args, "belief_network_bundle", None) is not None
+        if not merged_args.belief_network_checkpoint and not has_bundled_belief:
+            raise RuntimeError("--use_belief_network requires --belief_network_checkpoint.")
     model, _ = _load_model(args.checkpoint, merged_args, device=device)
     processor = model.backbone.processor
     records = _load_records(merged_args)

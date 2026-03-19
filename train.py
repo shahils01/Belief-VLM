@@ -100,6 +100,8 @@ def parse_args():
     parser.add_argument("--use_future_predictor", action="store_true")
     parser.add_argument("--future_predictor_checkpoint", type=str, default="")
     parser.add_argument("--future_frames", type=int, default=0)
+    parser.add_argument("--use_belief_network", action="store_true")
+    parser.add_argument("--belief_network_checkpoint", type=str, default="")
 
     parser.add_argument("--peft", type=str, default="none", choices=["none", "lora", "qlora"])
     parser.add_argument("--lora_r", type=int, default=16)
@@ -187,6 +189,8 @@ def build_model(args, device):
         use_cache=not args.disable_vl_cache,
         future_predictor_checkpoint=args.future_predictor_checkpoint if args.use_future_predictor else "",
         future_predictor_bundle=getattr(args, "future_predictor_bundle", None) if args.use_future_predictor else None,
+        belief_network_checkpoint=args.belief_network_checkpoint if args.use_belief_network else "",
+        belief_network_bundle=getattr(args, "belief_network_bundle", None) if args.use_belief_network else None,
         future_context_frames=args.video_frames if args.use_future_predictor else 0,
         future_frames=args.future_frames if args.use_future_predictor else 0,
     )
@@ -254,6 +258,17 @@ def _restore_bundled_future_predictor_args(args, ckpt):
         args.future_frames = int(bundle_args.get("future_frames", args.future_frames or 0))
 
 
+def _restore_bundled_belief_network_args(args, ckpt):
+    if not isinstance(ckpt, dict):
+        return
+    bundle = ckpt.get("belief_network")
+    if bundle is None:
+        return
+    args.use_belief_network = True
+    if not getattr(args, "belief_network_checkpoint", ""):
+        args.belief_network_bundle = bundle
+
+
 
 def run_epoch(model, loader, optimizer, accelerator, args, train, global_step):
     model.train() if train else model.eval()
@@ -314,19 +329,30 @@ def main():
     args = parse_args()
     _resolve_vl_model_preset(args)
     os.makedirs(args.save_dir, exist_ok=True)
+    args.future_predictor_bundle = None
+    args.belief_network_bundle = None
+    resume_ckpt = None
+    if args.resume_checkpoint:
+        resume_ckpt = torch.load(args.resume_checkpoint, map_location="cpu")
+        _restore_bundled_future_predictor_args(args, resume_ckpt)
+        _restore_bundled_belief_network_args(args, resume_ckpt)
     if args.use_future_predictor:
-        if not args.future_predictor_checkpoint:
+        if not args.future_predictor_checkpoint and args.future_predictor_bundle is None:
             raise RuntimeError("--use_future_predictor requires --future_predictor_checkpoint.")
         if args.future_frames <= 0:
             raise RuntimeError("--use_future_predictor requires --future_frames > 0.")
+    if args.use_belief_network and not args.belief_network_checkpoint and args.belief_network_bundle is None:
+        raise RuntimeError("--use_belief_network requires --belief_network_checkpoint.")
+    if args.use_future_predictor and args.use_belief_network:
+        raise RuntimeError("Use only one of --use_future_predictor or --use_belief_network.")
 
     if args.detect_anomaly:
         torch.autograd.set_detect_anomaly(True)
     if args.peft == "qlora" and args.fsdp:
         raise RuntimeError("FSDP + QLoRA is not supported.")
-    if args.use_future_predictor and not args.ddp_find_unused_parameters:
+    if (args.use_future_predictor or args.use_belief_network) and not args.ddp_find_unused_parameters:
         args.ddp_find_unused_parameters = True
-        print("Enabling DDP find_unused_parameters for future-conditioned training.")
+        print("Enabling DDP find_unused_parameters for predictive-token training.")
 
     if args.peft == "qlora":
         try:
@@ -412,11 +438,6 @@ def main():
     train_loader = build_train_loader(args, args.train_split, args.batch_size, args.num_workers, is_train=True)
     val_loader = build_train_loader(args, args.val_split, args.batch_size, args.num_workers, is_train=False) if args.val_ratio > 0 else None
 
-    resume_ckpt = None
-    if args.resume_checkpoint:
-        resume_ckpt = torch.load(args.resume_checkpoint, map_location="cpu")
-        _restore_bundled_future_predictor_args(args, resume_ckpt)
-
     model = build_model(args, device=accelerator.device)
     model = _apply_peft(model, args)
     _configure_memory_optimizations(model, args)
@@ -486,6 +507,7 @@ def main():
                     "global_step": global_step,
                     "args": vars(args),
                     "future_predictor": unwrapped.export_future_predictor_bundle(),
+                    "belief_network": unwrapped.export_belief_network_bundle(),
                 },
                 ckpt_path,
             )

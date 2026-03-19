@@ -6,8 +6,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from Belief_Network import AttentionConfig, RecursiveBeliefNetwork
 from future_prediction import FuturePredictionTransformer, FuturePredictorConfig
-
 
 @dataclass
 class ModelConfig:
@@ -19,6 +19,8 @@ class ModelConfig:
     use_cache: bool = False
     future_predictor_checkpoint: str = ""
     future_predictor_bundle: Optional[Any] = None
+    belief_network_checkpoint: str = ""
+    belief_network_bundle: Optional[Any] = None
     future_context_frames: int = 0
     future_frames: int = 0
 
@@ -218,13 +220,21 @@ class MultimodalBeliefModel(nn.Module):
             self._backbone_forward_params = set()
         self.future_predictor = None
         self.future_adapter = None
+        self.belief_network = None
+        self.belief_adapter = None
         self._future_frames = int(cfg.future_frames or 0)
         self._future_context_frames = int(cfg.future_context_frames or 0)
         self._image_token_id = int(getattr(self.backbone.model.config, "image_token_id", -1))
+        if cfg.future_predictor_checkpoint and cfg.belief_network_checkpoint:
+            raise RuntimeError("Configure only one of future_predictor_checkpoint or belief_network_checkpoint.")
         if cfg.future_predictor_bundle is not None:
             self._init_future_conditioning_from_bundle(cfg.future_predictor_bundle)
         elif cfg.future_predictor_checkpoint:
             self._init_future_conditioning(cfg.future_predictor_checkpoint)
+        elif cfg.belief_network_bundle is not None:
+            self._init_belief_conditioning_from_bundle(cfg.belief_network_bundle)
+        elif cfg.belief_network_checkpoint:
+            self._init_belief_conditioning(cfg.belief_network_checkpoint)
 
     def _build_future_predictor_from_state(self, predictor_state, saved_args):
         embed_dim = int(saved_args["predictor_embed_dim"]) if "predictor_embed_dim" in saved_args else int(saved_args.get("embed_dim", 0))
@@ -292,6 +302,74 @@ class MultimodalBeliefModel(nn.Module):
                 "predictor_dropout": float(predictor.cfg.dropout),
                 "video_frames": int(predictor.cfg.max_context_frames),
                 "future_frames": int(predictor.cfg.max_future_frames),
+            },
+        }
+
+    def _build_belief_network_from_state(self, belief_state, saved_args):
+        visual_dim = int(saved_args.get("visual_dim", 0))
+        if visual_dim <= 0:
+            visual_proj_weight = belief_state.get("visual_proj.weight")
+            if visual_proj_weight is not None:
+                visual_dim = int(visual_proj_weight.shape[1])
+        if visual_dim <= 0:
+            raise RuntimeError("Belief network checkpoint is missing visual-dimension metadata.")
+        belief_cfg = AttentionConfig(
+            num_attention_heads=int(saved_args.get("num_attention_heads", 12)),
+            num_hidden_layers=int(saved_args.get("num_hidden_layers", 12)),
+            state_dim=int(saved_args.get("state_dim", 12)),
+            belief_dim=int(saved_args.get("belief_dim", 3)),
+            hidden_size=int(saved_args.get("hidden_size", 768)),
+            latent_dim=int(saved_args.get("latent_dim", 32)),
+            attention_dropout=float(saved_args.get("attention_dropout", 0.3)),
+            proj_dropout=float(saved_args.get("proj_dropout", 0.2)),
+        )
+        belief_net = RecursiveBeliefNetwork(
+            config=belief_cfg,
+            visual_dim=visual_dim,
+            beta=float(saved_args.get("beta", 1.0)),
+            recon_weight=float(saved_args.get("recon_weight", 1.0)),
+            temporal_nce_weight=float(saved_args.get("temporal_nce_weight", 0.0)),
+            device=self.backbone.device,
+        )
+        belief_net.load_state_dict(belief_state)
+        belief_net.to(self.backbone.device)
+        belief_net.eval()
+        for param in belief_net.parameters():
+            param.requires_grad = False
+        self.belief_network = belief_net
+        self.belief_adapter = FutureTokenAdapter(visual_dim).to(self.backbone.device)
+
+    def _init_belief_conditioning(self, checkpoint_path: str):
+        ckpt = torch.load(checkpoint_path, map_location="cpu")
+        saved_args = ckpt.get("args", {})
+        belief_state = ckpt.get("belief_net", {})
+        self._build_belief_network_from_state(belief_state, saved_args)
+
+    def _init_belief_conditioning_from_bundle(self, bundle):
+        saved_args = bundle.get("args", {})
+        belief_state = bundle.get("belief_net", {})
+        self._build_belief_network_from_state(belief_state, saved_args)
+
+    def export_belief_network_bundle(self):
+        if self.belief_network is None:
+            return None
+        belief = self.belief_network
+        cfg = belief.config
+        return {
+            "belief_net": belief.state_dict(),
+            "args": {
+                "visual_dim": int(belief.visual_dim),
+                "state_dim": int(cfg.state_dim),
+                "belief_dim": int(cfg.belief_dim),
+                "hidden_size": int(cfg.hidden_size),
+                "latent_dim": int(cfg.latent_dim),
+                "num_attention_heads": int(cfg.num_attention_heads),
+                "num_hidden_layers": int(cfg.num_hidden_layers),
+                "attention_dropout": float(cfg.attention_dropout),
+                "proj_dropout": float(cfg.proj_dropout),
+                "beta": float(getattr(belief, "beta", 1.0)),
+                "recon_weight": float(getattr(belief, "recon_weight", 1.0)),
+                "temporal_nce_weight": float(getattr(belief, "temporal_nce_weight", 0.0)),
             },
         }
 
@@ -401,6 +479,55 @@ class MultimodalBeliefModel(nn.Module):
             **forward_kwargs,
         )
 
+    def _forward_with_belief(self, model_inputs, labels, forward_kwargs):
+        pixel_key = None
+        for candidate in ("pixel_values", "pixel_values_videos", "video_values", "video", "videos"):
+            if candidate in model_inputs:
+                pixel_key = candidate
+                break
+        if pixel_key is None:
+            raise RuntimeError("Belief conditioning requires pixel values in the model inputs.")
+        pixel_values = model_inputs[pixel_key]
+        input_ids = model_inputs["input_ids"]
+        attention_mask = model_inputs["attention_mask"]
+        batch_size = input_ids.shape[0]
+        image_features = self.backbone.extract_image_tokens(pixel_values, normalize=False)
+        num_images = image_features.shape[0]
+        if num_images % batch_size != 0:
+            raise RuntimeError(
+                f"Could not reshape image features by batch: num_images={num_images}, batch={batch_size}"
+            )
+        frames_per_sample = num_images // batch_size
+        context_frame_embeddings = image_features.mean(dim=1).view(batch_size, frames_per_sample, -1)
+        belief_dtype = next(self.belief_network.parameters()).dtype
+        adapter_dtype = next(self.belief_adapter.parameters()).dtype
+        context_frame_embeddings = context_frame_embeddings.to(dtype=belief_dtype)
+        state_seq = torch.zeros(
+            batch_size,
+            frames_per_sample,
+            self.belief_network.config.state_dim,
+            device=context_frame_embeddings.device,
+            dtype=context_frame_embeddings.dtype,
+        )
+        belief_outputs = self.belief_network(visual_seq=context_frame_embeddings, state_seq=state_seq)
+        belief_tokens = self.belief_adapter(belief_outputs["pred_next"].to(dtype=adapter_dtype))
+        belief_tokens = belief_tokens.to(dtype=image_features.dtype)
+        current_tokens = image_features.view(batch_size, -1, image_features.shape[-1])
+        inputs_embeds, new_attention_mask, new_labels = self._inject_image_features(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+            image_features=current_tokens,
+            extra_features=belief_tokens,
+        )
+        return self.backbone.model(
+            input_ids=None,
+            inputs_embeds=inputs_embeds,
+            attention_mask=new_attention_mask,
+            labels=new_labels,
+            **forward_kwargs,
+        )
+
     def forward(self, inputs, labels=None):
         model_inputs = self.backbone._move_inputs_to_device(inputs)
         forward_kwargs = {"return_dict": True}
@@ -409,6 +536,8 @@ class MultimodalBeliefModel(nn.Module):
         labels = labels.to(self.backbone.device) if labels is not None else None
         if self.future_predictor is not None:
             outputs = self._forward_with_future(model_inputs, labels, forward_kwargs)
+        elif self.belief_network is not None:
+            outputs = self._forward_with_belief(model_inputs, labels, forward_kwargs)
         else:
             if labels is not None:
                 model_inputs["labels"] = labels
