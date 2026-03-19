@@ -39,7 +39,11 @@ def parse_args():
     parser.add_argument("--vl_model_name", type=str, default=None)
     parser.add_argument("--vl_backend", type=str, default=None)
     parser.add_argument("--vl_dtype", type=str, default=None)
+    parser.add_argument("--mixed_precision", type=str, default=None)
     parser.add_argument("--peft", type=str, default=None)
+    parser.add_argument("--use_future_predictor", action="store_true")
+    parser.add_argument("--future_predictor_checkpoint", type=str, default="")
+    parser.add_argument("--future_frames", type=int, default=None)
     parser.add_argument("--freeze_vl", action="store_true")
     parser.add_argument("--gradient_checkpointing", action="store_true")
     parser.add_argument("--disable_vl_cache", action="store_true")
@@ -76,7 +80,9 @@ def _merge_args(cli_args, ckpt_args):
         "vl_model_name",
         "vl_backend",
         "vl_dtype",
+        "mixed_precision",
         "peft",
+        "future_frames",
     )
     for key in optional_overrides:
         value = getattr(cli_args, key)
@@ -91,6 +97,9 @@ def _merge_args(cli_args, ckpt_args):
         merged["disable_vl_cache"] = True
     if cli_args.allow_tf32:
         merged["allow_tf32"] = True
+    if cli_args.use_future_predictor:
+        merged["use_future_predictor"] = True
+        merged["future_predictor_checkpoint"] = cli_args.future_predictor_checkpoint
 
     merged.setdefault("vl_backend", "internvl")
     merged.setdefault("vl_model_preset", "internvl3_5_1b")
@@ -100,6 +109,9 @@ def _merge_args(cli_args, ckpt_args):
     merged.setdefault("vl_max_text_len", 256)
     merged.setdefault("freeze_vl", False)
     merged.setdefault("peft", "none")
+    merged.setdefault("use_future_predictor", False)
+    merged.setdefault("future_predictor_checkpoint", "")
+    merged.setdefault("future_frames", 0)
     merged.setdefault("lora_r", 16)
     merged.setdefault("lora_alpha", 32)
     merged.setdefault("lora_dropout", 0.05)
@@ -108,7 +120,22 @@ def _merge_args(cli_args, ckpt_args):
     merged.setdefault("gradient_checkpointing", False)
     merged.setdefault("disable_vl_cache", False)
     merged.setdefault("allow_tf32", False)
+    merged["future_predictor_bundle"] = getattr(cli_args, "future_predictor_bundle", None)
     return SimpleNamespace(**merged)
+
+
+def _restore_bundled_future_predictor_args(args, ckpt):
+    if not isinstance(ckpt, dict):
+        return
+    bundle = ckpt.get("future_predictor")
+    if bundle is None:
+        return
+    args.use_future_predictor = True
+    if not getattr(args, "future_predictor_checkpoint", ""):
+        args.future_predictor_bundle = bundle
+    bundle_args = bundle.get("args", {})
+    if int(getattr(args, "future_frames", 0) or 0) <= 0:
+        args.future_frames = int(bundle_args.get("future_frames", args.future_frames or 0))
 
 
 def _build_quant_config(args):
@@ -182,6 +209,9 @@ def _resolve_correct_choice_index(record, num_choices):
 
 
 def _sequence_nll(logits, labels):
+    seq_len = min(int(logits.shape[1]), int(labels.shape[1]))
+    logits = logits[:, :seq_len, :]
+    labels = labels[:, :seq_len]
     shift_logits = logits[:, :-1, :].float().contiguous()
     shift_labels = labels[:, 1:].contiguous()
     token_losses = F.cross_entropy(
@@ -198,8 +228,15 @@ def _sequence_nll(logits, labels):
 def evaluate(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     ckpt = torch.load(args.checkpoint, map_location="cpu") if args.checkpoint else {}
+    _restore_bundled_future_predictor_args(args, ckpt)
     ckpt_args = ckpt.get("args", {}) if isinstance(ckpt, dict) else {}
     merged_args = _merge_args(args, ckpt_args)
+    if merged_args.use_future_predictor:
+        has_bundled_predictor = getattr(merged_args, "future_predictor_bundle", None) is not None
+        if not merged_args.future_predictor_checkpoint and not has_bundled_predictor:
+            raise RuntimeError("--use_future_predictor requires --future_predictor_checkpoint.")
+        if int(merged_args.future_frames) <= 0:
+            raise RuntimeError("--use_future_predictor requires --future_frames > 0.")
     model, _ = _load_model(args.checkpoint, merged_args, device=device)
     processor = model.backbone.processor
     records = _load_records(merged_args)

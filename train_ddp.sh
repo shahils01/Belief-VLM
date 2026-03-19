@@ -8,9 +8,12 @@ VIDEO_ID_COLUMN="${VIDEO_ID_COLUMN:-video_id}"
 PARTICIPANT_COLUMN="${PARTICIPANT_COLUMN:-participant_id}"
 DEBUG_GENERATE="${DEBUG_GENERATE:-0}"
 DEBUG_GENERATE_EVERY="${DEBUG_GENERATE_EVERY:-0}"
+USE_FUTURE_PREDICTOR="${USE_FUTURE_PREDICTOR:-1}"
+FUTURE_PREDICTOR_CHECKPOINT="${FUTURE_PREDICTOR_CHECKPOINT:-/scratch/shahils/Belief-VLM/checkpoints_future_predictor/ckpt_epoch_9.pt}"
+FUTURE_FRAMES="${FUTURE_FRAMES:-8}"
 
 CMD=(
-  accelerate launch --num_processes 8 train.py
+  accelerate launch --num_processes 4 train.py
   --dataset_type hd_epic_local
   --video_root "$VIDEO_ROOT"
   --metadata_root "$METADATA_ROOT"
@@ -22,7 +25,7 @@ CMD=(
   --participant_column "$PARTICIPANT_COLUMN"
   --val_ratio 0.01
   --batch_size 2
-  --num_workers 16
+  --num_workers 4
   --video_frames 20
   --grad_accum_steps 16
   --mixed_precision bf16
@@ -31,12 +34,18 @@ CMD=(
   --log_every 1
   --vl_model_preset "$VL_MODEL_PRESET"
   --gradient_checkpointing
-  --save_dir checkpoints_belief_hd_epic_ddp_07
-  --resume_checkpoint "/scratch/shahils/Belief-VLM/checkpoints_belief_hd_epic_ddp_07/ckpt_epoch_26.pt"
+  --save_dir checkpoints_belief_hd_epic_ddp_bundles
+  --resume_checkpoint "/scratch/shahils/Belief-VLM/checkpoints_belief_hd_epic_ddp/ckpt_epoch_110.pt"
+  --load_model_only
+  --wandb
 )
 
 if [[ "$DEBUG_GENERATE" == "1" ]]; then
   CMD+=(--debug_generate --debug_generate_every "$DEBUG_GENERATE_EVERY")
+fi
+
+if [[ "$USE_FUTURE_PREDICTOR" == "1" ]]; then
+  CMD+=(--use_future_predictor --future_predictor_checkpoint "$FUTURE_PREDICTOR_CHECKPOINT" --future_frames "$FUTURE_FRAMES")
 fi
 
 "${CMD[@]}"

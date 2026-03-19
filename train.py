@@ -97,6 +97,9 @@ def parse_args():
     parser.add_argument("--vl_dtype", type=str, default="bfloat16", choices=["float16", "bfloat16", "float32"])
     parser.add_argument("--vl_max_text_len", type=int, default=256)
     parser.add_argument("--freeze_vl", action="store_true")
+    parser.add_argument("--use_future_predictor", action="store_true")
+    parser.add_argument("--future_predictor_checkpoint", type=str, default="")
+    parser.add_argument("--future_frames", type=int, default=0)
 
     parser.add_argument("--peft", type=str, default="none", choices=["none", "lora", "qlora"])
     parser.add_argument("--lora_r", type=int, default=16)
@@ -182,6 +185,10 @@ def build_model(args, device):
         freeze_vl=args.freeze_vl,
         quantization_config=getattr(args, "quantization_config", None),
         use_cache=not args.disable_vl_cache,
+        future_predictor_checkpoint=args.future_predictor_checkpoint if args.use_future_predictor else "",
+        future_predictor_bundle=getattr(args, "future_predictor_bundle", None) if args.use_future_predictor else None,
+        future_context_frames=args.video_frames if args.use_future_predictor else 0,
+        future_frames=args.future_frames if args.use_future_predictor else 0,
     )
     return MultimodalBeliefModel(cfg, device=device)
 
@@ -231,6 +238,20 @@ def _load_checkpoint_state(model, ckpt_state, accelerator):
             f"missing_keys={len(getattr(incompatible, 'missing_keys', []))} "
             f"unexpected_keys={len(getattr(incompatible, 'unexpected_keys', []))}"
         )
+
+
+def _restore_bundled_future_predictor_args(args, ckpt):
+    if not isinstance(ckpt, dict):
+        return
+    bundle = ckpt.get("future_predictor")
+    if bundle is None:
+        return
+    args.use_future_predictor = True
+    if not getattr(args, "future_predictor_checkpoint", ""):
+        args.future_predictor_bundle = bundle
+    bundle_args = bundle.get("args", {})
+    if int(getattr(args, "future_frames", 0) or 0) <= 0:
+        args.future_frames = int(bundle_args.get("future_frames", args.future_frames or 0))
 
 
 
@@ -293,11 +314,19 @@ def main():
     args = parse_args()
     _resolve_vl_model_preset(args)
     os.makedirs(args.save_dir, exist_ok=True)
+    if args.use_future_predictor:
+        if not args.future_predictor_checkpoint:
+            raise RuntimeError("--use_future_predictor requires --future_predictor_checkpoint.")
+        if args.future_frames <= 0:
+            raise RuntimeError("--use_future_predictor requires --future_frames > 0.")
 
     if args.detect_anomaly:
         torch.autograd.set_detect_anomaly(True)
     if args.peft == "qlora" and args.fsdp:
         raise RuntimeError("FSDP + QLoRA is not supported.")
+    if args.use_future_predictor and not args.ddp_find_unused_parameters:
+        args.ddp_find_unused_parameters = True
+        print("Enabling DDP find_unused_parameters for future-conditioned training.")
 
     if args.peft == "qlora":
         try:
@@ -367,7 +396,7 @@ def main():
     )
 
     if args.wandb:
-        init_kwargs = {"wandb": {"project": args.wandb_project}}
+        init_kwargs = {"wandb": {}}
         if args.wandb_entity:
             init_kwargs["wandb"]["entity"] = args.wandb_entity
         if args.wandb_run_name:
@@ -382,6 +411,11 @@ def main():
     )
     train_loader = build_train_loader(args, args.train_split, args.batch_size, args.num_workers, is_train=True)
     val_loader = build_train_loader(args, args.val_split, args.batch_size, args.num_workers, is_train=False) if args.val_ratio > 0 else None
+
+    resume_ckpt = None
+    if args.resume_checkpoint:
+        resume_ckpt = torch.load(args.resume_checkpoint, map_location="cpu")
+        _restore_bundled_future_predictor_args(args, resume_ckpt)
 
     model = build_model(args, device=accelerator.device)
     model = _apply_peft(model, args)
@@ -403,7 +437,7 @@ def main():
     start_epoch = 0
     global_step = 0
     if args.resume_checkpoint:
-        ckpt = torch.load(args.resume_checkpoint, map_location="cpu")
+        ckpt = resume_ckpt
         _load_checkpoint_state(model, ckpt["model"], accelerator)
         if not args.load_model_only:
             optimizer.load_state_dict(ckpt["optimizer"])
@@ -442,14 +476,16 @@ def main():
 
         accelerator.wait_for_everyone()
         if accelerator.is_main_process:
+            unwrapped = accelerator.unwrap_model(model)
             ckpt_path = os.path.join(args.save_dir, f"ckpt_epoch_{epoch}.pt")
             torch.save(
                 {
-                    "model": accelerator.unwrap_model(model).state_dict(),
+                    "model": unwrapped.state_dict(),
                     "optimizer": optimizer.state_dict(),
                     "epoch": epoch,
                     "global_step": global_step,
                     "args": vars(args),
+                    "future_predictor": unwrapped.export_future_predictor_bundle(),
                 },
                 ckpt_path,
             )
