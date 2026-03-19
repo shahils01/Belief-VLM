@@ -4,6 +4,7 @@ from typing import Any, Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 @dataclass
@@ -110,6 +111,34 @@ class InternVLBackbone(nn.Module):
             else:
                 moved[key] = value
         return moved
+
+    def build_pixel_values(self, frames):
+        image_processor = getattr(self.processor, "image_processor", None)
+        if image_processor is None:
+            raise RuntimeError("InternVL processor does not expose an image_processor.")
+        processed = image_processor(images=frames, return_tensors="pt")
+        pixel_values = processed["pixel_values"]
+        return pixel_values.to(self.device, dtype=self._dtype)
+
+    @torch.no_grad()
+    def extract_frame_embeddings(self, frames, normalize: bool = True):
+        pixel_values = self.build_pixel_values(frames)
+        model_ref = getattr(self.model, "model", self.model)
+        image_features = model_ref.get_image_features(pixel_values=pixel_values)
+        frame_embeddings = image_features.mean(dim=1)
+        if normalize:
+            frame_embeddings = F.normalize(frame_embeddings.float(), dim=-1)
+        return frame_embeddings
+
+    @torch.no_grad()
+    def extract_clip_embeddings(self, clips, normalize: bool = True):
+        if not clips:
+            raise RuntimeError("Expected at least one clip.")
+        clip_lengths = [len(clip) for clip in clips]
+        flat_frames = [frame for clip in clips for frame in clip]
+        frame_embeddings = self.extract_frame_embeddings(flat_frames, normalize=normalize)
+        splits = list(torch.split(frame_embeddings, clip_lengths, dim=0))
+        return torch.stack(splits, dim=0)
 
 
 class MultimodalBeliefModel(nn.Module):
