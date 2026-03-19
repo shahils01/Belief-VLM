@@ -152,7 +152,10 @@ def main():
     accelerator = Accelerator(mixed_precision=args.mixed_precision)
     visual_backbone = build_visual_backbone(args, accelerator.device)
 
-    embed_dim = int(visual_backbone.backbone.model.config.text_config.hidden_size)
+    probe_frames = build_future_prediction_loader(args, "train", batch_size=1, num_workers=0, is_train=True)
+    probe_batch = next(iter(probe_frames))
+    probe_embeddings = encode_batch(visual_backbone, probe_batch, accelerator.device)[0]
+    embed_dim = int(probe_embeddings.shape[-1])
     predictor_cfg = FuturePredictorConfig(
         embed_dim=embed_dim,
         hidden_dim=args.predictor_hidden_dim,
