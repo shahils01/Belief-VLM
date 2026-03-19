@@ -351,8 +351,12 @@ class MultimodalBeliefModel(nn.Module):
             )
         frames_per_sample = num_images // batch_size
         context_frame_embeddings = image_features.mean(dim=1).view(batch_size, frames_per_sample, -1)
+        predictor_dtype = next(self.future_predictor.parameters()).dtype
+        adapter_dtype = next(self.future_adapter.parameters()).dtype
+        context_frame_embeddings = context_frame_embeddings.to(dtype=predictor_dtype)
         future_pred = self.future_predictor(context_frame_embeddings, future_frames=self._future_frames)
-        future_tokens = self.future_adapter(future_pred)
+        future_tokens = self.future_adapter(future_pred.to(dtype=adapter_dtype))
+        future_tokens = future_tokens.to(dtype=image_features.dtype)
         current_tokens = image_features.view(batch_size, -1, image_features.shape[-1])
         inputs_embeds, new_attention_mask, new_labels = self._inject_image_features(
             input_ids=input_ids,

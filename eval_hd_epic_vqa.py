@@ -39,6 +39,7 @@ def parse_args():
     parser.add_argument("--vl_model_name", type=str, default=None)
     parser.add_argument("--vl_backend", type=str, default=None)
     parser.add_argument("--vl_dtype", type=str, default=None)
+    parser.add_argument("--mixed_precision", type=str, default=None)
     parser.add_argument("--peft", type=str, default=None)
     parser.add_argument("--use_future_predictor", action="store_true")
     parser.add_argument("--future_predictor_checkpoint", type=str, default="")
@@ -79,6 +80,7 @@ def _merge_args(cli_args, ckpt_args):
         "vl_model_name",
         "vl_backend",
         "vl_dtype",
+        "mixed_precision",
         "peft",
         "future_frames",
     )
