@@ -154,6 +154,7 @@ def main():
     probe_batch = next(iter(probe_frames))
     probe_embeddings = encode_batch(visual_backbone, probe_batch, accelerator.device)[0]
     embed_dim = int(probe_embeddings.shape[-1])
+    args.predictor_embed_dim = embed_dim
     predictor_cfg = FuturePredictorConfig(
         embed_dim=embed_dim,
         hidden_dim=args.predictor_hidden_dim,

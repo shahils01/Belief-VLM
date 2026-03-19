@@ -8,6 +8,9 @@ VIDEO_ID_COLUMN="${VIDEO_ID_COLUMN:-video_id}"
 PARTICIPANT_COLUMN="${PARTICIPANT_COLUMN:-participant_id}"
 DEBUG_GENERATE="${DEBUG_GENERATE:-0}"
 DEBUG_GENERATE_EVERY="${DEBUG_GENERATE_EVERY:-0}"
+USE_FUTURE_PREDICTOR="${USE_FUTURE_PREDICTOR:-0}"
+FUTURE_PREDICTOR_CHECKPOINT="${FUTURE_PREDICTOR_CHECKPOINT:-}"
+FUTURE_FRAMES="${FUTURE_FRAMES:-0}"
 
 CMD=(
   accelerate launch --num_processes 8 train.py
@@ -37,6 +40,10 @@ CMD=(
 
 if [[ "$DEBUG_GENERATE" == "1" ]]; then
   CMD+=(--debug_generate --debug_generate_every "$DEBUG_GENERATE_EVERY")
+fi
+
+if [[ "$USE_FUTURE_PREDICTOR" == "1" ]]; then
+  CMD+=(--use_future_predictor --future_predictor_checkpoint "$FUTURE_PREDICTOR_CHECKPOINT" --future_frames "$FUTURE_FRAMES")
 fi
 
 "${CMD[@]}"

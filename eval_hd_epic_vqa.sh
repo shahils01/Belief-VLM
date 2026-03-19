@@ -6,6 +6,9 @@ PRINT_SAMPLES="${PRINT_SAMPLES:-10}"
 PROGRESS_EVERY="${PROGRESS_EVERY:-50}"
 SAVE_PREDICTIONS="${SAVE_PREDICTIONS:-}"
 VL_MODEL_PRESET="${VL_MODEL_PRESET:-internvl3_5_2b}"
+USE_FUTURE_PREDICTOR="${USE_FUTURE_PREDICTOR:-0}"
+FUTURE_PREDICTOR_CHECKPOINT="${FUTURE_PREDICTOR_CHECKPOINT:-}"
+FUTURE_FRAMES="${FUTURE_FRAMES:-0}"
 
 CMD=(
   python eval_hd_epic_vqa.py
@@ -20,6 +23,10 @@ CMD=(
 
 if [[ -n "$CHECKPOINT" ]]; then
   CMD+=(--checkpoint "$CHECKPOINT")
+fi
+
+if [[ "$USE_FUTURE_PREDICTOR" == "1" ]]; then
+  CMD+=(--use_future_predictor --future_predictor_checkpoint "$FUTURE_PREDICTOR_CHECKPOINT" --future_frames "$FUTURE_FRAMES")
 fi
 
 if [[ -n "$SAVE_PREDICTIONS" ]]; then

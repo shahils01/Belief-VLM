@@ -6,6 +6,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from future_prediction import FuturePredictionTransformer, FuturePredictorConfig
+
 
 @dataclass
 class ModelConfig:
@@ -15,6 +17,9 @@ class ModelConfig:
     freeze_vl: bool = False
     quantization_config: Optional[Any] = None
     use_cache: bool = False
+    future_predictor_checkpoint: str = ""
+    future_context_frames: int = 0
+    future_frames: int = 0
 
 
 class InternVLBackbone(nn.Module):
@@ -112,6 +117,17 @@ class InternVLBackbone(nn.Module):
                 moved[key] = value
         return moved
 
+    def _get_core_model(self):
+        model = self.model
+        if hasattr(model, "get_base_model"):
+            try:
+                model = model.get_base_model()
+            except Exception:
+                pass
+        if hasattr(model, "model") and hasattr(model.model, "get_image_features"):
+            model = model.model
+        return model
+
     def build_pixel_values(self, frames):
         image_processor = getattr(self.processor, "image_processor", None)
         if image_processor is None:
@@ -123,7 +139,7 @@ class InternVLBackbone(nn.Module):
     @torch.no_grad()
     def extract_frame_embeddings(self, frames, normalize: bool = True):
         pixel_values = self.build_pixel_values(frames)
-        model_ref = getattr(self.model, "model", self.model)
+        model_ref = self._get_core_model()
         image_features = model_ref.get_image_features(pixel_values=pixel_values)
         if not torch.is_tensor(image_features):
             if hasattr(image_features, "image_hidden_states") and image_features.image_hidden_states is not None:
@@ -156,6 +172,39 @@ class InternVLBackbone(nn.Module):
         splits = list(torch.split(frame_embeddings, clip_lengths, dim=0))
         return torch.stack(splits, dim=0)
 
+    def extract_image_tokens(self, pixel_values, normalize: bool = False):
+        model_ref = self._get_core_model()
+        image_features = model_ref.get_image_features(pixel_values=pixel_values)
+        if not torch.is_tensor(image_features):
+            if hasattr(image_features, "image_hidden_states") and image_features.image_hidden_states is not None:
+                image_features = image_features.image_hidden_states
+            elif hasattr(image_features, "last_hidden_state") and image_features.last_hidden_state is not None:
+                image_features = image_features.last_hidden_state
+            elif hasattr(image_features, "pooler_output") and image_features.pooler_output is not None:
+                image_features = image_features.pooler_output
+            else:
+                raise RuntimeError(
+                    f"Unsupported InternVL image feature return type: {type(image_features)}"
+                )
+        if image_features.dim() == 2:
+            image_features = image_features.unsqueeze(1)
+        if normalize:
+            image_features = F.normalize(image_features.float(), dim=-1)
+        return image_features
+
+
+class FutureTokenAdapter(nn.Module):
+    def __init__(self, embed_dim: int):
+        super().__init__()
+        self.norm = nn.LayerNorm(embed_dim)
+        self.proj = nn.Linear(embed_dim, embed_dim)
+        self.gate = nn.Parameter(torch.tensor(0.0))
+
+    def forward(self, x):
+        delta = self.proj(self.norm(x))
+        gate = torch.tanh(self.gate)
+        return x + gate * delta
+
 
 class MultimodalBeliefModel(nn.Module):
     def __init__(self, cfg: ModelConfig, device: torch.device):
@@ -166,15 +215,153 @@ class MultimodalBeliefModel(nn.Module):
             self._backbone_forward_params = set(inspect.signature(self.backbone.model.forward).parameters.keys())
         except Exception:
             self._backbone_forward_params = set()
+        self.future_predictor = None
+        self.future_adapter = None
+        self._future_frames = int(cfg.future_frames or 0)
+        self._future_context_frames = int(cfg.future_context_frames or 0)
+        self._image_token_id = int(getattr(self.backbone.model.config, "image_token_id", -1))
+        if cfg.future_predictor_checkpoint:
+            self._init_future_conditioning(cfg.future_predictor_checkpoint)
+
+    def _init_future_conditioning(self, checkpoint_path: str):
+        ckpt = torch.load(checkpoint_path, map_location="cpu")
+        saved_args = ckpt.get("args", {})
+        predictor_cfg = FuturePredictorConfig(
+            embed_dim=int(saved_args["predictor_embed_dim"]) if "predictor_embed_dim" in saved_args else int(saved_args.get("embed_dim", 0)),
+            hidden_dim=int(saved_args.get("predictor_hidden_dim", 1024)),
+            num_layers=int(saved_args.get("predictor_layers", 2)),
+            num_heads=int(saved_args.get("predictor_heads", 8)),
+            dropout=float(saved_args.get("predictor_dropout", 0.1)),
+            max_context_frames=int(saved_args.get("video_frames", self._future_context_frames or 8)),
+            max_future_frames=int(saved_args.get("future_frames", self._future_frames or 8)),
+        )
+        if predictor_cfg.embed_dim <= 0:
+            raise RuntimeError("Future predictor checkpoint is missing embed-dimension metadata.")
+        predictor = FuturePredictionTransformer(predictor_cfg)
+        predictor.load_state_dict(ckpt["predictor"])
+        predictor.to(self.backbone.device)
+        predictor.eval()
+        for param in predictor.parameters():
+            param.requires_grad = False
+        self.future_predictor = predictor
+        self.future_adapter = FutureTokenAdapter(predictor_cfg.embed_dim).to(self.backbone.device)
+        self._future_context_frames = int(self._future_context_frames or predictor_cfg.max_context_frames)
+        self._future_frames = int(self._future_frames or predictor_cfg.max_future_frames)
+
+    def _inject_image_features(self, input_ids, attention_mask, labels, image_features, extra_features=None):
+        batch_size, _, hidden_dim = image_features.shape
+        token_embed = self.backbone.model.get_input_embeddings()
+        new_input_ids = []
+        new_attention_masks = []
+        new_labels = [] if labels is not None else None
+        flat_features = []
+
+        for row in range(batch_size):
+            row_ids = input_ids[row]
+            row_attn = attention_mask[row]
+            valid_len = int(row_attn.sum().item())
+            row_ids = row_ids[:valid_len]
+            row_attn = row_attn[:valid_len]
+            row_labels = labels[row][:valid_len] if labels is not None else None
+
+            if row_labels is not None:
+                non_mask = torch.nonzero(row_labels.ne(-100), as_tuple=False)
+                insert_at = int(non_mask[0].item()) if non_mask.numel() > 0 else valid_len
+            else:
+                insert_at = valid_len
+
+            extra_count = 0 if extra_features is None else int(extra_features.shape[1])
+            added_ids = torch.full((extra_count,), self._image_token_id, dtype=row_ids.dtype, device=row_ids.device)
+            new_row_ids = torch.cat([row_ids[:insert_at], added_ids, row_ids[insert_at:]], dim=0)
+            new_row_attn = torch.ones_like(new_row_ids)
+            new_input_ids.append(new_row_ids)
+            new_attention_masks.append(new_row_attn)
+
+            row_features = image_features[row]
+            if extra_features is not None:
+                row_features = torch.cat([row_features, extra_features[row]], dim=0)
+            flat_features.append(row_features)
+
+            if row_labels is not None:
+                added_labels = torch.full((extra_count,), -100, dtype=row_labels.dtype, device=row_labels.device)
+                new_row_labels = torch.cat([row_labels[:insert_at], added_labels, row_labels[insert_at:]], dim=0)
+                new_labels.append(new_row_labels)
+
+        max_len = max(int(row.shape[0]) for row in new_input_ids)
+        pad_id = self.backbone.tokenizer.pad_token_id
+        if pad_id is None:
+            pad_id = self.backbone.tokenizer.eos_token_id
+        padded_ids = []
+        padded_attn = []
+        padded_labels = [] if new_labels is not None else None
+        for idx in range(batch_size):
+            row_ids = new_input_ids[idx]
+            row_attn = new_attention_masks[idx]
+            pad_len = max_len - int(row_ids.shape[0])
+            padded_ids.append(F.pad(row_ids, (0, pad_len), value=pad_id))
+            padded_attn.append(F.pad(row_attn, (0, pad_len), value=0))
+            if new_labels is not None:
+                padded_labels.append(F.pad(new_labels[idx], (0, pad_len), value=-100))
+
+        new_input_ids = torch.stack(padded_ids, dim=0)
+        new_attention_mask = torch.stack(padded_attn, dim=0)
+        new_labels = torch.stack(padded_labels, dim=0) if padded_labels is not None else None
+        inputs_embeds = token_embed(new_input_ids)
+        special_image_mask = new_input_ids.eq(self._image_token_id).unsqueeze(-1).expand_as(inputs_embeds)
+        combined_features = torch.cat(flat_features, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+        inputs_embeds = inputs_embeds.masked_scatter(special_image_mask, combined_features)
+        return inputs_embeds, new_attention_mask, new_labels
+
+    def _forward_with_future(self, model_inputs, labels, forward_kwargs):
+        pixel_key = None
+        for candidate in ("pixel_values", "pixel_values_videos", "video_values", "video", "videos"):
+            if candidate in model_inputs:
+                pixel_key = candidate
+                break
+        if pixel_key is None:
+            raise RuntimeError("Future conditioning requires pixel values in the model inputs.")
+        pixel_values = model_inputs[pixel_key]
+        input_ids = model_inputs["input_ids"]
+        attention_mask = model_inputs["attention_mask"]
+        batch_size = input_ids.shape[0]
+        image_features = self.backbone.extract_image_tokens(pixel_values, normalize=False)
+        num_images = image_features.shape[0]
+        if num_images % batch_size != 0:
+            raise RuntimeError(
+                f"Could not reshape image features by batch: num_images={num_images}, batch={batch_size}"
+            )
+        frames_per_sample = num_images // batch_size
+        context_frame_embeddings = image_features.mean(dim=1).view(batch_size, frames_per_sample, -1)
+        future_pred = self.future_predictor(context_frame_embeddings, future_frames=self._future_frames)
+        future_tokens = self.future_adapter(future_pred)
+        current_tokens = image_features.view(batch_size, -1, image_features.shape[-1])
+        inputs_embeds, new_attention_mask, new_labels = self._inject_image_features(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+            image_features=current_tokens,
+            extra_features=future_tokens,
+        )
+        return self.backbone.model(
+            input_ids=None,
+            inputs_embeds=inputs_embeds,
+            attention_mask=new_attention_mask,
+            labels=new_labels,
+            **forward_kwargs,
+        )
 
     def forward(self, inputs, labels=None):
         model_inputs = self.backbone._move_inputs_to_device(inputs)
-        if labels is not None:
-            model_inputs["labels"] = labels.to(self.backbone.device)
         forward_kwargs = {"return_dict": True}
         if hasattr(self.backbone.model, "config") and hasattr(self.backbone.model.config, "use_cache"):
             forward_kwargs["use_cache"] = False
-        outputs = self.backbone.model(**model_inputs, **forward_kwargs)
+        labels = labels.to(self.backbone.device) if labels is not None else None
+        if self.future_predictor is not None:
+            outputs = self._forward_with_future(model_inputs, labels, forward_kwargs)
+        else:
+            if labels is not None:
+                model_inputs["labels"] = labels
+            outputs = self.backbone.model(**model_inputs, **forward_kwargs)
         return {"loss": outputs.loss, "logits": outputs.logits}
 
     @torch.no_grad()

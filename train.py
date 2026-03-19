@@ -97,6 +97,9 @@ def parse_args():
     parser.add_argument("--vl_dtype", type=str, default="bfloat16", choices=["float16", "bfloat16", "float32"])
     parser.add_argument("--vl_max_text_len", type=int, default=256)
     parser.add_argument("--freeze_vl", action="store_true")
+    parser.add_argument("--use_future_predictor", action="store_true")
+    parser.add_argument("--future_predictor_checkpoint", type=str, default="")
+    parser.add_argument("--future_frames", type=int, default=0)
 
     parser.add_argument("--peft", type=str, default="none", choices=["none", "lora", "qlora"])
     parser.add_argument("--lora_r", type=int, default=16)
@@ -182,6 +185,9 @@ def build_model(args, device):
         freeze_vl=args.freeze_vl,
         quantization_config=getattr(args, "quantization_config", None),
         use_cache=not args.disable_vl_cache,
+        future_predictor_checkpoint=args.future_predictor_checkpoint if args.use_future_predictor else "",
+        future_context_frames=args.video_frames if args.use_future_predictor else 0,
+        future_frames=args.future_frames if args.use_future_predictor else 0,
     )
     return MultimodalBeliefModel(cfg, device=device)
 
@@ -293,6 +299,11 @@ def main():
     args = parse_args()
     _resolve_vl_model_preset(args)
     os.makedirs(args.save_dir, exist_ok=True)
+    if args.use_future_predictor:
+        if not args.future_predictor_checkpoint:
+            raise RuntimeError("--use_future_predictor requires --future_predictor_checkpoint.")
+        if args.future_frames <= 0:
+            raise RuntimeError("--use_future_predictor requires --future_frames > 0.")
 
     if args.detect_anomaly:
         torch.autograd.set_detect_anomaly(True)
