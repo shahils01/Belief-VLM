@@ -125,7 +125,23 @@ class InternVLBackbone(nn.Module):
         pixel_values = self.build_pixel_values(frames)
         model_ref = getattr(self.model, "model", self.model)
         image_features = model_ref.get_image_features(pixel_values=pixel_values)
-        frame_embeddings = image_features.mean(dim=1)
+        if not torch.is_tensor(image_features):
+            if hasattr(image_features, "image_hidden_states") and image_features.image_hidden_states is not None:
+                image_features = image_features.image_hidden_states
+            elif hasattr(image_features, "last_hidden_state") and image_features.last_hidden_state is not None:
+                image_features = image_features.last_hidden_state
+            elif hasattr(image_features, "pooler_output") and image_features.pooler_output is not None:
+                image_features = image_features.pooler_output
+            else:
+                raise RuntimeError(
+                    f"Unsupported InternVL image feature return type: {type(image_features)}"
+                )
+        if image_features.dim() == 3:
+            frame_embeddings = image_features.mean(dim=1)
+        elif image_features.dim() == 2:
+            frame_embeddings = image_features
+        else:
+            raise RuntimeError(f"Unexpected image feature shape: {tuple(image_features.shape)}")
         if normalize:
             frame_embeddings = F.normalize(frame_embeddings.float(), dim=-1)
         return frame_embeddings
