@@ -18,4 +18,4 @@ accelerate launch --num_processes 1 train_belief_network.py \
   --vl_model_preset "$VL_MODEL_PRESET" \
   --gradient_checkpointing \
   --save_dir /scratch/shahils/Belief-VLM/checkpoints_future_belief_predictor \
-  # --resume_checkpoint /scratch/shahils/Belief-VLM/checkpoints_future_predictor/ckpt_epoch_3.pt
+  --resume_checkpoint /scratch/shahils/Belief-VLM/checkpoints_future_belief_predictor/ckpt_epoch_5.pt

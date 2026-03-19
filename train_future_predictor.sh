@@ -4,7 +4,7 @@ VIDEO_ROOT="${VIDEO_ROOT:-/scratch/shahils/hd_epic_dataset/videos/HD-EPIC/Videos
 FUTURE_OFFSET_SEC="${FUTURE_OFFSET_SEC:-0.0}"
 FUTURE_DURATION_SEC="${FUTURE_DURATION_SEC:-0.0}"
 VIDEO_FRAMES="${VIDEO_FRAMES:-20}"
-FUTURE_FRAMES="${FUTURE_FRAMES:-8}"
+FUTURE_FRAMES="${FUTURE_FRAMES:-2}"
 
 accelerate launch --num_processes 1 train_future_predictor.py \
   --annotation_path "$ANNOTATION_PATH" \
@@ -13,7 +13,7 @@ accelerate launch --num_processes 1 train_future_predictor.py \
   --future_frames "$FUTURE_FRAMES" \
   --future_offset_sec "$FUTURE_OFFSET_SEC" \
   --future_duration_sec "$FUTURE_DURATION_SEC" \
-  --batch_size 2 \
+  --batch_size 64 \
   --num_workers 4 \
   --epochs 500 \
   --log_every 20 \
@@ -22,4 +22,4 @@ accelerate launch --num_processes 1 train_future_predictor.py \
   --vl_model_preset "$VL_MODEL_PRESET" \
   --gradient_checkpointing \
   --save_dir /scratch/shahils/Belief-VLM/checkpoints_future_predictor \
-  --resume_checkpoint /scratch/shahils/Belief-VLM/checkpoints_future_predictor/ckpt_epoch_9.pt \  
+  # --resume_checkpoint /scratch/shahils/Belief-VLM/checkpoints_future_predictor/ckpt_epoch_19.pt 

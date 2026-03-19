@@ -400,7 +400,7 @@ class RecursiveBeliefNetwork(nn.Module):
         visual_dim: int,
         beta: float = 1.0,
         recon_weight: float = 1.0,
-        temporal_nce_weight: float = 0.0,
+        temporal_nce_weight: float = 1.0,
         device=None,
     ):
         super().__init__()
