@@ -8,8 +8,8 @@ VIDEO_ID_COLUMN="${VIDEO_ID_COLUMN:-video_id}"
 PARTICIPANT_COLUMN="${PARTICIPANT_COLUMN:-participant_id}"
 DEBUG_GENERATE="${DEBUG_GENERATE:-0}"
 DEBUG_GENERATE_EVERY="${DEBUG_GENERATE_EVERY:-0}"
-USE_FUTURE_PREDICTOR="${USE_FUTURE_PREDICTOR:-0}"
-FUTURE_PREDICTOR_CHECKPOINT="${FUTURE_PREDICTOR_CHECKPOINT:-/scratch/shahils/Belief-VLM/checkpoints_future_predictor/ckpt_epoch_5.pt}"
+USE_FUTURE_PREDICTOR="${USE_FUTURE_PREDICTOR:-1}"
+FUTURE_PREDICTOR_CHECKPOINT="${FUTURE_PREDICTOR_CHECKPOINT:-/scratch/shahils/Belief-VLM/checkpoints_future_predictor/ckpt_epoch_9.pt}"
 FUTURE_FRAMES="${FUTURE_FRAMES:-8}"
 
 CMD=(
@@ -34,9 +34,10 @@ CMD=(
   --log_every 1
   --vl_model_preset "$VL_MODEL_PRESET"
   --gradient_checkpointing
-  --save_dir checkpoints_belief_hd_epic_ddp_07
-  --resume_checkpoint "/scratch/shahils/Belief-VLM/checkpoints_belief_hd_epic_ddp/ckpt_epoch_110.pt"
+  --save_dir checkpoints_belief_hd_epic_ddp_bundles
+  --resume_checkpoint "/scratch/shahils/Belief-VLM/checkpoints_belief_hd_epic_ddp_bundles/ckpt_epoch_13.pt"
   --load_model_only
+  --wandb
 )
 
 if [[ "$DEBUG_GENERATE" == "1" ]]; then
