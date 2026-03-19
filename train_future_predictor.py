@@ -109,7 +109,7 @@ def run_epoch(visual_backbone, predictor, loss_fn, loader, optimizer, accelerato
         context_embeddings, future_embeddings = encode_batch(visual_backbone, batch, accelerator.device)
         with accelerator.accumulate(predictor):
             with torch.set_grad_enabled(train):
-                pred_future = predictor(context_embeddings)
+                pred_future = predictor(context_embeddings, future_frames=future_embeddings.shape[1])
                 metrics = loss_fn(pred_future, future_embeddings)
                 loss = metrics["loss"]
                 if train:
@@ -146,8 +146,6 @@ def main():
     args = parse_args()
     _resolve_vl_model_preset(args)
     os.makedirs(args.save_dir, exist_ok=True)
-    if args.video_frames != args.future_frames:
-        raise RuntimeError("The first future predictor version expects --video_frames == --future_frames.")
 
     accelerator = Accelerator(mixed_precision=args.mixed_precision)
     visual_backbone = build_visual_backbone(args, accelerator.device)
@@ -162,7 +160,8 @@ def main():
         num_layers=args.predictor_layers,
         num_heads=args.predictor_heads,
         dropout=args.predictor_dropout,
-        max_frames=max(args.video_frames, args.future_frames),
+        max_context_frames=args.video_frames,
+        max_future_frames=args.future_frames,
     )
     predictor = FuturePredictionTransformer(predictor_cfg).to(accelerator.device)
     loss_fn = FuturePredictionLoss(mse_weight=args.mse_weight, cosine_weight=args.cosine_weight)
