@@ -272,6 +272,36 @@ class MultimodalBeliefModel(nn.Module):
             value = getattr(getattr(model_ref, "vision_model", model_ref), "config", None)
             if value is not None and hasattr(value, attr):
                 return int(getattr(value, attr))
+        image_processor = getattr(self.backbone.processor, "image_processor", None)
+        if image_processor is not None:
+            size = getattr(image_processor, "size", None) or {}
+            height = int(size.get("height", size.get("shortest_edge", 448)) or 448)
+            width = int(size.get("width", size.get("shortest_edge", height)) or height)
+        else:
+            height = 448
+            width = 448
+        try:
+            with torch.no_grad():
+                dummy_pixels = torch.zeros(
+                    1,
+                    3,
+                    height,
+                    width,
+                    device=self.backbone.device,
+                    dtype=self.backbone._dtype,
+                )
+                image_features = model_ref.get_image_features(pixel_values=dummy_pixels)
+                if not torch.is_tensor(image_features):
+                    if hasattr(image_features, "image_hidden_states") and image_features.image_hidden_states is not None:
+                        image_features = image_features.image_hidden_states
+                    elif hasattr(image_features, "last_hidden_state") and image_features.last_hidden_state is not None:
+                        image_features = image_features.last_hidden_state
+                    elif hasattr(image_features, "pooler_output") and image_features.pooler_output is not None:
+                        image_features = image_features.pooler_output
+                if torch.is_tensor(image_features):
+                    return int(image_features.shape[-1])
+        except Exception:
+            pass
         return 0
 
     def _ensure_feature_adapters(self, image_feature_dim: int):
