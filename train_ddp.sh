@@ -8,9 +8,13 @@ VIDEO_ID_COLUMN="${VIDEO_ID_COLUMN:-video_id}"
 PARTICIPANT_COLUMN="${PARTICIPANT_COLUMN:-participant_id}"
 DEBUG_GENERATE="${DEBUG_GENERATE:-0}"
 DEBUG_GENERATE_EVERY="${DEBUG_GENERATE_EVERY:-0}"
-USE_FUTURE_PREDICTOR="${USE_FUTURE_PREDICTOR:-1}"
-FUTURE_PREDICTOR_CHECKPOINT="${FUTURE_PREDICTOR_CHECKPOINT:-/scratch/shahils/Belief-VLM/checkpoints_future_predictor/ckpt_epoch_19.pt}"
-FUTURE_FRAMES="${FUTURE_FRAMES:-8}"
+USE_BELIEF_MODEL="${USE_BELIEF_MODEL:-1}"
+BELIEF_NUM_TOKENS="${BELIEF_NUM_TOKENS:-4}"
+BELIEF_TARGET_FRAMES="${BELIEF_TARGET_FRAMES:-2}"
+BELIEF_AUX_WEIGHT="${BELIEF_AUX_WEIGHT:-0.2}"
+BELIEF_FUTURE_WEIGHT="${BELIEF_FUTURE_WEIGHT:-1.0}"
+BELIEF_RECON_WEIGHT="${BELIEF_RECON_WEIGHT:-0.5}"
+BELIEF_KL_WEIGHT="${BELIEF_KL_WEIGHT:-0.001}"
 
 CMD=(
   accelerate launch --num_processes 4 train.py
@@ -35,8 +39,6 @@ CMD=(
   --vl_model_preset "$VL_MODEL_PRESET"
   --gradient_checkpointing
   --save_dir checkpoints_belief_hd_epic_ddp_bundles
-  --resume_checkpoint "/scratch/shahils/Belief-VLM/checkpoints_belief_hd_epic_ddp_bundles/ckpt_epoch_24.pt"
-  --load_model_only
   --wandb
 )
 
@@ -44,8 +46,16 @@ if [[ "$DEBUG_GENERATE" == "1" ]]; then
   CMD+=(--debug_generate --debug_generate_every "$DEBUG_GENERATE_EVERY")
 fi
 
-if [[ "$USE_FUTURE_PREDICTOR" == "1" ]]; then
-  CMD+=(--use_future_predictor --future_predictor_checkpoint "$FUTURE_PREDICTOR_CHECKPOINT" --future_frames "$FUTURE_FRAMES")
+if [[ "$USE_BELIEF_MODEL" == "1" ]]; then
+  CMD+=(
+    --use_belief_model
+    --belief_num_tokens "$BELIEF_NUM_TOKENS"
+    --belief_target_frames "$BELIEF_TARGET_FRAMES"
+    --belief_aux_weight "$BELIEF_AUX_WEIGHT"
+    --belief_future_weight "$BELIEF_FUTURE_WEIGHT"
+    --belief_reconstruction_weight "$BELIEF_RECON_WEIGHT"
+    --belief_kl_weight "$BELIEF_KL_WEIGHT"
+  )
 fi
 
 "${CMD[@]}"

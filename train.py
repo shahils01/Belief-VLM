@@ -100,6 +100,18 @@ def parse_args():
     parser.add_argument("--use_future_predictor", action="store_true")
     parser.add_argument("--future_predictor_checkpoint", type=str, default="")
     parser.add_argument("--future_frames", type=int, default=0)
+    parser.add_argument("--use_belief_model", action="store_true")
+    parser.add_argument("--belief_hidden_dim", type=int, default=1024)
+    parser.add_argument("--belief_latent_dim", type=int, default=512)
+    parser.add_argument("--belief_num_layers", type=int, default=2)
+    parser.add_argument("--belief_num_heads", type=int, default=8)
+    parser.add_argument("--belief_num_tokens", type=int, default=4)
+    parser.add_argument("--belief_dropout", type=float, default=0.1)
+    parser.add_argument("--belief_target_frames", type=int, default=2)
+    parser.add_argument("--belief_aux_weight", type=float, default=0.2)
+    parser.add_argument("--belief_future_weight", type=float, default=1.0)
+    parser.add_argument("--belief_reconstruction_weight", type=float, default=0.5)
+    parser.add_argument("--belief_kl_weight", type=float, default=1e-3)
 
     parser.add_argument("--peft", type=str, default="none", choices=["none", "lora", "qlora"])
     parser.add_argument("--lora_r", type=int, default=16)
@@ -187,8 +199,20 @@ def build_model(args, device):
         use_cache=not args.disable_vl_cache,
         future_predictor_checkpoint=args.future_predictor_checkpoint if args.use_future_predictor else "",
         future_predictor_bundle=getattr(args, "future_predictor_bundle", None) if args.use_future_predictor else None,
-        future_context_frames=args.video_frames if args.use_future_predictor else 0,
+        future_context_frames=args.video_frames if (args.use_future_predictor or args.use_belief_model) else 0,
         future_frames=args.future_frames if args.use_future_predictor else 0,
+        use_belief_model=args.use_belief_model,
+        belief_hidden_dim=args.belief_hidden_dim,
+        belief_latent_dim=args.belief_latent_dim,
+        belief_num_layers=args.belief_num_layers,
+        belief_num_heads=args.belief_num_heads,
+        belief_num_tokens=args.belief_num_tokens,
+        belief_dropout=args.belief_dropout,
+        belief_target_frames=args.belief_target_frames,
+        belief_aux_weight=args.belief_aux_weight,
+        belief_future_weight=args.belief_future_weight,
+        belief_reconstruction_weight=args.belief_reconstruction_weight,
+        belief_kl_weight=args.belief_kl_weight,
     )
     return MultimodalBeliefModel(cfg, device=device)
 
@@ -300,6 +324,9 @@ def run_epoch(model, loader, optimizer, accelerator, args, train, global_step):
             accelerator.print(f"{phase} step={step} loss={avg_loss:.4f}")
             if args.wandb:
                 metrics = {f"{phase}/loss": avg_loss}
+                for key in ("lm_loss", "aux_loss", "belief_future_loss", "belief_reconstruction_loss", "belief_kl_loss"):
+                    if key in outputs:
+                        metrics[f"{phase}/{key}"] = float(outputs[key].detach().item())
                 if train:
                     metrics["train/lr"] = optimizer.param_groups[0]["lr"]
                     accelerator.log(metrics, step=global_step + step)
@@ -319,6 +346,12 @@ def main():
             raise RuntimeError("--use_future_predictor requires --future_predictor_checkpoint.")
         if args.future_frames <= 0:
             raise RuntimeError("--use_future_predictor requires --future_frames > 0.")
+    if args.use_future_predictor and args.use_belief_model:
+        raise RuntimeError("Use either --use_future_predictor or --use_belief_model, not both.")
+    if args.use_belief_model and args.video_frames < 2:
+        raise RuntimeError("--use_belief_model requires --video_frames >= 2.")
+    if args.use_belief_model and args.belief_target_frames >= args.video_frames:
+        raise RuntimeError("--belief_target_frames must be smaller than --video_frames.")
 
     if args.detect_anomaly:
         torch.autograd.set_detect_anomaly(True)
@@ -327,6 +360,9 @@ def main():
     if args.use_future_predictor and not args.ddp_find_unused_parameters:
         args.ddp_find_unused_parameters = True
         print("Enabling DDP find_unused_parameters for future-conditioned training.")
+    if args.use_belief_model and not args.ddp_find_unused_parameters:
+        args.ddp_find_unused_parameters = True
+        print("Enabling DDP find_unused_parameters for belief-conditioned training.")
 
     if args.peft == "qlora":
         try:
