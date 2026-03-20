@@ -312,6 +312,21 @@ class MultimodalBeliefModel(nn.Module):
         if image_feature_dim != self._lm_embed_dim and self.image_token_adapter is None:
             self.image_token_adapter = nn.Linear(image_feature_dim, self._lm_embed_dim).to(self.backbone.device)
 
+    @staticmethod
+    def _resize_token_sequence(tokens: torch.Tensor, target_tokens: int):
+        current_tokens = int(tokens.shape[1])
+        if current_tokens == target_tokens:
+            return tokens
+        if target_tokens <= 0:
+            raise RuntimeError(f"target_tokens must be positive, got {target_tokens}")
+        resized = F.interpolate(
+            tokens.transpose(1, 2),
+            size=target_tokens,
+            mode="linear",
+            align_corners=False,
+        )
+        return resized.transpose(1, 2)
+
     def _init_belief_conditioning(self):
         vision_feature_dim = self._infer_vision_feature_dim()
         if vision_feature_dim <= 0:
@@ -422,10 +437,10 @@ class MultimodalBeliefModel(nn.Module):
             image_token_count = int(image_mask.sum().item())
             row_image_features = image_features[row]
             if image_token_count != int(row_image_features.shape[0]):
-                raise RuntimeError(
-                    "Mismatch between processor image tokens and extracted image features: "
-                    f"expected={image_token_count}, got={int(row_image_features.shape[0])}"
-                )
+                row_image_features = self._resize_token_sequence(
+                    row_image_features.unsqueeze(0),
+                    image_token_count,
+                ).squeeze(0)
             if image_token_count > 0:
                 row_embeds_cur = row_embeds_cur.masked_scatter(
                     image_mask.unsqueeze(-1).expand_as(row_embeds_cur),
