@@ -479,7 +479,7 @@ class MultimodalBeliefModel(nn.Module):
         future_tokens = self.future_adapter(future_pred.to(dtype=adapter_dtype))
         future_tokens = future_tokens.to(dtype=image_features.dtype)
         future_outputs = None
-        if self._train_future_predictor:
+        if self._train_future_predictor and self.training:
             if "future_pixel_values" not in model_inputs:
                 raise RuntimeError(
                     "Joint future-predictor training requires future_pixel_values in the batch."
