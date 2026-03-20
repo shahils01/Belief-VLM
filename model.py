@@ -221,16 +221,18 @@ class FutureTokenAdapter(nn.Module):
 
 
 class BeliefTokenAdapter(nn.Module):
-    def __init__(self, embed_dim: int):
+    def __init__(self, input_dim: int, output_dim: int):
         super().__init__()
-        self.norm = nn.LayerNorm(embed_dim)
-        self.proj = nn.Linear(embed_dim, embed_dim)
+        self.norm = nn.LayerNorm(input_dim)
+        self.proj = nn.Linear(input_dim, output_dim)
         self.gate = nn.Parameter(torch.tensor(0.0))
 
     def forward(self, x):
         delta = self.proj(self.norm(x))
         gate = torch.tanh(self.gate)
-        return x + gate * delta
+        if x.shape[-1] == delta.shape[-1]:
+            return x + gate * delta
+        return gate * delta + (1.0 - gate) * self.proj.weight.new_zeros(delta.shape)
 
 
 class MultimodalBeliefModel(nn.Module):
@@ -247,10 +249,16 @@ class MultimodalBeliefModel(nn.Module):
         self.belief_predictor = None
         self.belief_adapter = None
         self.belief_loss = None
+        self.image_token_adapter = None
         self.belief_aux_weight = float(cfg.belief_aux_weight)
         self._future_frames = int(cfg.future_frames or 0)
         self._future_context_frames = int(cfg.future_context_frames or 0)
         self._image_token_id = int(getattr(self.backbone.model.config, "image_token_id", -1))
+        token_embed = self.backbone.model.get_input_embeddings()
+        self._lm_embed_dim = int(getattr(token_embed, "embedding_dim", 0) or 0)
+        self._vision_feature_dim = int(self._infer_vision_feature_dim() or 0)
+        if self._vision_feature_dim > 0:
+            self._ensure_feature_adapters(self._vision_feature_dim)
         if cfg.future_predictor_bundle is not None:
             self._init_future_conditioning_from_bundle(cfg.future_predictor_bundle)
         elif cfg.future_predictor_checkpoint:
@@ -258,25 +266,28 @@ class MultimodalBeliefModel(nn.Module):
         if cfg.use_belief_model:
             self._init_belief_conditioning()
 
+    def _infer_vision_feature_dim(self):
+        model_ref = self.backbone._get_core_model()
+        for attr in ("projection_dim", "hidden_size", "embed_dim"):
+            value = getattr(getattr(model_ref, "vision_model", model_ref), "config", None)
+            if value is not None and hasattr(value, attr):
+                return int(getattr(value, attr))
+        return 0
+
+    def _ensure_feature_adapters(self, image_feature_dim: int):
+        if self._lm_embed_dim <= 0:
+            raise RuntimeError("Could not infer the LM embedding size for conditioned inputs.")
+        if image_feature_dim <= 0:
+            raise RuntimeError("Could not infer the visual feature size for conditioned inputs.")
+        if image_feature_dim != self._lm_embed_dim and self.image_token_adapter is None:
+            self.image_token_adapter = nn.Linear(image_feature_dim, self._lm_embed_dim).to(self.backbone.device)
+
     def _init_belief_conditioning(self):
-        image_embed_dim = None
-        token_embed = getattr(self.backbone.model, "get_input_embeddings", None)
-        if callable(token_embed):
-            token_embed = token_embed()
-            image_embed_dim = int(getattr(token_embed, "embedding_dim", 0) or 0)
-        if image_embed_dim <= 0:
-            model_ref = self.backbone._get_core_model()
-            for attr in ("hidden_size", "projection_dim", "embed_dim"):
-                value = getattr(getattr(model_ref, "vision_model", model_ref), "config", None)
-                if value is not None and hasattr(value, attr):
-                    image_embed_dim = int(getattr(value, attr))
-                    break
-        if image_embed_dim is None:
-            image_embed_dim = int(getattr(self.backbone.model.config, "hidden_size", 0))
-        if image_embed_dim <= 0:
+        vision_feature_dim = self._infer_vision_feature_dim()
+        if vision_feature_dim <= 0:
             raise RuntimeError("Could not infer the visual embedding size for belief conditioning.")
         predictor_cfg = BeliefPredictorConfig(
-            embed_dim=image_embed_dim,
+            embed_dim=vision_feature_dim,
             hidden_dim=int(self.cfg.belief_hidden_dim),
             latent_dim=int(self.cfg.belief_latent_dim),
             num_layers=int(self.cfg.belief_num_layers),
@@ -287,7 +298,7 @@ class MultimodalBeliefModel(nn.Module):
             target_frames=max(1, int(self.cfg.belief_target_frames)),
         )
         self.belief_predictor = BeliefPredictionTransformer(predictor_cfg).to(self.backbone.device)
-        self.belief_adapter = BeliefTokenAdapter(image_embed_dim).to(self.backbone.device)
+        self.belief_adapter = BeliefTokenAdapter(vision_feature_dim, self._lm_embed_dim).to(self.backbone.device)
         self.belief_loss = BeliefAuxiliaryLoss(
             future_weight=float(self.cfg.belief_future_weight),
             reconstruction_weight=float(self.cfg.belief_reconstruction_weight),
@@ -331,7 +342,7 @@ class MultimodalBeliefModel(nn.Module):
         for param in predictor.parameters():
             param.requires_grad = False
         self.future_predictor = predictor
-        self.future_adapter = FutureTokenAdapter(predictor_cfg.embed_dim).to(self.backbone.device)
+        self.future_adapter = BeliefTokenAdapter(predictor_cfg.embed_dim, self._lm_embed_dim).to(self.backbone.device)
         self._future_context_frames = int(self._future_context_frames or predictor_cfg.max_context_frames)
         self._future_frames = int(self._future_frames or predictor_cfg.max_future_frames)
 
@@ -454,6 +465,9 @@ class MultimodalBeliefModel(nn.Module):
             )
         frames_per_sample = num_images // batch_size
         frame_embeddings = image_features.mean(dim=1).view(batch_size, frames_per_sample, -1)
+        self._ensure_feature_adapters(int(image_features.shape[-1]))
+        if self.image_token_adapter is not None:
+            image_features = self.image_token_adapter(image_features)
         image_tokens = image_features.view(batch_size, -1, image_features.shape[-1])
         return image_tokens, frame_embeddings
 
