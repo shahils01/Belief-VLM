@@ -9,10 +9,10 @@ PARTICIPANT_COLUMN="${PARTICIPANT_COLUMN:-participant_id}"
 DEBUG_GENERATE="${DEBUG_GENERATE:-0}"
 DEBUG_GENERATE_EVERY="${DEBUG_GENERATE_EVERY:-0}"
 PREDICTIVE_MODULE="${PREDICTIVE_MODULE:-future}"
-USE_FUTURE_PREDICTOR="${USE_FUTURE_PREDICTOR:-0}"
+USE_FUTURE_PREDICTOR="${USE_FUTURE_PREDICTOR:-1}"
 FUTURE_PREDICTOR_CHECKPOINT="${FUTURE_PREDICTOR_CHECKPOINT:-/scratch/shahils/Belief-VLM/checkpoints_future_predictor/ckpt_epoch_19.pt}"
-FUTURE_FRAMES="${FUTURE_FRAMES:-8}"
-FINETUNE_FUTURE_PREDICTOR="${FINETUNE_FUTURE_PREDICTOR:-0}"
+FUTURE_FRAMES="${FUTURE_FRAMES:-2}"
+FINETUNE_FUTURE_PREDICTOR="${FINETUNE_FUTURE_PREDICTOR:-1}"
 FUTURE_AUX_WEIGHT="${FUTURE_AUX_WEIGHT:-0.1}"
 FUTURE_OFFSET_SEC="${FUTURE_OFFSET_SEC:-0.0}"
 FUTURE_DURATION_SEC="${FUTURE_DURATION_SEC:-0.0}"
@@ -22,7 +22,7 @@ FINETUNE_BELIEF_NETWORK="${FINETUNE_BELIEF_NETWORK:-0}"
 BELIEF_AUX_WEIGHT="${BELIEF_AUX_WEIGHT:-0.1}"
 
 CMD=(
-  accelerate launch --num_processes 4 train.py
+  accelerate launch --num_processes 6 train.py
   --dataset_type hd_epic_local
   --video_root "$VIDEO_ROOT"
   --metadata_root "$METADATA_ROOT"
@@ -35,7 +35,7 @@ CMD=(
   --val_ratio 0.01
   --batch_size 2
   --num_workers 4
-  --video_frames 20
+  --video_frames 10
   --grad_accum_steps 16
   --mixed_precision bf16
   --allow_tf32
@@ -43,10 +43,9 @@ CMD=(
   --log_every 1
   --vl_model_preset "$VL_MODEL_PRESET"
   --gradient_checkpointing
-  --save_dir checkpoints_belief_hd_epic_ddp_bundles
-  --resume_checkpoint "/scratch/shahils/Belief-VLM/checkpoints_belief_hd_epic_ddp_bundles/ckpt_epoch_24.pt"
-  --load_model_only
+  --save_dir checkpoints_future_full_finetune_scratch
   --wandb
+  --wandb_run_name "future_full_ft"
 )
 
 if [[ "$DEBUG_GENERATE" == "1" ]]; then
@@ -70,3 +69,5 @@ fi
 "${CMD[@]}"
 
   # --peft qlora
+  # --resume_checkpoint "/scratch/shahils/Belief-VLM/checkpoints_belief_hd_epic_ddp_07/ckpt_epoch_99.pt"
+  # --load_model_only
