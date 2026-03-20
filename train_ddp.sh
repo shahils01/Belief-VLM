@@ -30,7 +30,7 @@ CMD=(
   --val_ratio 0.01
   --batch_size 2
   --num_workers 4
-  --video_frames 20
+  --video_frames 10
   --grad_accum_steps 16
   --mixed_precision bf16
   --allow_tf32

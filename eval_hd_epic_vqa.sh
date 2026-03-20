@@ -18,7 +18,7 @@ CMD=(
   --print_samples "$PRINT_SAMPLES"
   --progress_every "$PROGRESS_EVERY"
   --vl_model_preset "$VL_MODEL_PRESET"
-  --video_frames "20"
+  --video_frames "10"
   --mixed_precision bf16
   --allow_tf32
 )
