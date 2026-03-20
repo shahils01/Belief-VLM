@@ -22,7 +22,7 @@ FINETUNE_BELIEF_NETWORK="${FINETUNE_BELIEF_NETWORK:-0}"
 BELIEF_AUX_WEIGHT="${BELIEF_AUX_WEIGHT:-0.1}"
 
 CMD=(
-  accelerate launch --num_processes 6 train.py
+  accelerate launch --num_processes 1 train.py
   --dataset_type hd_epic_local
   --video_root "$VIDEO_ROOT"
   --metadata_root "$METADATA_ROOT"
@@ -43,7 +43,7 @@ CMD=(
   --log_every 1
   --vl_model_preset "$VL_MODEL_PRESET"
   --gradient_checkpointing
-  --save_dir checkpoints_future_full_finetune_scratch
+  --save_dir checkpoints_future_full_finetune_scratch_temp
   --wandb
   --wandb_run_name "future_full_ft"
 )
