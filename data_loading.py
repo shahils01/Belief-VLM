@@ -724,7 +724,7 @@ def _stack_inputs(items):
     for key in items[0].keys():
         values = [item[key] for item in items]
         if torch.is_tensor(values[0]):
-            if key == "pixel_values" and values[0].dim() == 4:
+            if key in {"pixel_values", "future_pixel_values"} and values[0].dim() == 4:
                 output[key] = torch.cat(values, dim=0)
             elif key in {"input_ids", "attention_mask"}:
                 max_len = max(int(v.shape[0]) for v in values)
