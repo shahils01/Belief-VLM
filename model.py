@@ -259,13 +259,18 @@ class MultimodalBeliefModel(nn.Module):
             self._init_belief_conditioning()
 
     def _init_belief_conditioning(self):
-        model_ref = self.backbone._get_core_model()
         image_embed_dim = None
-        for attr in ("hidden_size", "projection_dim", "embed_dim"):
-            value = getattr(getattr(model_ref, "vision_model", model_ref), "config", None)
-            if value is not None and hasattr(value, attr):
-                image_embed_dim = int(getattr(value, attr))
-                break
+        token_embed = getattr(self.backbone.model, "get_input_embeddings", None)
+        if callable(token_embed):
+            token_embed = token_embed()
+            image_embed_dim = int(getattr(token_embed, "embedding_dim", 0) or 0)
+        if image_embed_dim <= 0:
+            model_ref = self.backbone._get_core_model()
+            for attr in ("hidden_size", "projection_dim", "embed_dim"):
+                value = getattr(getattr(model_ref, "vision_model", model_ref), "config", None)
+                if value is not None and hasattr(value, attr):
+                    image_embed_dim = int(getattr(value, attr))
+                    break
         if image_embed_dim is None:
             image_embed_dim = int(getattr(self.backbone.model.config, "hidden_size", 0))
         if image_embed_dim <= 0:
