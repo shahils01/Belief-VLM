@@ -631,10 +631,28 @@ class LocalHD_EPICDataset(IterableDataset):
                 vl_backend=self.args.vl_backend,
                 max_text_len=self.args.vl_max_text_len,
             )
+            inputs = {k: v for k, v in packed.items() if k not in {"labels", "prompt_text", "answer_text"}}
+            if getattr(self.args, "use_future_predictor", False) and getattr(self.args, "finetune_future_predictor", False):
+                future_start_sec, future_end_sec = _resolve_hd_epic_future_window(
+                    record,
+                    future_offset_sec=getattr(self.args, "future_offset_sec", 0.0),
+                    future_duration_sec=getattr(self.args, "future_duration_sec", 0.0),
+                )
+                future_frames = decode_mp4_frames(
+                    video_path,
+                    self.args.future_frames,
+                    start_time_sec=future_start_sec,
+                    end_time_sec=future_end_sec,
+                )
+                image_processor = getattr(self.processor, "image_processor", None)
+                if image_processor is None:
+                    raise RuntimeError("InternVL processor does not expose an image_processor.")
+                future_pixels = image_processor(images=future_frames, return_tensors="pt")["pixel_values"]
+                inputs["future_pixel_values"] = future_pixels
 
             sample_count += 1
             yield {
-                "inputs": {k: v for k, v in packed.items() if k not in {"labels", "prompt_text", "answer_text"}},
+                "inputs": inputs,
                 "labels": packed["labels"],
             }
 

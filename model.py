@@ -7,7 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from Belief_Network import AttentionConfig, RecursiveBeliefNetwork
-from future_prediction import FuturePredictionTransformer, FuturePredictorConfig
+from future_prediction import FuturePredictionLoss, FuturePredictionTransformer, FuturePredictorConfig
 
 @dataclass
 class ModelConfig:
@@ -19,6 +19,8 @@ class ModelConfig:
     use_cache: bool = False
     future_predictor_checkpoint: str = ""
     future_predictor_bundle: Optional[Any] = None
+    train_future_predictor: bool = False
+    future_aux_weight: float = 0.0
     belief_network_checkpoint: str = ""
     belief_network_bundle: Optional[Any] = None
     train_belief_network: bool = False
@@ -224,6 +226,8 @@ class MultimodalBeliefModel(nn.Module):
         self.future_adapter = None
         self.belief_network = None
         self.belief_adapter = None
+        self._train_future_predictor = bool(cfg.train_future_predictor)
+        self._future_aux_weight = float(cfg.future_aux_weight)
         self._train_belief_network = bool(cfg.train_belief_network)
         self._belief_aux_weight = float(cfg.belief_aux_weight)
         self._future_frames = int(cfg.future_frames or 0)
@@ -273,11 +277,15 @@ class MultimodalBeliefModel(nn.Module):
         predictor = FuturePredictionTransformer(predictor_cfg)
         predictor.load_state_dict(predictor_state)
         predictor.to(self.backbone.device)
-        predictor.eval()
-        for param in predictor.parameters():
-            param.requires_grad = False
+        if self._train_future_predictor:
+            predictor.train()
+        else:
+            predictor.eval()
+            for param in predictor.parameters():
+                param.requires_grad = False
         self.future_predictor = predictor
         self.future_adapter = FutureTokenAdapter(predictor_cfg.embed_dim).to(self.backbone.device)
+        self.future_loss_fn = FuturePredictionLoss()
         self._future_context_frames = int(self._future_context_frames or predictor_cfg.max_context_frames)
         self._future_frames = int(self._future_frames or predictor_cfg.max_future_frames)
 
@@ -470,6 +478,22 @@ class MultimodalBeliefModel(nn.Module):
         future_pred = self.future_predictor(context_frame_embeddings, future_frames=self._future_frames)
         future_tokens = self.future_adapter(future_pred.to(dtype=adapter_dtype))
         future_tokens = future_tokens.to(dtype=image_features.dtype)
+        future_outputs = None
+        if self._train_future_predictor:
+            if "future_pixel_values" not in model_inputs:
+                raise RuntimeError(
+                    "Joint future-predictor training requires future_pixel_values in the batch."
+                )
+            future_pixel_values = model_inputs["future_pixel_values"]
+            future_image_features = self.backbone.extract_image_tokens(future_pixel_values, normalize=False)
+            if future_image_features.shape[0] % batch_size != 0:
+                raise RuntimeError(
+                    f"Could not reshape future image features by batch: num_images={future_image_features.shape[0]}, batch={batch_size}"
+                )
+            future_frames_per_sample = future_image_features.shape[0] // batch_size
+            future_target = future_image_features.mean(dim=1).view(batch_size, future_frames_per_sample, -1)
+            future_target = future_target.to(dtype=future_pred.dtype)
+            future_outputs = self.future_loss_fn(future_pred, future_target)
         current_tokens = image_features.view(batch_size, -1, image_features.shape[-1])
         inputs_embeds, new_attention_mask, new_labels = self._inject_image_features(
             input_ids=input_ids,
@@ -478,13 +502,14 @@ class MultimodalBeliefModel(nn.Module):
             image_features=current_tokens,
             extra_features=future_tokens,
         )
-        return self.backbone.model(
+        backbone_outputs = self.backbone.model(
             input_ids=None,
             inputs_embeds=inputs_embeds,
             attention_mask=new_attention_mask,
             labels=new_labels,
             **forward_kwargs,
         )
+        return backbone_outputs, future_outputs
 
     def _forward_with_belief(self, model_inputs, labels, forward_kwargs):
         pixel_key = None
@@ -543,16 +568,26 @@ class MultimodalBeliefModel(nn.Module):
             forward_kwargs["use_cache"] = False
         labels = labels.to(self.backbone.device) if labels is not None else None
         if self.future_predictor is not None:
-            outputs = self._forward_with_future(model_inputs, labels, forward_kwargs)
+            outputs, future_outputs = self._forward_with_future(model_inputs, labels, forward_kwargs)
+            belief_outputs = None
         elif self.belief_network is not None:
             outputs, belief_outputs = self._forward_with_belief(model_inputs, labels, forward_kwargs)
+            future_outputs = None
         else:
             if labels is not None:
                 model_inputs["labels"] = labels
             outputs = self.backbone.model(**model_inputs, **forward_kwargs)
             belief_outputs = None
+            future_outputs = None
         total_loss = outputs.loss
         result = {"loss": total_loss, "logits": outputs.logits}
+        if future_outputs is not None:
+            result["future_loss"] = future_outputs["loss"]
+            result["future_mse"] = future_outputs["mse"]
+            result["future_cosine"] = future_outputs["cosine"]
+            if self._train_future_predictor and labels is not None and self._future_aux_weight > 0.0:
+                total_loss = total_loss + self._future_aux_weight * future_outputs["loss"]
+                result["loss"] = total_loss
         if belief_outputs is not None:
             result["belief_loss"] = belief_outputs["loss"]
             result["belief_recon_loss"] = belief_outputs["recon_loss"]

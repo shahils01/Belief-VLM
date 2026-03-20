@@ -100,6 +100,10 @@ def parse_args():
     parser.add_argument("--use_future_predictor", action="store_true")
     parser.add_argument("--future_predictor_checkpoint", type=str, default="")
     parser.add_argument("--future_frames", type=int, default=0)
+    parser.add_argument("--finetune_future_predictor", action="store_true")
+    parser.add_argument("--future_aux_weight", type=float, default=0.0)
+    parser.add_argument("--future_offset_sec", type=float, default=0.0)
+    parser.add_argument("--future_duration_sec", type=float, default=0.0)
     parser.add_argument("--use_belief_network", action="store_true")
     parser.add_argument("--belief_network_checkpoint", type=str, default="")
     parser.add_argument("--finetune_belief_network", action="store_true")
@@ -191,6 +195,8 @@ def build_model(args, device):
         use_cache=not args.disable_vl_cache,
         future_predictor_checkpoint=args.future_predictor_checkpoint if args.use_future_predictor else "",
         future_predictor_bundle=getattr(args, "future_predictor_bundle", None) if args.use_future_predictor else None,
+        train_future_predictor=args.finetune_future_predictor if args.use_future_predictor else False,
+        future_aux_weight=args.future_aux_weight if args.use_future_predictor else 0.0,
         belief_network_checkpoint=args.belief_network_checkpoint if args.use_belief_network else "",
         belief_network_bundle=getattr(args, "belief_network_bundle", None) if args.use_belief_network else None,
         train_belief_network=args.finetune_belief_network if args.use_belief_network else False,
@@ -277,6 +283,9 @@ def _restore_bundled_belief_network_args(args, ckpt):
 def run_epoch(model, loader, optimizer, accelerator, args, train, global_step):
     model.train() if train else model.eval()
     total_loss = 0.0
+    total_future_loss = 0.0
+    total_future_mse = 0.0
+    total_future_cosine = 0.0
     total_belief_loss = 0.0
     total_belief_recon = 0.0
     total_belief_kl = 0.0
@@ -315,6 +324,10 @@ def run_epoch(model, loader, optimizer, accelerator, args, train, global_step):
 
         batch_size = labels.size(0)
         total_loss += loss.detach().item() * batch_size
+        if "future_loss" in outputs:
+            total_future_loss += outputs["future_loss"].detach().item() * batch_size
+            total_future_mse += outputs["future_mse"].detach().item() * batch_size
+            total_future_cosine += outputs["future_cosine"].detach().item() * batch_size
         if "belief_loss" in outputs:
             total_belief_loss += outputs["belief_loss"].detach().item() * batch_size
             total_belief_recon += outputs["belief_recon_loss"].detach().item() * batch_size
@@ -325,7 +338,14 @@ def run_epoch(model, loader, optimizer, accelerator, args, train, global_step):
         if args.log_every > 0 and step % args.log_every == 0:
             avg_loss = total_loss / max(total_examples, 1)
             phase = "train" if train else "val"
-            if total_belief_loss > 0.0 or "belief_loss" in outputs:
+            if total_future_loss > 0.0 or "future_loss" in outputs:
+                accelerator.print(
+                    f"{phase} step={step} loss={avg_loss:.4f} "
+                    f"future={total_future_loss / max(total_examples, 1):.4f} "
+                    f"mse={total_future_mse / max(total_examples, 1):.4f} "
+                    f"cos={total_future_cosine / max(total_examples, 1):.4f}"
+                )
+            elif total_belief_loss > 0.0 or "belief_loss" in outputs:
                 accelerator.print(
                     f"{phase} step={step} loss={avg_loss:.4f} "
                     f"belief={total_belief_loss / max(total_examples, 1):.4f} "
@@ -337,6 +357,10 @@ def run_epoch(model, loader, optimizer, accelerator, args, train, global_step):
                 accelerator.print(f"{phase} step={step} loss={avg_loss:.4f}")
             if args.wandb:
                 metrics = {f"{phase}/loss": avg_loss}
+                if total_future_loss > 0.0 or "future_loss" in outputs:
+                    metrics[f"{phase}/future_loss"] = total_future_loss / max(total_examples, 1)
+                    metrics[f"{phase}/future_mse"] = total_future_mse / max(total_examples, 1)
+                    metrics[f"{phase}/future_cosine"] = total_future_cosine / max(total_examples, 1)
                 if total_belief_loss > 0.0 or "belief_loss" in outputs:
                     metrics[f"{phase}/belief_loss"] = total_belief_loss / max(total_examples, 1)
                     metrics[f"{phase}/belief_recon_loss"] = total_belief_recon / max(total_examples, 1)
