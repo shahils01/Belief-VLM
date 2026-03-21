@@ -44,6 +44,18 @@ def parse_args():
     parser.add_argument("--use_future_predictor", action="store_true")
     parser.add_argument("--future_predictor_checkpoint", type=str, default="")
     parser.add_argument("--future_frames", type=int, default=None)
+    parser.add_argument("--use_belief_model", action="store_true")
+    parser.add_argument("--belief_hidden_dim", type=int, default=None)
+    parser.add_argument("--belief_latent_dim", type=int, default=None)
+    parser.add_argument("--belief_num_layers", type=int, default=None)
+    parser.add_argument("--belief_num_heads", type=int, default=None)
+    parser.add_argument("--belief_num_tokens", type=int, default=None)
+    parser.add_argument("--belief_dropout", type=float, default=None)
+    parser.add_argument("--belief_target_frames", type=int, default=None)
+    parser.add_argument("--belief_aux_weight", type=float, default=None)
+    parser.add_argument("--belief_future_weight", type=float, default=None)
+    parser.add_argument("--belief_reconstruction_weight", type=float, default=None)
+    parser.add_argument("--belief_kl_weight", type=float, default=None)
     parser.add_argument("--freeze_vl", action="store_true")
     parser.add_argument("--gradient_checkpointing", action="store_true")
     parser.add_argument("--disable_vl_cache", action="store_true")
@@ -83,6 +95,17 @@ def _merge_args(cli_args, ckpt_args):
         "mixed_precision",
         "peft",
         "future_frames",
+        "belief_hidden_dim",
+        "belief_latent_dim",
+        "belief_num_layers",
+        "belief_num_heads",
+        "belief_num_tokens",
+        "belief_dropout",
+        "belief_target_frames",
+        "belief_aux_weight",
+        "belief_future_weight",
+        "belief_reconstruction_weight",
+        "belief_kl_weight",
     )
     for key in optional_overrides:
         value = getattr(cli_args, key)
@@ -100,6 +123,8 @@ def _merge_args(cli_args, ckpt_args):
     if cli_args.use_future_predictor:
         merged["use_future_predictor"] = True
         merged["future_predictor_checkpoint"] = cli_args.future_predictor_checkpoint
+    if cli_args.use_belief_model:
+        merged["use_belief_model"] = True
 
     merged.setdefault("vl_backend", "internvl")
     merged.setdefault("vl_model_preset", "internvl3_5_1b")
@@ -112,6 +137,18 @@ def _merge_args(cli_args, ckpt_args):
     merged.setdefault("use_future_predictor", False)
     merged.setdefault("future_predictor_checkpoint", "")
     merged.setdefault("future_frames", 0)
+    merged.setdefault("use_belief_model", False)
+    merged.setdefault("belief_hidden_dim", 1024)
+    merged.setdefault("belief_latent_dim", 512)
+    merged.setdefault("belief_num_layers", 2)
+    merged.setdefault("belief_num_heads", 8)
+    merged.setdefault("belief_num_tokens", 4)
+    merged.setdefault("belief_dropout", 0.1)
+    merged.setdefault("belief_target_frames", 2)
+    merged.setdefault("belief_aux_weight", 0.2)
+    merged.setdefault("belief_future_weight", 1.0)
+    merged.setdefault("belief_reconstruction_weight", 0.5)
+    merged.setdefault("belief_kl_weight", 1e-3)
     merged.setdefault("lora_r", 16)
     merged.setdefault("lora_alpha", 32)
     merged.setdefault("lora_dropout", 0.05)
@@ -136,6 +173,16 @@ def _restore_bundled_future_predictor_args(args, ckpt):
     bundle_args = bundle.get("args", {})
     if int(getattr(args, "future_frames", 0) or 0) <= 0:
         args.future_frames = int(bundle_args.get("future_frames", args.future_frames or 0))
+
+
+def _restore_belief_args_from_checkpoint(args, ckpt):
+    if not isinstance(ckpt, dict):
+        return
+    ckpt_args = ckpt.get("args", {})
+    if not isinstance(ckpt_args, dict):
+        return
+    if bool(ckpt_args.get("use_belief_model", False)):
+        args.use_belief_model = True
 
 
 def _build_quant_config(args):
@@ -229,14 +276,22 @@ def evaluate(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     ckpt = torch.load(args.checkpoint, map_location="cpu") if args.checkpoint else {}
     _restore_bundled_future_predictor_args(args, ckpt)
+    _restore_belief_args_from_checkpoint(args, ckpt)
     ckpt_args = ckpt.get("args", {}) if isinstance(ckpt, dict) else {}
     merged_args = _merge_args(args, ckpt_args)
+    if merged_args.use_future_predictor and merged_args.use_belief_model:
+        raise RuntimeError("Evaluation expects either future conditioning or belief conditioning, not both.")
     if merged_args.use_future_predictor:
         has_bundled_predictor = getattr(merged_args, "future_predictor_bundle", None) is not None
         if not merged_args.future_predictor_checkpoint and not has_bundled_predictor:
             raise RuntimeError("--use_future_predictor requires --future_predictor_checkpoint.")
         if int(merged_args.future_frames) <= 0:
             raise RuntimeError("--use_future_predictor requires --future_frames > 0.")
+    if merged_args.use_belief_model:
+        if int(merged_args.video_frames) < 2:
+            raise RuntimeError("--use_belief_model requires --video_frames >= 2.")
+        if int(merged_args.belief_target_frames) >= int(merged_args.video_frames):
+            raise RuntimeError("--belief_target_frames must be smaller than --video_frames.")
     model, _ = _load_model(args.checkpoint, merged_args, device=device)
     processor = model.backbone.processor
     records = _load_records(merged_args)
