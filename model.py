@@ -228,10 +228,12 @@ class BeliefTokenAdapter(nn.Module):
         self.gate = nn.Parameter(torch.tensor(0.0))
 
     def forward(self, x):
-        delta = self.proj(self.norm(x))
+        proj_dtype = self.proj.weight.dtype
+        x_in = x.to(dtype=proj_dtype)
+        delta = self.proj(self.norm(x_in))
         gate = torch.tanh(self.gate)
         if x.shape[-1] == delta.shape[-1]:
-            return x + gate * delta
+            return x_in + gate * delta
         return gate * delta + (1.0 - gate) * self.proj.weight.new_zeros(delta.shape)
 
 
@@ -512,7 +514,8 @@ class MultimodalBeliefModel(nn.Module):
         frame_embeddings = image_features.mean(dim=1).view(batch_size, frames_per_sample, -1)
         self._ensure_feature_adapters(int(image_features.shape[-1]))
         if self.image_token_adapter is not None:
-            image_features = self.image_token_adapter(image_features)
+            adapter_dtype = self.image_token_adapter.weight.dtype
+            image_features = self.image_token_adapter(image_features.to(dtype=adapter_dtype))
         image_tokens = image_features.view(batch_size, -1, image_features.shape[-1])
         return image_tokens, frame_embeddings
 
