@@ -30,6 +30,7 @@ class ModelConfig:
     belief_num_tokens: int = 4
     belief_dropout: float = 0.1
     belief_target_frames: int = 2
+    belief_max_text_tokens: int = 256
     belief_aux_weight: float = 0.2
     belief_future_weight: float = 1.0
     belief_reconstruction_weight: float = 0.5
@@ -335,6 +336,7 @@ class MultimodalBeliefModel(nn.Module):
             raise RuntimeError("Could not infer the visual embedding size for belief conditioning.")
         predictor_cfg = BeliefPredictorConfig(
             embed_dim=vision_feature_dim,
+            text_dim=self._lm_embed_dim,
             hidden_dim=int(self.cfg.belief_hidden_dim),
             latent_dim=int(self.cfg.belief_latent_dim),
             num_layers=int(self.cfg.belief_num_layers),
@@ -342,6 +344,7 @@ class MultimodalBeliefModel(nn.Module):
             num_belief_tokens=int(self.cfg.belief_num_tokens),
             dropout=float(self.cfg.belief_dropout),
             max_context_frames=max(2, int(self.cfg.future_context_frames or 32)),
+            max_text_tokens=max(1, int(self.cfg.belief_max_text_tokens)),
             target_frames=max(1, int(self.cfg.belief_target_frames)),
         )
         self.belief_predictor = BeliefPredictionTransformer(predictor_cfg).to(self.backbone.device)
@@ -519,6 +522,47 @@ class MultimodalBeliefModel(nn.Module):
         image_tokens = image_features.view(batch_size, -1, image_features.shape[-1])
         return image_tokens, frame_embeddings
 
+    def _extract_prompt_text_context(self, model_inputs, labels=None):
+        input_ids = model_inputs["input_ids"]
+        attention_mask = model_inputs["attention_mask"]
+        token_embed = self.backbone.model.get_input_embeddings()
+        text_rows = []
+        max_text_tokens = 0
+
+        for row in range(input_ids.shape[0]):
+            row_ids = input_ids[row]
+            valid_len = int(attention_mask[row].sum().item())
+            row_ids = row_ids[:valid_len]
+            prompt_mask = torch.ones(valid_len, dtype=torch.bool, device=row_ids.device)
+            if labels is not None:
+                row_labels = labels[row][:valid_len]
+                prompt_mask = row_labels.eq(-100)
+            text_mask = prompt_mask & row_ids.ne(self._image_token_id)
+            selected_ids = row_ids[text_mask]
+            if selected_ids.numel() == 0:
+                row_text = token_embed.weight.new_zeros((0, token_embed.embedding_dim))
+            else:
+                row_text = token_embed(selected_ids)
+            text_rows.append(row_text)
+            max_text_tokens = max(max_text_tokens, int(row_text.shape[0]))
+
+        if max_text_tokens == 0:
+            return None, None
+
+        padded_rows = []
+        padding_masks = []
+        for row_text in text_rows:
+            pad_len = max_text_tokens - int(row_text.shape[0])
+            if pad_len > 0:
+                row_text = F.pad(row_text, (0, 0, 0, pad_len), value=0.0)
+            padded_rows.append(row_text)
+            padding_mask = torch.zeros(max_text_tokens, dtype=torch.bool, device=row_text.device)
+            if pad_len > 0:
+                padding_mask[-pad_len:] = True
+            padding_masks.append(padding_mask)
+
+        return torch.stack(padded_rows, dim=0), torch.stack(padding_masks, dim=0)
+
     def _forward_with_future(self, model_inputs, labels, forward_kwargs):
         image_tokens, context_frame_embeddings = self._extract_frame_context(model_inputs)
         predictor_dtype = next(self.future_predictor.parameters()).dtype
@@ -545,9 +589,18 @@ class MultimodalBeliefModel(nn.Module):
 
     def _forward_with_belief(self, model_inputs, labels, forward_kwargs):
         image_tokens, frame_embeddings = self._extract_frame_context(model_inputs)
+        text_embeddings, text_padding_mask = self._extract_prompt_text_context(model_inputs, labels=labels)
         predictor_dtype = next(self.belief_predictor.parameters()).dtype
         adapter_dtype = next(self.belief_adapter.parameters()).dtype
-        belief_outputs = self.belief_predictor(frame_embeddings.to(dtype=predictor_dtype))
+        if text_embeddings is not None:
+            text_embeddings = text_embeddings.to(self.backbone.device, dtype=predictor_dtype)
+        if text_padding_mask is not None:
+            text_padding_mask = text_padding_mask.to(self.backbone.device)
+        belief_outputs = self.belief_predictor(
+            frame_embeddings.to(dtype=predictor_dtype),
+            text_embeddings=text_embeddings,
+            text_padding_mask=text_padding_mask,
+        )
         belief_tokens = self.belief_adapter(belief_outputs["belief_tokens"].to(dtype=adapter_dtype))
         belief_tokens = belief_tokens.to(dtype=image_tokens.dtype)
         inputs_embeds, new_attention_mask, new_labels = self._compose_inputs_with_belief(
@@ -605,7 +658,16 @@ class MultimodalBeliefModel(nn.Module):
         elif self.belief_predictor is not None:
             predictor_dtype = next(self.belief_predictor.parameters()).dtype
             adapter_dtype = next(self.belief_adapter.parameters()).dtype
-            belief_outputs = self.belief_predictor(frame_embeddings.to(dtype=predictor_dtype))
+            text_embeddings, text_padding_mask = self._extract_prompt_text_context(model_inputs, labels=None)
+            if text_embeddings is not None:
+                text_embeddings = text_embeddings.to(self.backbone.device, dtype=predictor_dtype)
+            if text_padding_mask is not None:
+                text_padding_mask = text_padding_mask.to(self.backbone.device)
+            belief_outputs = self.belief_predictor(
+                frame_embeddings.to(dtype=predictor_dtype),
+                text_embeddings=text_embeddings,
+                text_padding_mask=text_padding_mask,
+            )
             belief_features = self.belief_adapter(
                 belief_outputs["belief_tokens"].to(dtype=adapter_dtype)
             ).to(dtype=image_tokens.dtype)

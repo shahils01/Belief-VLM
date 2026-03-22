@@ -8,6 +8,7 @@ import torch.nn.functional as F
 @dataclass
 class BeliefPredictorConfig:
     embed_dim: int
+    text_dim: int = 0
     hidden_dim: int = 1024
     latent_dim: int = 512
     num_layers: int = 2
@@ -15,6 +16,7 @@ class BeliefPredictorConfig:
     num_belief_tokens: int = 4
     dropout: float = 0.1
     max_context_frames: int = 32
+    max_text_tokens: int = 256
     target_frames: int = 2
 
 
@@ -25,6 +27,11 @@ class BeliefPredictionTransformer(nn.Module):
         self.input_proj = nn.Linear(cfg.embed_dim, cfg.hidden_dim)
         self.output_proj = nn.Linear(cfg.hidden_dim, cfg.embed_dim)
         self.context_pos_embed = nn.Parameter(torch.zeros(1, cfg.max_context_frames, cfg.hidden_dim))
+        self.text_proj = nn.Linear(cfg.text_dim, cfg.hidden_dim) if cfg.text_dim > 0 else None
+        self.text_pos_embed = (
+            nn.Parameter(torch.zeros(1, cfg.max_text_tokens, cfg.hidden_dim)) if cfg.text_dim > 0 else None
+        )
+        self.modality_embed = nn.Parameter(torch.zeros(1, 2, cfg.hidden_dim))
         self.belief_queries = nn.Parameter(torch.zeros(1, cfg.num_belief_tokens, cfg.hidden_dim))
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=cfg.hidden_dim,
@@ -73,15 +80,41 @@ class BeliefPredictionTransformer(nn.Module):
         context_frames = total_frames - target_frames
         return frame_embeddings[:, :context_frames], frame_embeddings[:, context_frames:]
 
-    def forward(self, frame_embeddings):
+    def forward(self, frame_embeddings, text_embeddings=None, text_padding_mask=None):
         context_embeddings, target_embeddings = self._split_context_and_target(frame_embeddings)
         context_len = int(context_embeddings.shape[1])
-        memory = self.input_proj(context_embeddings)
-        memory = memory + self.context_pos_embed[:, :context_len]
-        memory = self.encoder(memory)
+        visual_memory = self.input_proj(context_embeddings)
+        visual_memory = visual_memory + self.context_pos_embed[:, :context_len] + self.modality_embed[:, :1]
+
+        encoder_inputs = visual_memory
+        encoder_padding_mask = None
+        if (
+            text_embeddings is not None
+            and self.text_proj is not None
+            and int(text_embeddings.shape[1]) > 0
+        ):
+            text_len = min(int(text_embeddings.shape[1]), int(self.cfg.max_text_tokens))
+            text_hidden = self.text_proj(text_embeddings[:, :text_len])
+            text_hidden = text_hidden + self.text_pos_embed[:, :text_len] + self.modality_embed[:, 1:2]
+            encoder_inputs = torch.cat([text_hidden, visual_memory], dim=1)
+            if text_padding_mask is not None:
+                text_padding_mask = text_padding_mask[:, :text_len]
+                visual_padding = torch.zeros(
+                    text_padding_mask.shape[0],
+                    context_len,
+                    dtype=torch.bool,
+                    device=text_padding_mask.device,
+                )
+                encoder_padding_mask = torch.cat([text_padding_mask, visual_padding], dim=1)
+
+        memory = self.encoder(encoder_inputs, src_key_padding_mask=encoder_padding_mask)
         memory = self.memory_norm(memory)
 
-        pooled_memory = memory.mean(dim=1)
+        if encoder_padding_mask is not None:
+            valid_mask = (~encoder_padding_mask).unsqueeze(-1)
+            pooled_memory = (memory * valid_mask).sum(dim=1) / valid_mask.sum(dim=1).clamp_min(1.0)
+        else:
+            pooled_memory = memory.mean(dim=1)
         mu = self.posterior_mu(pooled_memory)
         logvar = self.posterior_logvar(pooled_memory).clamp(min=-8.0, max=8.0)
         std = torch.exp(0.5 * logvar)
