@@ -10,11 +10,6 @@ DEBUG_GENERATE="${DEBUG_GENERATE:-0}"
 DEBUG_GENERATE_EVERY="${DEBUG_GENERATE_EVERY:-0}"
 USE_BELIEF_MODEL="${USE_BELIEF_MODEL:-1}"
 BELIEF_NUM_TOKENS="${BELIEF_NUM_TOKENS:-4}"
-BELIEF_TARGET_FRAMES="${BELIEF_TARGET_FRAMES:-2}"
-BELIEF_AUX_WEIGHT="${BELIEF_AUX_WEIGHT:-0.2}"
-BELIEF_FUTURE_WEIGHT="${BELIEF_FUTURE_WEIGHT:-1.0}"
-BELIEF_RECON_WEIGHT="${BELIEF_RECON_WEIGHT:-0.5}"
-BELIEF_KL_WEIGHT="${BELIEF_KL_WEIGHT:-0.001}"
 
 CMD=(
   accelerate launch --num_processes 8 train.py
@@ -30,7 +25,7 @@ CMD=(
   --val_ratio 0.01
   --batch_size 2
   --num_workers 4
-  --video_frames 10
+  --video_frames 20
   --grad_accum_steps 16
   --mixed_precision bf16
   --allow_tf32
@@ -38,7 +33,7 @@ CMD=(
   --log_every 1
   --vl_model_preset "$VL_MODEL_PRESET"
   --gradient_checkpointing
-  --save_dir checkpoints_belief_hd_epic_ddp_bundles
+  --save_dir checkpoints_belief_hd_epic_ddp_ca_belief
   --wandb
 )
 
@@ -50,11 +45,6 @@ if [[ "$USE_BELIEF_MODEL" == "1" ]]; then
   CMD+=(
     --use_belief_model
     --belief_num_tokens "$BELIEF_NUM_TOKENS"
-    --belief_target_frames "$BELIEF_TARGET_FRAMES"
-    --belief_aux_weight "$BELIEF_AUX_WEIGHT"
-    --belief_future_weight "$BELIEF_FUTURE_WEIGHT"
-    --belief_reconstruction_weight "$BELIEF_RECON_WEIGHT"
-    --belief_kl_weight "$BELIEF_KL_WEIGHT"
   )
 fi
 

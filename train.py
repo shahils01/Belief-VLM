@@ -107,11 +107,6 @@ def parse_args():
     parser.add_argument("--belief_num_heads", type=int, default=8)
     parser.add_argument("--belief_num_tokens", type=int, default=4)
     parser.add_argument("--belief_dropout", type=float, default=0.1)
-    parser.add_argument("--belief_target_frames", type=int, default=2)
-    parser.add_argument("--belief_aux_weight", type=float, default=0.2)
-    parser.add_argument("--belief_future_weight", type=float, default=1.0)
-    parser.add_argument("--belief_reconstruction_weight", type=float, default=0.5)
-    parser.add_argument("--belief_kl_weight", type=float, default=1e-3)
 
     parser.add_argument("--peft", type=str, default="none", choices=["none", "lora", "qlora"])
     parser.add_argument("--lora_r", type=int, default=16)
