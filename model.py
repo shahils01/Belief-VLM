@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from belief_prediction import BeliefAuxiliaryLoss, BeliefPredictionTransformer, BeliefPredictorConfig
+from custom_belief import BeliefProjector, RecurrentBeliefQueryModule
 from future_prediction import FuturePredictionTransformer, FuturePredictorConfig
 
 
@@ -23,12 +23,12 @@ class ModelConfig:
     future_context_frames: int = 0
     future_frames: int = 0
     use_belief_model: bool = False
-    belief_hidden_dim: int = 1024
-    belief_latent_dim: int = 512
-    belief_num_layers: int = 2
     belief_num_heads: int = 8
     belief_num_tokens: int = 4
     belief_dropout: float = 0.1
+    belief_hidden_dim: int = 1024
+    belief_latent_dim: int = 512
+    belief_num_layers: int = 2
     belief_target_frames: int = 2
     belief_max_text_tokens: int = 256
     belief_aux_weight: float = 0.2
@@ -251,9 +251,7 @@ class MultimodalBeliefModel(nn.Module):
         self.future_adapter = None
         self.belief_predictor = None
         self.belief_adapter = None
-        self.belief_loss = None
         self.image_token_adapter = None
-        self.belief_aux_weight = float(cfg.belief_aux_weight)
         self._future_frames = int(cfg.future_frames or 0)
         self._future_context_frames = int(cfg.future_context_frames or 0)
         self._image_token_id = int(getattr(self.backbone.model.config, "image_token_id", -1))
@@ -331,29 +329,16 @@ class MultimodalBeliefModel(nn.Module):
         return resized.transpose(1, 2)
 
     def _init_belief_conditioning(self):
-        vision_feature_dim = self._infer_vision_feature_dim()
-        if vision_feature_dim <= 0:
-            raise RuntimeError("Could not infer the visual embedding size for belief conditioning.")
-        predictor_cfg = BeliefPredictorConfig(
-            embed_dim=vision_feature_dim,
-            text_dim=self._lm_embed_dim,
-            hidden_dim=int(self.cfg.belief_hidden_dim),
-            latent_dim=int(self.cfg.belief_latent_dim),
-            num_layers=int(self.cfg.belief_num_layers),
+        if self._lm_embed_dim <= 0:
+            raise RuntimeError("Could not infer the LM embedding size for belief conditioning.")
+        self.belief_predictor = RecurrentBeliefQueryModule(
+            d_model=self._lm_embed_dim,
+            num_queries=int(self.cfg.belief_num_tokens),
             num_heads=int(self.cfg.belief_num_heads),
-            num_belief_tokens=int(self.cfg.belief_num_tokens),
             dropout=float(self.cfg.belief_dropout),
-            max_context_frames=max(2, int(self.cfg.future_context_frames or 32)),
-            max_text_tokens=max(1, int(self.cfg.belief_max_text_tokens)),
-            target_frames=max(1, int(self.cfg.belief_target_frames)),
-        )
-        self.belief_predictor = BeliefPredictionTransformer(predictor_cfg).to(self.backbone.device)
-        self.belief_adapter = BeliefTokenAdapter(vision_feature_dim, self._lm_embed_dim).to(self.backbone.device)
-        self.belief_loss = BeliefAuxiliaryLoss(
-            future_weight=float(self.cfg.belief_future_weight),
-            reconstruction_weight=float(self.cfg.belief_reconstruction_weight),
-            kl_weight=float(self.cfg.belief_kl_weight),
+            use_text_conditioning=True,
         ).to(self.backbone.device)
+        self.belief_adapter = BeliefProjector(self._lm_embed_dim, self._lm_embed_dim).to(self.backbone.device)
 
     def _build_future_predictor_from_state(self, predictor_state, saved_args):
         embed_dim = int(saved_args["predictor_embed_dim"]) if "predictor_embed_dim" in saved_args else int(saved_args.get("embed_dim", 0))
@@ -588,20 +573,37 @@ class MultimodalBeliefModel(nn.Module):
         return {"loss": outputs.loss, "logits": outputs.logits}
 
     def _forward_with_belief(self, model_inputs, labels, forward_kwargs):
-        image_tokens, frame_embeddings = self._extract_frame_context(model_inputs)
+        image_tokens, _ = self._extract_frame_context(model_inputs)
         text_embeddings, text_padding_mask = self._extract_prompt_text_context(model_inputs, labels=labels)
         predictor_dtype = next(self.belief_predictor.parameters()).dtype
-        adapter_dtype = next(self.belief_adapter.parameters()).dtype
+        projector_dtype = next(self.belief_adapter.parameters()).dtype
+        vision_tokens = image_tokens.to(self.backbone.device, dtype=predictor_dtype)
         if text_embeddings is not None:
             text_embeddings = text_embeddings.to(self.backbone.device, dtype=predictor_dtype)
-        if text_padding_mask is not None:
-            text_padding_mask = text_padding_mask.to(self.backbone.device)
-        belief_outputs = self.belief_predictor(
-            frame_embeddings.to(dtype=predictor_dtype),
-            text_embeddings=text_embeddings,
-            text_padding_mask=text_padding_mask,
+            if text_padding_mask is not None:
+                text_padding_mask = text_padding_mask.to(self.backbone.device)
+        else:
+            text_embeddings = vision_tokens.new_zeros((vision_tokens.shape[0], 1, vision_tokens.shape[-1]))
+            text_padding_mask = torch.zeros(
+                vision_tokens.shape[0],
+                1,
+                dtype=torch.bool,
+                device=self.backbone.device,
+            )
+        vision_padding_mask = torch.zeros(
+            vision_tokens.shape[0],
+            vision_tokens.shape[1],
+            dtype=torch.bool,
+            device=self.backbone.device,
         )
-        belief_tokens = self.belief_adapter(belief_outputs["belief_tokens"].to(dtype=adapter_dtype))
+        key_padding_mask = torch.cat([vision_padding_mask, text_padding_mask], dim=1)
+        belief_tokens, _ = self.belief_predictor(
+            Z_v=vision_tokens,
+            Z_x=text_embeddings,
+            prev_belief=None,
+            key_padding_mask=key_padding_mask,
+        )
+        belief_tokens = self.belief_adapter(belief_tokens.to(dtype=projector_dtype))
         belief_tokens = belief_tokens.to(dtype=image_tokens.dtype)
         inputs_embeds, new_attention_mask, new_labels = self._compose_inputs_with_belief(
             input_ids=model_inputs["input_ids"],
@@ -617,17 +619,7 @@ class MultimodalBeliefModel(nn.Module):
             labels=new_labels,
             **forward_kwargs,
         )
-        aux_metrics = self.belief_loss(belief_outputs)
-        total_loss = outputs.loss + self.belief_aux_weight * aux_metrics["loss"]
-        return {
-            "loss": total_loss,
-            "lm_loss": outputs.loss,
-            "aux_loss": aux_metrics["loss"],
-            "belief_future_loss": aux_metrics["future"],
-            "belief_reconstruction_loss": aux_metrics["reconstruction"],
-            "belief_kl_loss": aux_metrics["kl"],
-            "logits": outputs.logits,
-        }
+        return {"loss": outputs.loss, "logits": outputs.logits}
 
     def forward(self, inputs, labels=None):
         model_inputs = self.backbone._move_inputs_to_device(inputs)
@@ -657,19 +649,36 @@ class MultimodalBeliefModel(nn.Module):
             belief_features = self.future_adapter(future_pred.to(dtype=adapter_dtype)).to(dtype=image_tokens.dtype)
         elif self.belief_predictor is not None:
             predictor_dtype = next(self.belief_predictor.parameters()).dtype
-            adapter_dtype = next(self.belief_adapter.parameters()).dtype
+            projector_dtype = next(self.belief_adapter.parameters()).dtype
             text_embeddings, text_padding_mask = self._extract_prompt_text_context(model_inputs, labels=None)
+            vision_tokens = image_tokens.to(self.backbone.device, dtype=predictor_dtype)
             if text_embeddings is not None:
                 text_embeddings = text_embeddings.to(self.backbone.device, dtype=predictor_dtype)
-            if text_padding_mask is not None:
-                text_padding_mask = text_padding_mask.to(self.backbone.device)
-            belief_outputs = self.belief_predictor(
-                frame_embeddings.to(dtype=predictor_dtype),
-                text_embeddings=text_embeddings,
-                text_padding_mask=text_padding_mask,
+                if text_padding_mask is not None:
+                    text_padding_mask = text_padding_mask.to(self.backbone.device)
+            else:
+                text_embeddings = vision_tokens.new_zeros((vision_tokens.shape[0], 1, vision_tokens.shape[-1]))
+                text_padding_mask = torch.zeros(
+                    vision_tokens.shape[0],
+                    1,
+                    dtype=torch.bool,
+                    device=self.backbone.device,
+                )
+            vision_padding_mask = torch.zeros(
+                vision_tokens.shape[0],
+                vision_tokens.shape[1],
+                dtype=torch.bool,
+                device=self.backbone.device,
+            )
+            key_padding_mask = torch.cat([vision_padding_mask, text_padding_mask], dim=1)
+            belief_tokens, _ = self.belief_predictor(
+                Z_v=vision_tokens,
+                Z_x=text_embeddings,
+                prev_belief=None,
+                key_padding_mask=key_padding_mask,
             )
             belief_features = self.belief_adapter(
-                belief_outputs["belief_tokens"].to(dtype=adapter_dtype)
+                belief_tokens.to(dtype=projector_dtype)
             ).to(dtype=image_tokens.dtype)
         inputs_embeds, new_attention_mask, _ = self._compose_inputs_with_belief(
             input_ids=model_inputs["input_ids"],
