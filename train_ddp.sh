@@ -17,7 +17,7 @@ BELIEF_RECON_WEIGHT="${BELIEF_RECON_WEIGHT:-0.5}"
 BELIEF_KL_WEIGHT="${BELIEF_KL_WEIGHT:-0.001}"
 
 CMD=(
-  accelerate launch --num_processes 4 train.py
+  accelerate launch --num_processes 8 train.py
   --dataset_type hd_epic_local
   --video_root "$VIDEO_ROOT"
   --metadata_root "$METADATA_ROOT"
