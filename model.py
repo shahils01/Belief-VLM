@@ -213,6 +213,16 @@ class FutureTokenAdapter(nn.Module):
         return x + gate * delta
 
 
+class PromptConditionAdapter(nn.Module):
+    def __init__(self, input_dim: int, target_dim: int):
+        super().__init__()
+        self.norm = nn.LayerNorm(input_dim)
+        self.proj = nn.Linear(input_dim, target_dim)
+
+    def forward(self, x):
+        return self.proj(self.norm(x))
+
+
 class MultimodalBeliefModel(nn.Module):
     def __init__(self, cfg: ModelConfig, device: torch.device):
         super().__init__()
@@ -224,8 +234,10 @@ class MultimodalBeliefModel(nn.Module):
             self._backbone_forward_params = set()
         self.future_predictor = None
         self.future_adapter = None
+        self.future_text_adapter = None
         self.belief_network = None
         self.belief_adapter = None
+        self.belief_text_adapter = None
         self._train_future_predictor = bool(cfg.train_future_predictor)
         self._future_aux_weight = float(cfg.future_aux_weight)
         self._train_belief_network = bool(cfg.train_belief_network)
@@ -285,6 +297,8 @@ class MultimodalBeliefModel(nn.Module):
                 param.requires_grad = False
         self.future_predictor = predictor
         self.future_adapter = FutureTokenAdapter(predictor_cfg.embed_dim).to(self.backbone.device)
+        lm_embed_dim = int(self.backbone.model.get_input_embeddings().embedding_dim)
+        self.future_text_adapter = PromptConditionAdapter(lm_embed_dim, predictor_cfg.embed_dim).to(self.backbone.device)
         self.future_loss_fn = FuturePredictionLoss()
         self._future_context_frames = int(self._future_context_frames or predictor_cfg.max_context_frames)
         self._future_frames = int(self._future_frames or predictor_cfg.max_future_frames)
@@ -353,6 +367,8 @@ class MultimodalBeliefModel(nn.Module):
                 param.requires_grad = False
         self.belief_network = belief_net
         self.belief_adapter = FutureTokenAdapter(visual_dim).to(self.backbone.device)
+        lm_embed_dim = int(self.backbone.model.get_input_embeddings().embedding_dim)
+        self.belief_text_adapter = PromptConditionAdapter(lm_embed_dim, visual_dim).to(self.backbone.device)
 
     def _init_belief_conditioning(self, checkpoint_path: str):
         ckpt = torch.load(checkpoint_path, map_location="cpu")
@@ -452,6 +468,20 @@ class MultimodalBeliefModel(nn.Module):
         inputs_embeds = inputs_embeds.masked_scatter(special_image_mask, combined_features)
         return inputs_embeds, new_attention_mask, new_labels
 
+    def _pool_prompt_condition(self, input_ids, attention_mask, labels, adapter):
+        token_embed = self.backbone.model.get_input_embeddings()
+        prompt_embeds = token_embed(input_ids)
+        mask = attention_mask.bool()
+        if labels is not None:
+            mask = mask & labels.eq(-100)
+        if self._image_token_id >= 0:
+            mask = mask & input_ids.ne(self._image_token_id)
+        mask = mask & input_ids.ne(self.backbone.tokenizer.pad_token_id or -1)
+        mask_f = mask.unsqueeze(-1).to(prompt_embeds.dtype)
+        denom = mask_f.sum(dim=1).clamp_min(1.0)
+        pooled = (prompt_embeds * mask_f).sum(dim=1) / denom
+        return adapter(pooled)
+
     def _forward_with_future(self, model_inputs, labels, forward_kwargs):
         pixel_key = None
         for candidate in ("pixel_values", "pixel_values_videos", "video_values", "video", "videos"):
@@ -474,7 +504,14 @@ class MultimodalBeliefModel(nn.Module):
         context_frame_embeddings = image_features.mean(dim=1).view(batch_size, frames_per_sample, -1)
         predictor_dtype = next(self.future_predictor.parameters()).dtype
         adapter_dtype = next(self.future_adapter.parameters()).dtype
+        prompt_condition = self._pool_prompt_condition(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+            adapter=self.future_text_adapter,
+        ).to(dtype=predictor_dtype)
         context_frame_embeddings = context_frame_embeddings.to(dtype=predictor_dtype)
+        context_frame_embeddings = context_frame_embeddings + prompt_condition.unsqueeze(1)
         future_pred = self.future_predictor(context_frame_embeddings, future_frames=self._future_frames)
         future_tokens = self.future_adapter(future_pred.to(dtype=adapter_dtype))
         future_tokens = future_tokens.to(dtype=image_features.dtype)
@@ -533,7 +570,14 @@ class MultimodalBeliefModel(nn.Module):
         context_frame_embeddings = image_features.mean(dim=1).view(batch_size, frames_per_sample, -1)
         belief_dtype = next(self.belief_network.parameters()).dtype
         adapter_dtype = next(self.belief_adapter.parameters()).dtype
+        prompt_condition = self._pool_prompt_condition(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+            adapter=self.belief_text_adapter,
+        ).to(dtype=belief_dtype)
         context_frame_embeddings = context_frame_embeddings.to(dtype=belief_dtype)
+        context_frame_embeddings = context_frame_embeddings + prompt_condition.unsqueeze(1)
         state_seq = torch.zeros(
             batch_size,
             frames_per_sample,
