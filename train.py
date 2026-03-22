@@ -203,12 +203,7 @@ def build_model(args, device):
         belief_num_heads=args.belief_num_heads,
         belief_num_tokens=args.belief_num_tokens,
         belief_dropout=args.belief_dropout,
-        belief_target_frames=args.belief_target_frames,
         belief_max_text_tokens=args.vl_max_text_len,
-        belief_aux_weight=args.belief_aux_weight,
-        belief_future_weight=args.belief_future_weight,
-        belief_reconstruction_weight=args.belief_reconstruction_weight,
-        belief_kl_weight=args.belief_kl_weight,
     )
     return MultimodalBeliefModel(cfg, device=device)
 

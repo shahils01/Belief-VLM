@@ -12,7 +12,7 @@ USE_BELIEF_MODEL="${USE_BELIEF_MODEL:-1}"
 BELIEF_NUM_TOKENS="${BELIEF_NUM_TOKENS:-4}"
 
 CMD=(
-  accelerate launch --num_processes 8 train.py
+  accelerate launch --num_processes 4 train.py
   --dataset_type hd_epic_local
   --video_root "$VIDEO_ROOT"
   --metadata_root "$METADATA_ROOT"
