@@ -344,10 +344,8 @@ def main():
             raise RuntimeError("--use_future_predictor requires --future_frames > 0.")
     if args.use_future_predictor and args.use_belief_model:
         raise RuntimeError("Use either --use_future_predictor or --use_belief_model, not both.")
-    if args.use_belief_model and args.video_frames < 2:
-        raise RuntimeError("--use_belief_model requires --video_frames >= 2.")
-    if args.use_belief_model and args.belief_target_frames >= args.video_frames:
-        raise RuntimeError("--belief_target_frames must be smaller than --video_frames.")
+    if args.use_belief_model and args.video_frames < 1:
+        raise RuntimeError("--use_belief_model requires --video_frames >= 1.")
 
     if args.detect_anomaly:
         torch.autograd.set_detect_anomaly(True)
