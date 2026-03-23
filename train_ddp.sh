@@ -8,8 +8,8 @@ VIDEO_ID_COLUMN="${VIDEO_ID_COLUMN:-video_id}"
 PARTICIPANT_COLUMN="${PARTICIPANT_COLUMN:-participant_id}"
 DEBUG_GENERATE="${DEBUG_GENERATE:-0}"
 DEBUG_GENERATE_EVERY="${DEBUG_GENERATE_EVERY:-0}"
-USE_BELIEF_MODEL="${USE_BELIEF_MODEL:-0}"
-BELIEF_NUM_TOKENS="${BELIEF_NUM_TOKENS:-0}"
+USE_BELIEF_MODEL="${USE_BELIEF_MODEL:-1}"
+BELIEF_NUM_TOKENS="${BELIEF_NUM_TOKENS:-4}"
 
 CMD=(
   accelerate launch --num_processes 6 train.py
@@ -23,7 +23,7 @@ CMD=(
   --video_id_column "$VIDEO_ID_COLUMN"
   --participant_column "$PARTICIPANT_COLUMN"
   --val_ratio 0.01
-  --batch_size 2
+  --batch_size 4
   --num_workers 4
   --video_frames 20
   --grad_accum_steps 16
@@ -33,7 +33,7 @@ CMD=(
   --log_every 1
   --vl_model_preset "$VL_MODEL_PRESET"
   --gradient_checkpointing
-  --save_dir checkpoints_belief_hd_epic_ddp_07
+  --save_dir checkpoints_belief_hd_epic_ddp_ca_belief
   --resume_checkpoint /scratch/shahils/Belief-VLM/checkpoints_belief_hd_epic_ddp_07/ckpt_epoch_99.pt
   --load_model_only
   --wandb
@@ -51,5 +51,3 @@ if [[ "$USE_BELIEF_MODEL" == "1" ]]; then
 fi
 
 "${CMD[@]}"
-
-  # --peft qlora
