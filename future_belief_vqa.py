@@ -131,6 +131,72 @@ class FutureBeliefVQAConfig:
     num_fusion_layers: int = 2
     dropout: float = 0.1
     future_frames: int = 2
+    num_belief_tokens: int = 4
+
+
+class CrossAttentionBlock(nn.Module):
+    def __init__(self, hidden_dim: int, num_heads: int, dropout: float):
+        super().__init__()
+        self.query_norm = nn.LayerNorm(hidden_dim)
+        self.context_norm = nn.LayerNorm(hidden_dim)
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=hidden_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.mlp_norm = nn.LayerNorm(hidden_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_dim, 4 * hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(4 * hidden_dim, hidden_dim),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, query, context, context_mask=None):
+        key_padding_mask = None
+        if context_mask is not None:
+            key_padding_mask = ~context_mask.bool()
+        norm_query = self.query_norm(query)
+        norm_context = self.context_norm(context)
+        attended, _ = self.cross_attn(
+            norm_query,
+            norm_context,
+            norm_context,
+            key_padding_mask=key_padding_mask,
+            need_weights=False,
+        )
+        query = query + attended
+        query = query + self.mlp(self.mlp_norm(query))
+        return query
+
+
+class SelfAttentionBlock(nn.Module):
+    def __init__(self, hidden_dim: int, num_heads: int, dropout: float):
+        super().__init__()
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.attn = nn.MultiheadAttention(
+            embed_dim=hidden_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.mlp_norm = nn.LayerNorm(hidden_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_dim, 4 * hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(4 * hidden_dim, hidden_dim),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x):
+        norm_x = self.norm(x)
+        attended, _ = self.attn(norm_x, norm_x, norm_x, need_weights=False)
+        x = x + attended
+        x = x + self.mlp(self.mlp_norm(x))
+        return x
 
 
 class FutureBeliefVQAModel(nn.Module):
@@ -141,25 +207,26 @@ class FutureBeliefVQAModel(nn.Module):
         self.question_proj = nn.Linear(cfg.text_dim, cfg.hidden_dim)
         self.option_proj = nn.Linear(cfg.text_dim, cfg.hidden_dim)
         self.future_pos_embed = nn.Parameter(torch.zeros(1, cfg.future_frames, cfg.hidden_dim))
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=cfg.hidden_dim,
-            nhead=cfg.num_attention_heads,
-            dim_feedforward=4 * cfg.hidden_dim,
-            dropout=cfg.dropout,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,
+        self.belief_tokens = nn.Parameter(torch.zeros(1, cfg.num_belief_tokens, cfg.hidden_dim))
+        self.text_to_belief = nn.ModuleList(
+            [CrossAttentionBlock(cfg.hidden_dim, cfg.num_attention_heads, cfg.dropout) for _ in range(cfg.num_fusion_layers)]
         )
-        self.fusion = nn.TransformerEncoder(encoder_layer, num_layers=cfg.num_fusion_layers)
+        self.vision_to_belief = nn.ModuleList(
+            [CrossAttentionBlock(cfg.hidden_dim, cfg.num_attention_heads, cfg.dropout) for _ in range(cfg.num_fusion_layers)]
+        )
+        self.belief_self_attn = nn.ModuleList(
+            [SelfAttentionBlock(cfg.hidden_dim, cfg.num_attention_heads, cfg.dropout) for _ in range(cfg.num_fusion_layers)]
+        )
+        self.option_to_belief = CrossAttentionBlock(cfg.hidden_dim, cfg.num_attention_heads, cfg.dropout)
         self.norm = nn.LayerNorm(cfg.hidden_dim)
         self.classifier = nn.Sequential(
-            nn.Linear(2 * cfg.hidden_dim, cfg.hidden_dim),
+            nn.Linear(cfg.hidden_dim, cfg.hidden_dim),
             nn.GELU(),
             nn.Dropout(cfg.dropout),
             nn.Linear(cfg.hidden_dim, 1),
         )
 
-    def _pool_contextual_text_embeddings(self, backbone_model, texts: Sequence[str], device: torch.device):
+    def _encode_contextual_text(self, backbone_model, texts: Sequence[str], device: torch.device):
         tokenizer = backbone_model.backbone.tokenizer
         encoded = tokenizer(
             list(texts),
@@ -181,37 +248,62 @@ class FutureBeliefVQAModel(nn.Module):
         if not hidden_states:
             raise RuntimeError("Backbone LM did not return hidden_states for contextual text encoding.")
         embeddings = hidden_states[-1]
-        mask = attention_mask.unsqueeze(-1).to(embeddings.dtype)
-        denom = mask.sum(dim=1).clamp_min(1.0)
-        return (embeddings * mask).sum(dim=1) / denom
+        return embeddings, attention_mask.bool()
+
+    def _pool_masked_tokens(self, embeddings, mask):
+        mask_f = mask.unsqueeze(-1).to(embeddings.dtype)
+        denom = mask_f.sum(dim=1).clamp_min(1.0)
+        return (embeddings * mask_f).sum(dim=1) / denom
 
     def encode_batch(self, backbone_model, batch, device: torch.device):
         with torch.no_grad():
             future_visual = backbone_model.backbone.extract_clip_embeddings(batch["future_frames"], normalize=False)
         future_visual = future_visual.to(device)
-        question_embeddings = self._pool_contextual_text_embeddings(backbone_model, batch["questions"], device)
+        question_tokens, question_mask = self._encode_contextual_text(backbone_model, batch["questions"], device)
 
         flat_options = [option for options in batch["options"] for option in options]
-        option_embeddings = self._pool_contextual_text_embeddings(backbone_model, flat_options, device)
+        option_tokens, option_mask = self._encode_contextual_text(backbone_model, flat_options, device)
         num_options = len(batch["options"][0])
-        option_embeddings = option_embeddings.view(len(batch["options"]), num_options, -1)
-        return future_visual, question_embeddings, option_embeddings
+        option_tokens = option_tokens.view(len(batch["options"]), num_options, option_tokens.shape[1], option_tokens.shape[2])
+        option_mask = option_mask.view(len(batch["options"]), num_options, option_mask.shape[1])
+        return future_visual, question_tokens, question_mask, option_tokens, option_mask
 
     def forward(self, backbone_model, batch, device: torch.device):
-        future_visual, question_embeddings, option_embeddings = self.encode_batch(backbone_model, batch, device)
+        future_visual, question_tokens, question_mask, option_tokens, option_mask = self.encode_batch(
+            backbone_model,
+            batch,
+            device,
+        )
         future_hidden = self.visual_proj(future_visual)
         if future_hidden.shape[1] > self.future_pos_embed.shape[1]:
             raise RuntimeError(
                 f"Configured future_frames={self.future_pos_embed.shape[1]} but got {future_hidden.shape[1]} frames."
             )
         future_hidden = future_hidden + self.future_pos_embed[:, : future_hidden.shape[1]]
-        question_token = self.question_proj(question_embeddings).unsqueeze(1)
-        fused = self.fusion(torch.cat([question_token, future_hidden], dim=1))
-        context = self.norm(fused[:, 0])
+        question_hidden = self.question_proj(question_tokens)
 
-        option_hidden = self.option_proj(option_embeddings)
-        context = context.unsqueeze(1).expand_as(option_hidden)
-        logits = self.classifier(torch.cat([context, option_hidden], dim=-1)).squeeze(-1)
+        belief = self.belief_tokens.expand(future_hidden.shape[0], -1, -1)
+        for text_block, vision_block, self_block in zip(
+            self.text_to_belief,
+            self.vision_to_belief,
+            self.belief_self_attn,
+        ):
+            belief = text_block(belief, question_hidden, question_mask)
+            belief = vision_block(belief, future_hidden)
+            belief = self_block(belief)
+        belief = self.norm(belief)
+
+        batch_size, num_options, option_seq_len, _ = option_tokens.shape
+        option_hidden = self.option_proj(option_tokens.view(batch_size * num_options, option_seq_len, -1))
+        option_mask = option_mask.view(batch_size * num_options, option_seq_len)
+        repeated_belief = belief.unsqueeze(1).expand(-1, num_options, -1, -1).reshape(
+            batch_size * num_options,
+            belief.shape[1],
+            belief.shape[2],
+        )
+        option_conditioned = self.option_to_belief(option_hidden, repeated_belief)
+        option_summary = self._pool_masked_tokens(option_conditioned, option_mask)
+        logits = self.classifier(option_summary).view(batch_size, num_options)
 
         labels = batch.get("labels")
         outputs = {"logits": logits}
