@@ -158,8 +158,15 @@ class InternVLBackbone(nn.Module):
         return frame_embeddings
 
     def _extract_last_image_features(self, pixel_values):
+        image_features = self._extract_image_features_for_layer(pixel_values, vision_feature_layer=None)
+        return image_features
+
+    def _extract_image_features_for_layer(self, pixel_values, vision_feature_layer=None):
         model_ref = self._get_core_model()
-        image_features = model_ref.get_image_features(pixel_values=pixel_values)
+        kwargs = {"pixel_values": pixel_values}
+        if vision_feature_layer is not None:
+            kwargs["vision_feature_layer"] = vision_feature_layer
+        image_features = model_ref.get_image_features(**kwargs)
         if not torch.is_tensor(image_features):
             if hasattr(image_features, "image_hidden_states") and image_features.image_hidden_states is not None:
                 image_features = image_features.image_hidden_states
@@ -173,37 +180,26 @@ class InternVLBackbone(nn.Module):
                 )
         return image_features
 
-    def _pool_vision_hidden_state(self, hidden_state):
-        if hidden_state.dim() == 4:
-            return hidden_state.mean(dim=(1, 2))
-        if hidden_state.dim() == 3:
-            return hidden_state.mean(dim=1)
-        if hidden_state.dim() == 2:
-            return hidden_state
-        raise RuntimeError(f"Unexpected hidden-state shape: {tuple(hidden_state.shape)}")
-
     @torch.no_grad()
     def extract_frame_layer_embeddings(self, frames, num_layers: int = 6, normalize: bool = True):
         if num_layers <= 0:
             raise RuntimeError(f"num_layers must be positive, got {num_layers}.")
         pixel_values = self.build_pixel_values(frames)
-        model_ref = self._get_core_model()
-        image_features = model_ref.get_image_features(
-            pixel_values=pixel_values,
-            output_hidden_states=True,
-            vision_feature_select_strategy="full",
-        )
-        hidden_states = getattr(image_features, "hidden_states", None)
-        if hidden_states is None:
-            raise RuntimeError("Vision backbone did not return hidden_states for multi-layer supervision.")
-        layer_states = list(hidden_states)
-        if len(layer_states) > 1:
-            layer_states = layer_states[1:]
-        if len(layer_states) < num_layers:
-            raise RuntimeError(
-                f"Requested {num_layers} vision layers, but backbone returned only {len(layer_states)} layers."
+        pooled_layers = []
+        for layer_idx in range(-num_layers, 0):
+            image_features = self._extract_image_features_for_layer(
+                pixel_values,
+                vision_feature_layer=layer_idx,
             )
-        pooled_layers = [self._pool_vision_hidden_state(hidden_state) for hidden_state in layer_states[-num_layers:]]
+            if image_features.dim() == 3:
+                pooled = image_features.mean(dim=1)
+            elif image_features.dim() == 2:
+                pooled = image_features
+            else:
+                raise RuntimeError(
+                    f"Unexpected per-layer image feature shape for layer {layer_idx}: {tuple(image_features.shape)}"
+                )
+            pooled_layers.append(pooled)
         frame_embeddings = torch.stack(pooled_layers, dim=1)
         if normalize:
             frame_embeddings = F.normalize(frame_embeddings.float(), dim=-1)
