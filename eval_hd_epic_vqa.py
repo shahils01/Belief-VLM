@@ -19,6 +19,8 @@ from data_loading import (
 from train import _apply_peft, _configure_memory_optimizations, _resolve_vl_model_preset, build_model
 
 
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate HD-EPIC VQA multiple-choice accuracy.")
     parser.add_argument("--checkpoint", type=str, default="")
