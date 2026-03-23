@@ -8,11 +8,11 @@ VIDEO_ID_COLUMN="${VIDEO_ID_COLUMN:-video_id}"
 PARTICIPANT_COLUMN="${PARTICIPANT_COLUMN:-participant_id}"
 DEBUG_GENERATE="${DEBUG_GENERATE:-0}"
 DEBUG_GENERATE_EVERY="${DEBUG_GENERATE_EVERY:-0}"
-USE_BELIEF_MODEL="${USE_BELIEF_MODEL:-1}"
-BELIEF_NUM_TOKENS="${BELIEF_NUM_TOKENS:-4}"
+USE_BELIEF_MODEL="${USE_BELIEF_MODEL:-0}"
+BELIEF_NUM_TOKENS="${BELIEF_NUM_TOKENS:-0}"
 
 CMD=(
-  accelerate launch --num_processes 4 train.py
+  accelerate launch --num_processes 6 train.py
   --dataset_type hd_epic_local
   --video_root "$VIDEO_ROOT"
   --metadata_root "$METADATA_ROOT"
@@ -29,11 +29,13 @@ CMD=(
   --grad_accum_steps 16
   --mixed_precision bf16
   --allow_tf32
-  --epochs 100
+  --epochs 200
   --log_every 1
   --vl_model_preset "$VL_MODEL_PRESET"
   --gradient_checkpointing
-  --save_dir checkpoints_belief_hd_epic_ddp_ca_belief
+  --save_dir checkpoints_belief_hd_epic_ddp_07
+  --resume_checkpoint /scratch/shahils/Belief-VLM/checkpoints_belief_hd_epic_ddp_07/ckpt_epoch_99.pt
+  --load_model_only
   --wandb
 )
 
