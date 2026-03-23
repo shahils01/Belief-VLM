@@ -107,7 +107,7 @@ def run_epoch(visual_backbone, predictor, loss_fn, loader, optimizer, accelerato
     total_loss = 0.0
     total_mse = 0.0
     total_cosine = 0.0
-    total_examples = 0
+    total_examples = 0.0
 
     for step, batch in enumerate(loader, start=1):
         context_embeddings, future_embeddings = encode_batch(
@@ -118,7 +118,12 @@ def run_epoch(visual_backbone, predictor, loss_fn, loader, optimizer, accelerato
         )
         with accelerator.accumulate(predictor):
             with torch.set_grad_enabled(train):
-                pred_future = predictor(context_embeddings, future_frames=future_embeddings.shape[1])
+                pred_future = predictor(
+                    context_embeddings,
+                    future_frames=future_embeddings.shape[1],
+                    return_layer_outputs=True,
+                    num_output_layers=args.vision_loss_layers,
+                )
                 metrics = loss_fn(pred_future, future_embeddings)
                 loss = metrics["loss"]
                 if train:
@@ -129,14 +134,23 @@ def run_epoch(visual_backbone, predictor, loss_fn, loader, optimizer, accelerato
                     optimizer.zero_grad(set_to_none=True)
 
         batch_size = context_embeddings.size(0)
-        total_examples += batch_size
-        total_loss += loss.detach().item() * batch_size
-        total_mse += metrics["mse"].detach().item() * batch_size
-        total_cosine += metrics["cosine"].detach().item() * batch_size
+        batch_stats = torch.stack(
+            [
+                loss.detach() * batch_size,
+                metrics["mse"].detach() * batch_size,
+                metrics["cosine"].detach() * batch_size,
+                torch.tensor(batch_size, device=accelerator.device, dtype=loss.dtype),
+            ]
+        )
+        batch_stats = accelerator.gather_for_metrics(batch_stats.unsqueeze(0)).sum(dim=0)
+        total_loss += float(batch_stats[0].item())
+        total_mse += float(batch_stats[1].item())
+        total_cosine += float(batch_stats[2].item())
+        total_examples += float(batch_stats[3].item())
 
-        if args.log_every > 0 and step % args.log_every == 0:
+        if accelerator.is_main_process and args.log_every > 0 and step % args.log_every == 0:
             phase = "train" if train else "val"
-            print(
+            accelerator.print(
                 f"{phase} step={step} "
                 f"loss={total_loss / max(total_examples, 1):.4f} "
                 f"mse={total_mse / max(total_examples, 1):.4f} "
@@ -154,6 +168,10 @@ def run_epoch(visual_backbone, predictor, loss_fn, loader, optimizer, accelerato
 def main():
     args = parse_args()
     _resolve_vl_model_preset(args)
+    if args.predictor_layers < args.vision_loss_layers:
+        raise RuntimeError(
+            f"--predictor_layers ({args.predictor_layers}) must be >= --vision_loss_layers ({args.vision_loss_layers})."
+        )
     os.makedirs(args.save_dir, exist_ok=True)
 
     accelerator = Accelerator(mixed_precision=args.mixed_precision)
@@ -195,14 +213,14 @@ def main():
 
     for epoch in range(start_epoch, args.epochs):
         train_metrics = run_epoch(visual_backbone, predictor, loss_fn, train_loader, optimizer, accelerator, args, True)
-        print(
+        accelerator.print(
             f"epoch={epoch} train_loss={train_metrics['loss']:.4f} "
             f"train_mse={train_metrics['mse']:.4f} train_cosine={train_metrics['cosine']:.4f}"
         )
 
         with torch.no_grad():
             val_metrics = run_epoch(visual_backbone, predictor, loss_fn, val_loader, optimizer, accelerator, args, False)
-        print(
+        accelerator.print(
             f"epoch={epoch} val_loss={val_metrics['loss']:.4f} "
             f"val_mse={val_metrics['mse']:.4f} val_cosine={val_metrics['cosine']:.4f}"
         )
@@ -219,7 +237,7 @@ def main():
                 },
                 ckpt_path,
             )
-            print(f"saved {ckpt_path}")
+            accelerator.print(f"saved {ckpt_path}")
 
 
 if __name__ == "__main__":
