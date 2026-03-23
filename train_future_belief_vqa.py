@@ -96,8 +96,8 @@ def build_visual_backbone(args, device):
 def run_epoch(visual_backbone, belief_model, loader, optimizer, accelerator, args, train):
     belief_model.train() if train else belief_model.eval()
     total_loss = 0.0
-    total_correct = 0
-    total_examples = 0
+    total_correct = 0.0
+    total_examples = 0.0
 
     for step, batch in enumerate(loader, start=1):
         with accelerator.accumulate(belief_model):
@@ -119,14 +119,24 @@ def run_epoch(visual_backbone, belief_model, loader, optimizer, accelerator, arg
 
         preds = logits.argmax(dim=-1)
         batch_size = labels.shape[0]
-        total_examples += batch_size
-        total_loss += float(loss.detach().item()) * batch_size
-        total_correct += int((preds == labels).sum().item())
+        batch_stats = torch.tensor(
+            [
+                loss.detach() * batch_size,
+                (preds == labels).sum().detach(),
+                torch.tensor(batch_size, device=accelerator.device, dtype=loss.dtype),
+            ],
+            device=accelerator.device,
+            dtype=loss.dtype,
+        )
+        batch_stats = accelerator.gather_for_metrics(batch_stats.unsqueeze(0)).sum(dim=0)
+        total_loss += float(batch_stats[0].item())
+        total_correct += float(batch_stats[1].item())
+        total_examples += float(batch_stats[2].item())
 
-        if args.log_every > 0 and step % args.log_every == 0:
+        if accelerator.is_main_process and args.log_every > 0 and step % args.log_every == 0:
             phase = "train" if train else "val"
             denom = max(total_examples, 1)
-            print(
+            accelerator.print(
                 f"{phase} step={step} "
                 f"loss={total_loss / denom:.4f} "
                 f"acc={total_correct / denom:.4f}"
@@ -187,14 +197,14 @@ def main():
 
     for epoch in range(start_epoch, args.epochs):
         train_metrics = run_epoch(visual_backbone, belief_model, train_loader, optimizer, accelerator, args, True)
-        print(
+        accelerator.print(
             f"epoch={epoch} train_loss={train_metrics['loss']:.4f} "
             f"train_acc={train_metrics['accuracy']:.4f}"
         )
 
         with torch.no_grad():
             val_metrics = run_epoch(visual_backbone, belief_model, val_loader, optimizer, accelerator, args, False)
-        print(
+        accelerator.print(
             f"epoch={epoch} val_loss={val_metrics['loss']:.4f} "
             f"val_acc={val_metrics['accuracy']:.4f}"
         )
@@ -210,14 +220,14 @@ def main():
             }
             ckpt_path = os.path.join(args.save_dir, f"ckpt_epoch_{epoch}.pt")
             torch.save(state, ckpt_path)
-            print(f"saved {ckpt_path}")
+            accelerator.print(f"saved {ckpt_path}")
 
             if val_metrics["accuracy"] > best_val:
                 best_val = val_metrics["accuracy"]
                 state["best_val_accuracy"] = best_val
                 best_path = os.path.join(args.save_dir, "ckpt_best.pt")
                 torch.save(state, best_path)
-                print(f"saved {best_path}")
+                accelerator.print(f"saved {best_path}")
 
 
 if __name__ == "__main__":
