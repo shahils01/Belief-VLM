@@ -258,7 +258,9 @@ class MultimodalBeliefModel(nn.Module):
         token_embed = self.backbone.model.get_input_embeddings()
         self._lm_embed_dim = int(getattr(token_embed, "embedding_dim", 0) or 0)
         self._vision_feature_dim = int(self._infer_vision_feature_dim() or 0)
-        if self._vision_feature_dim > 0:
+        if self._vision_feature_dim > 0 and (
+            cfg.use_belief_model or cfg.future_predictor_bundle is not None or bool(cfg.future_predictor_checkpoint)
+        ):
             self._ensure_feature_adapters(self._vision_feature_dim)
         if cfg.future_predictor_bundle is not None:
             self._init_future_conditioning_from_bundle(cfg.future_predictor_bundle)
