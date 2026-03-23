@@ -62,6 +62,7 @@ def parse_args():
     parser.add_argument("--predictor_layers", type=int, default=2)
     parser.add_argument("--predictor_heads", type=int, default=8)
     parser.add_argument("--predictor_dropout", type=float, default=0.1)
+    parser.add_argument("--vision_loss_layers", type=int, default=6)
     parser.add_argument("--mse_weight", type=float, default=1.0)
     parser.add_argument("--cosine_weight", type=float, default=1.0)
     return parser.parse_args()
@@ -91,10 +92,13 @@ def build_visual_backbone(args, device):
     return model
 
 
-def encode_batch(backbone_model, batch, device):
+def encode_batch(backbone_model, batch, device, vision_loss_layers: int):
     with torch.no_grad():
         context_embeddings = backbone_model.backbone.extract_clip_embeddings(batch["context_frames"]).to(device)
-        future_embeddings = backbone_model.backbone.extract_clip_embeddings(batch["future_frames"]).to(device)
+        future_embeddings = backbone_model.backbone.extract_clip_layer_embeddings(
+            batch["future_frames"],
+            num_layers=vision_loss_layers,
+        ).to(device)
     return context_embeddings, future_embeddings
 
 
@@ -106,7 +110,12 @@ def run_epoch(visual_backbone, predictor, loss_fn, loader, optimizer, accelerato
     total_examples = 0
 
     for step, batch in enumerate(loader, start=1):
-        context_embeddings, future_embeddings = encode_batch(visual_backbone, batch, accelerator.device)
+        context_embeddings, future_embeddings = encode_batch(
+            visual_backbone,
+            batch,
+            accelerator.device,
+            args.vision_loss_layers,
+        )
         with accelerator.accumulate(predictor):
             with torch.set_grad_enabled(train):
                 pred_future = predictor(context_embeddings, future_frames=future_embeddings.shape[1])
@@ -149,10 +158,14 @@ def main():
 
     accelerator = Accelerator(mixed_precision=args.mixed_precision)
     visual_backbone = build_visual_backbone(args, accelerator.device)
-
     probe_frames = build_future_prediction_loader(args, "train", batch_size=1, num_workers=0, is_train=True)
     probe_batch = next(iter(probe_frames))
-    probe_embeddings = encode_batch(visual_backbone, probe_batch, accelerator.device)[0]
+    probe_embeddings = encode_batch(
+        visual_backbone,
+        probe_batch,
+        accelerator.device,
+        args.vision_loss_layers,
+    )[0]
     embed_dim = int(probe_embeddings.shape[-1])
     args.predictor_embed_dim = embed_dim
     predictor_cfg = FuturePredictorConfig(

@@ -76,8 +76,17 @@ class FuturePredictionLoss(nn.Module):
         self.cosine_weight = cosine_weight
 
     def forward(self, pred, target):
-        mse = F.mse_loss(pred, target)
-        cosine = 1.0 - F.cosine_similarity(pred, target, dim=-1).mean()
+        if target.dim() == pred.dim():
+            mse = F.mse_loss(pred, target)
+            cosine = 1.0 - F.cosine_similarity(pred, target, dim=-1).mean()
+        elif target.dim() == pred.dim() + 1:
+            expanded_pred = pred.unsqueeze(2).expand_as(target)
+            mse = (expanded_pred.float() - target.float()).pow(2).mean(dim=(0, 1, 3)).sum()
+            cosine = (1.0 - F.cosine_similarity(expanded_pred, target, dim=-1)).mean(dim=(0, 1)).sum()
+        else:
+            raise RuntimeError(
+                f"Unsupported prediction/target rank combination: pred={pred.dim()} target={target.dim()}"
+            )
         loss = self.mse_weight * mse + self.cosine_weight * cosine
         return {
             "loss": loss,

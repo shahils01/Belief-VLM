@@ -2,11 +2,11 @@ VL_MODEL_PRESET="${VL_MODEL_PRESET:-internvl3_5_2b}"
 ANNOTATION_PATH="${ANNOTATION_PATH:-/scratch/shahils/hd_epic_dataset/hd-epic-annotations/vqa-benchmark/fine_grained_why_recognition.json}"
 VIDEO_ROOT="${VIDEO_ROOT:-/scratch/shahils/hd_epic_dataset/videos/HD-EPIC/Videos}"
 FUTURE_OFFSET_SEC="${FUTURE_OFFSET_SEC:-0.0}"
-FUTURE_DURATION_SEC="${FUTURE_DURATION_SEC:-0.0}"
-VIDEO_FRAMES="${VIDEO_FRAMES:-20}"
-FUTURE_FRAMES="${FUTURE_FRAMES:-2}"
+FUTURE_DURATION_SEC="${FUTURE_DURATION_SEC:-2.0}"
+VIDEO_FRAMES="${VIDEO_FRAMES:-8}"
+FUTURE_FRAMES="${FUTURE_FRAMES:-1}"
 
-accelerate launch --num_processes 1 train_future_predictor.py \
+accelerate launch --num_processes 8 train_future_predictor.py \
   --annotation_path "$ANNOTATION_PATH" \
   --video_root "$VIDEO_ROOT" \
   --video_frames "$VIDEO_FRAMES" \
