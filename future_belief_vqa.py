@@ -159,9 +159,8 @@ class FutureBeliefVQAModel(nn.Module):
             nn.Linear(cfg.hidden_dim, 1),
         )
 
-    def _pool_text_embeddings(self, backbone_model, texts: Sequence[str], device: torch.device):
+    def _pool_contextual_text_embeddings(self, backbone_model, texts: Sequence[str], device: torch.device):
         tokenizer = backbone_model.backbone.tokenizer
-        token_embed = backbone_model.backbone.model.get_input_embeddings()
         encoded = tokenizer(
             list(texts),
             padding=True,
@@ -170,7 +169,18 @@ class FutureBeliefVQAModel(nn.Module):
         )
         input_ids = encoded["input_ids"].to(device)
         attention_mask = encoded["attention_mask"].to(device)
-        embeddings = token_embed(input_ids)
+        with torch.no_grad():
+            outputs = backbone_model.backbone.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=True,
+                return_dict=True,
+                use_cache=False,
+            )
+        hidden_states = getattr(outputs, "hidden_states", None)
+        if not hidden_states:
+            raise RuntimeError("Backbone LM did not return hidden_states for contextual text encoding.")
+        embeddings = hidden_states[-1]
         mask = attention_mask.unsqueeze(-1).to(embeddings.dtype)
         denom = mask.sum(dim=1).clamp_min(1.0)
         return (embeddings * mask).sum(dim=1) / denom
@@ -179,10 +189,10 @@ class FutureBeliefVQAModel(nn.Module):
         with torch.no_grad():
             future_visual = backbone_model.backbone.extract_clip_embeddings(batch["future_frames"], normalize=False)
         future_visual = future_visual.to(device)
-        question_embeddings = self._pool_text_embeddings(backbone_model, batch["questions"], device)
+        question_embeddings = self._pool_contextual_text_embeddings(backbone_model, batch["questions"], device)
 
         flat_options = [option for options in batch["options"] for option in options]
-        option_embeddings = self._pool_text_embeddings(backbone_model, flat_options, device)
+        option_embeddings = self._pool_contextual_text_embeddings(backbone_model, flat_options, device)
         num_options = len(batch["options"][0])
         option_embeddings = option_embeddings.view(len(batch["options"]), num_options, -1)
         return future_visual, question_embeddings, option_embeddings
