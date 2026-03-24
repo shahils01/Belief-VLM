@@ -1,4 +1,4 @@
-CHECKPOINT="${CHECKPOINT:-/scratch/shahils/Belief-VLM/checkpoints_future_full_finetune/ckpt_epoch_21.pt}"
+CHECKPOINT="${CHECKPOINT:-/scratch/shahils/Belief-VLM/checkpoints_future_full_finetune_scratch_temp/ckpt_epoch_28.pt}"
 ANNOTATION_PATH="${ANNOTATION_PATH:-/scratch/shahils/hd_epic_dataset/hd-epic-annotations/vqa-benchmark/fine_grained_why_recognition.json}"
 VIDEO_ROOT="${VIDEO_ROOT:-/scratch/shahils/hd_epic_dataset/videos/HD-EPIC/Videos}"
 MAX_SAMPLES="${MAX_SAMPLES:-0}"
@@ -9,7 +9,7 @@ VL_MODEL_PRESET="${VL_MODEL_PRESET:-internvl3_5_2b}"
 PREDICTIVE_MODULE="${PREDICTIVE_MODULE:-future}"
 USE_FUTURE_PREDICTOR="${USE_FUTURE_PREDICTOR:-1}"
 FUTURE_PREDICTOR_CHECKPOINT="${FUTURE_PREDICTOR_CHECKPOINT:-}"
-FUTURE_FRAMES="${FUTURE_FRAMES:-2}"
+FUTURE_FRAMES="${FUTURE_FRAMES:-1}"
 USE_BELIEF_NETWORK="${USE_BELIEF_NETWORK:-0}"
 BELIEF_NETWORK_CHECKPOINT="${BELIEF_NETWORK_CHECKPOINT:-}"
 
@@ -21,7 +21,7 @@ CMD=(
   --print_samples "$PRINT_SAMPLES"
   --progress_every "$PROGRESS_EVERY"
   --vl_model_preset "$VL_MODEL_PRESET"
-  --video_frames "10"
+  --video_frames "8"
   --mixed_precision bf16
   --allow_tf32
 )

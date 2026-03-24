@@ -208,7 +208,7 @@ def main():
     if args.resume_checkpoint:
         ckpt = torch.load(args.resume_checkpoint, map_location="cpu")
         _load_checkpoint_state(predictor, ckpt["predictor"], accelerator)
-        optimizer.load_state_dict(ckpt["optimizer"])
+        # optimizer.load_state_dict(ckpt["optimizer"])
         start_epoch = int(ckpt.get("epoch", -1)) + 1
 
     for epoch in range(start_epoch, args.epochs):

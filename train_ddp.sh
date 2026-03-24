@@ -10,8 +10,8 @@ DEBUG_GENERATE="${DEBUG_GENERATE:-0}"
 DEBUG_GENERATE_EVERY="${DEBUG_GENERATE_EVERY:-0}"
 PREDICTIVE_MODULE="${PREDICTIVE_MODULE:-future}"
 USE_FUTURE_PREDICTOR="${USE_FUTURE_PREDICTOR:-1}"
-FUTURE_PREDICTOR_CHECKPOINT="${FUTURE_PREDICTOR_CHECKPOINT:-/scratch/shahils/Belief-VLM/checkpoints_future_predictor/ckpt_epoch_19.pt}"
-FUTURE_FRAMES="${FUTURE_FRAMES:-2}"
+FUTURE_PREDICTOR_CHECKPOINT="${FUTURE_PREDICTOR_CHECKPOINT:-/scratch/shahils/Belief-VLM/checkpoints_future_predictor/ckpt_epoch_197.pt}"
+FUTURE_FRAMES="${FUTURE_FRAMES:-1}"
 FINETUNE_FUTURE_PREDICTOR="${FINETUNE_FUTURE_PREDICTOR:-1}"
 FUTURE_AUX_WEIGHT="${FUTURE_AUX_WEIGHT:-0.1}"
 FUTURE_OFFSET_SEC="${FUTURE_OFFSET_SEC:-0.0}"
@@ -22,7 +22,7 @@ FINETUNE_BELIEF_NETWORK="${FINETUNE_BELIEF_NETWORK:-0}"
 BELIEF_AUX_WEIGHT="${BELIEF_AUX_WEIGHT:-0.1}"
 
 CMD=(
-  accelerate launch --num_processes 1 train.py
+  accelerate launch --num_processes 6 train.py
   --dataset_type hd_epic_local
   --video_root "$VIDEO_ROOT"
   --metadata_root "$METADATA_ROOT"
@@ -35,7 +35,7 @@ CMD=(
   --val_ratio 0.01
   --batch_size 2
   --num_workers 4
-  --video_frames 10
+  --video_frames 8
   --grad_accum_steps 16
   --mixed_precision bf16
   --allow_tf32

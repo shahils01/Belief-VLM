@@ -256,8 +256,10 @@ class PromptConditionAdapter(nn.Module):
         super().__init__()
         self.norm = nn.LayerNorm(input_dim)
         self.proj = nn.Linear(input_dim, target_dim)
+        # self.to(torch.bfloat16)
 
     def forward(self, x):
+        x = x.float()
         return self.proj(self.norm(x))
 
 
