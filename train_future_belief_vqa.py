@@ -102,9 +102,11 @@ def run_epoch(model, loader, optimizer, accelerator, args, train):
     total_loss = 0.0
     total_correct = 0.0
     total_examples = 0.0
+    base_model = accelerator.unwrap_model(model)
+    processor = base_model.backbone.processor
 
     for step, batch in enumerate(loader, start=1):
-        collated, labels, num_options = build_future_vqa_option_batch(model.backbone.processor, batch, args)
+        collated, labels, num_options = build_future_vqa_option_batch(processor, batch, args)
         labels = labels.to(accelerator.device)
         flat_labels = collated["labels"].to(accelerator.device)
 
