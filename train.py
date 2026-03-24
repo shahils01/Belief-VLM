@@ -131,6 +131,7 @@ def parse_args():
     parser.add_argument("--mc_loss_weight", type=float, default=1.0)
     parser.add_argument("--belief_aux_loss_weight", type=float, default=0.25)
     parser.add_argument("--mc_train_num_choices", type=int, default=0)
+    parser.add_argument("--choice_micro_batch_size", type=int, default=0)
     parser.add_argument("--lr_scheduler", type=str, default="cosine", choices=["constant", "cosine"])
     parser.add_argument("--warmup_ratio", type=float, default=0.03)
     parser.add_argument("--save_best_metric", type=str, default="val_mc_acc", choices=["val_mc_acc", "val_loss"])
@@ -314,9 +315,42 @@ def _reshape_choice_scores(flat_scores, choice_group_sizes):
     return grouped
 
 
-def _compute_choice_losses(model, choice_inputs, choice_labels, choice_group_sizes, correct_choice_idx):
-    outputs = model(choice_inputs, labels=choice_labels, return_aux=True)
-    choice_nll = _sequence_nll(outputs["logits"], choice_labels)
+def _slice_choice_inputs(choice_inputs, start, end):
+    sliced = {}
+    for key, value in choice_inputs.items():
+        if torch.is_tensor(value):
+            if value.dim() > 0 and value.shape[0] == choice_inputs["input_ids"].shape[0]:
+                sliced[key] = value[start:end]
+            else:
+                sliced[key] = value
+        elif isinstance(value, list) and len(value) == choice_inputs["input_ids"].shape[0]:
+            sliced[key] = value[start:end]
+        else:
+            sliced[key] = value
+    return sliced
+
+
+def _compute_choice_losses(model, choice_inputs, choice_labels, choice_group_sizes, correct_choice_idx, choice_micro_batch_size=0):
+    total_choices = int(choice_labels.shape[0])
+    micro_batch = int(choice_micro_batch_size or 0)
+    if micro_batch <= 0:
+        micro_batch = total_choices
+
+    choice_nll_parts = []
+    belief_summary_parts = []
+    choice_text_summary_parts = []
+    for start in range(0, total_choices, micro_batch):
+        end = min(total_choices, start + micro_batch)
+        choice_inputs_chunk = _slice_choice_inputs(choice_inputs, start, end)
+        choice_labels_chunk = choice_labels[start:end]
+        outputs = model(choice_inputs_chunk, labels=choice_labels_chunk, return_aux=True)
+        choice_nll_parts.append(_sequence_nll(outputs["logits"], choice_labels_chunk))
+        if outputs.get("belief_summary") is not None:
+            belief_summary_parts.append(outputs["belief_summary"])
+        if outputs.get("choice_text_summary") is not None:
+            choice_text_summary_parts.append(outputs["choice_text_summary"])
+
+    choice_nll = torch.cat(choice_nll_parts, dim=0)
     choice_scores = _reshape_choice_scores(-choice_nll, choice_group_sizes)
     mc_loss = F.cross_entropy(choice_scores, correct_choice_idx)
     mc_acc = (choice_scores.argmax(dim=1) == correct_choice_idx).float().mean()
@@ -325,8 +359,8 @@ def _compute_choice_losses(model, choice_inputs, choice_labels, choice_group_siz
         "mc_acc": mc_acc,
         "choice_scores": choice_scores,
     }
-    belief_summary = outputs.get("belief_summary")
-    choice_text_summary = outputs.get("choice_text_summary")
+    belief_summary = torch.cat(belief_summary_parts, dim=0) if belief_summary_parts else None
+    choice_text_summary = torch.cat(choice_text_summary_parts, dim=0) if choice_text_summary_parts else None
     if belief_summary is not None and choice_text_summary is not None:
         belief_summary = F.normalize(belief_summary.float(), dim=-1)
         choice_text_summary = F.normalize(choice_text_summary.float(), dim=-1)
@@ -353,6 +387,13 @@ def _estimate_train_steps(loader, args):
         batch_size = max(1, int(args.batch_size))
         approx_batches = max(1, (approx_records + batch_size - 1) // batch_size)
         return max(1, approx_batches * max(1, args.epochs))
+
+
+def _reduce_epoch_totals(accelerator, totals):
+    keys = list(totals.keys())
+    values = torch.tensor([float(totals[key]) for key in keys], device=accelerator.device, dtype=torch.float64)
+    reduced = accelerator.reduce(values, reduction="sum")
+    return {key: float(reduced[idx].item()) for idx, key in enumerate(keys)}
 
 
 
@@ -420,6 +461,7 @@ def run_epoch(model, loader, optimizer, scheduler, accelerator, args, train, glo
                         choice_labels=choice_labels,
                         choice_group_sizes=choice_group_sizes,
                         correct_choice_idx=correct_choice_idx,
+                        choice_micro_batch_size=args.choice_micro_batch_size,
                     )
                     metrics.update({k: v.detach() if torch.is_tensor(v) else v for k, v in choice_metrics.items() if k != "choice_scores"})
                     loss = loss + args.mc_loss_weight * choice_metrics["mc_loss"]
@@ -447,39 +489,62 @@ def run_epoch(model, loader, optimizer, scheduler, accelerator, args, train, glo
             total_mc_acc += float(metrics["mc_acc"].item()) * batch_size
 
         if args.log_every > 0 and step % args.log_every == 0:
-            avg_loss = total_loss / max(total_examples, 1)
+            reduced_totals = _reduce_epoch_totals(
+                accelerator,
+                {
+                    "loss": total_loss,
+                    "examples": total_examples,
+                    "lm_loss": total_lm_loss,
+                    "mc_loss": total_mc_loss,
+                    "belief_aux_loss": total_belief_aux_loss,
+                    "mc_acc": total_mc_acc,
+                },
+            )
+            global_examples = max(reduced_totals["examples"], 1.0)
+            avg_loss = reduced_totals["loss"] / global_examples
             phase = "train" if train else "val"
             message = f"{phase} step={step} loss={avg_loss:.4f}"
-            if total_lm_loss > 0:
-                message += f" lm_loss={total_lm_loss / max(total_examples, 1):.4f}"
-            if total_mc_loss > 0:
-                message += f" mc_loss={total_mc_loss / max(total_examples, 1):.4f}"
-                message += f" mc_acc={total_mc_acc / max(total_examples, 1):.4f}"
-            if total_belief_aux_loss > 0:
-                message += f" belief_aux_loss={total_belief_aux_loss / max(total_examples, 1):.4f}"
+            if reduced_totals["lm_loss"] > 0:
+                message += f" lm_loss={reduced_totals['lm_loss'] / global_examples:.4f}"
+            if reduced_totals["mc_loss"] > 0:
+                message += f" mc_loss={reduced_totals['mc_loss'] / global_examples:.4f}"
+                message += f" mc_acc={reduced_totals['mc_acc'] / global_examples:.4f}"
+            if reduced_totals["belief_aux_loss"] > 0:
+                message += f" belief_aux_loss={reduced_totals['belief_aux_loss'] / global_examples:.4f}"
             accelerator.print(message)
             if args.wandb:
                 wandb_metrics = {f"{phase}/loss": avg_loss}
-                if total_lm_loss > 0:
-                    wandb_metrics[f"{phase}/lm_loss"] = total_lm_loss / max(total_examples, 1)
-                if total_mc_loss > 0:
-                    wandb_metrics[f"{phase}/mc_loss"] = total_mc_loss / max(total_examples, 1)
-                    wandb_metrics[f"{phase}/mc_acc"] = total_mc_acc / max(total_examples, 1)
-                if total_belief_aux_loss > 0:
-                    wandb_metrics[f"{phase}/belief_aux_loss"] = total_belief_aux_loss / max(total_examples, 1)
+                if reduced_totals["lm_loss"] > 0:
+                    wandb_metrics[f"{phase}/lm_loss"] = reduced_totals["lm_loss"] / global_examples
+                if reduced_totals["mc_loss"] > 0:
+                    wandb_metrics[f"{phase}/mc_loss"] = reduced_totals["mc_loss"] / global_examples
+                    wandb_metrics[f"{phase}/mc_acc"] = reduced_totals["mc_acc"] / global_examples
+                if reduced_totals["belief_aux_loss"] > 0:
+                    wandb_metrics[f"{phase}/belief_aux_loss"] = reduced_totals["belief_aux_loss"] / global_examples
                 if train:
                     wandb_metrics["train/lr"] = optimizer.param_groups[0]["lr"]
                     accelerator.log(wandb_metrics, step=global_step + step)
                 else:
                     accelerator.log(wandb_metrics, step=global_step)
 
-    denom = max(total_examples, 1)
+    reduced_totals = _reduce_epoch_totals(
+        accelerator,
+        {
+            "loss": total_loss,
+            "examples": total_examples,
+            "lm_loss": total_lm_loss,
+            "mc_loss": total_mc_loss,
+            "belief_aux_loss": total_belief_aux_loss,
+            "mc_acc": total_mc_acc,
+        },
+    )
+    denom = max(reduced_totals["examples"], 1.0)
     return {
-        "loss": total_loss / denom,
-        "lm_loss": total_lm_loss / denom if total_lm_loss > 0 else 0.0,
-        "mc_loss": total_mc_loss / denom if total_mc_loss > 0 else 0.0,
-        "belief_aux_loss": total_belief_aux_loss / denom if total_belief_aux_loss > 0 else 0.0,
-        "mc_acc": total_mc_acc / denom if total_mc_acc > 0 else 0.0,
+        "loss": reduced_totals["loss"] / denom,
+        "lm_loss": reduced_totals["lm_loss"] / denom if reduced_totals["lm_loss"] > 0 else 0.0,
+        "mc_loss": reduced_totals["mc_loss"] / denom if reduced_totals["mc_loss"] > 0 else 0.0,
+        "belief_aux_loss": reduced_totals["belief_aux_loss"] / denom if reduced_totals["belief_aux_loss"] > 0 else 0.0,
+        "mc_acc": reduced_totals["mc_acc"] / denom if reduced_totals["mc_acc"] > 0 else 0.0,
         "global_step": (global_step + step if train else global_step),
     }
 

@@ -1,6 +1,6 @@
 VL_MODEL_PRESET="${VL_MODEL_PRESET:-internvl3_5_2b}"
 VIDEO_ROOT="${VIDEO_ROOT:-/scratch/shahils/hd_epic_dataset/videos/HD-EPIC/Videos}"
-ANNOTATION_PATH="${ANNOTATION_PATH:-/scratch/shahils/hd_epic_dataset/hd-epic-annotations/vqa-benchmark/fine_grained_why_recognition.json}"
+ANNOTATION_PATH="${ANNOTATION_PATH:-/scratch/shahils/hd_epic_dataset/hd-epic-annotations/vqa-benchmark/}"
 METADATA_ROOT="${METADATA_ROOT:-/scratch/shahils/hd_epic_dataset/HD-EPIC Intermediate Data}"
 QUESTION_COLUMN="${QUESTION_COLUMN:-question}"
 ANSWER_COLUMN="${ANSWER_COLUMN:-answer}"
@@ -22,22 +22,23 @@ CMD=(
   --answer_column "$ANSWER_COLUMN"
   --video_id_column "$VIDEO_ID_COLUMN"
   --participant_column "$PARTICIPANT_COLUMN"
-  --val_ratio 0.05
-  --batch_size 4
+  --val_ratio 0.1
+  --batch_size 2
   --num_workers 4
-  --video_frames 20
+  --video_frames 8
   --grad_accum_steps 16
   --mixed_precision bf16
   --allow_tf32
   --epochs 200
   --log_every 1
-  --train_objective hybrid
+  --train_objective mc
   --belief_fusion_scope vision_text
   --belief_use_recurrence
-  --belief_temporal_chunks 4
+  --belief_temporal_chunks 2
   --mc_loss_weight 1.0
   --lm_loss_weight 1.0
   --belief_aux_loss_weight 0.25
+  --choice_micro_batch_size 2
   --lr_scheduler cosine
   --warmup_ratio 0.03
   --save_best_metric val_mc_acc
