@@ -35,6 +35,10 @@ class ModelConfig:
     belief_future_weight: float = 1.0
     belief_reconstruction_weight: float = 0.5
     belief_kl_weight: float = 1e-3
+    belief_fusion_scope: str = "vision_text"
+    belief_use_recurrence: bool = True
+    belief_temporal_chunks: int = 4
+    disable_late_belief_prefix: bool = False
 
 
 class InternVLBackbone(nn.Module):
@@ -251,6 +255,12 @@ class MultimodalBeliefModel(nn.Module):
         self.future_adapter = None
         self.belief_predictor = None
         self.belief_adapter = None
+        self.belief_to_vision_attn = None
+        self.belief_to_text_attn = None
+        self.vision_fusion_gate = None
+        self.text_fusion_gate = None
+        self.belief_summary_head = None
+        self.choice_text_head = None
         self.image_token_adapter = None
         self._future_frames = int(cfg.future_frames or 0)
         self._future_context_frames = int(cfg.future_context_frames or 0)
@@ -341,6 +351,22 @@ class MultimodalBeliefModel(nn.Module):
             use_text_conditioning=True,
         ).to(self.backbone.device)
         self.belief_adapter = BeliefProjector(self._lm_embed_dim, self._lm_embed_dim).to(self.backbone.device)
+        self.belief_to_vision_attn = nn.MultiheadAttention(
+            embed_dim=self._lm_embed_dim,
+            num_heads=int(self.cfg.belief_num_heads),
+            dropout=float(self.cfg.belief_dropout),
+            batch_first=True,
+        ).to(self.backbone.device)
+        self.belief_to_text_attn = nn.MultiheadAttention(
+            embed_dim=self._lm_embed_dim,
+            num_heads=int(self.cfg.belief_num_heads),
+            dropout=float(self.cfg.belief_dropout),
+            batch_first=True,
+        ).to(self.backbone.device)
+        self.vision_fusion_gate = nn.Parameter(torch.tensor(0.0, device=self.backbone.device))
+        self.text_fusion_gate = nn.Parameter(torch.tensor(0.0, device=self.backbone.device))
+        self.belief_summary_head = nn.Linear(self._lm_embed_dim, self._lm_embed_dim).to(self.backbone.device)
+        self.choice_text_head = nn.Linear(self._lm_embed_dim, self._lm_embed_dim).to(self.backbone.device)
 
     def _build_future_predictor_from_state(self, predictor_state, saved_args):
         embed_dim = int(saved_args["predictor_embed_dim"]) if "predictor_embed_dim" in saved_args else int(saved_args.get("embed_dim", 0))
@@ -411,8 +437,18 @@ class MultimodalBeliefModel(nn.Module):
             },
         }
 
-    def _compose_inputs_with_belief(self, input_ids, attention_mask, labels, image_features, belief_features=None):
-        batch_size, _, hidden_dim = image_features.shape
+    def _compose_conditioned_inputs(
+        self,
+        input_ids,
+        attention_mask,
+        labels,
+        image_features,
+        prompt_override_embeddings=None,
+        prompt_positions=None,
+        belief_features=None,
+        insert_belief_prefix=False,
+    ):
+        batch_size = image_features.shape[0]
         token_embed = self.backbone.model.get_input_embeddings()
         row_embeds = []
         row_attention_masks = []
@@ -425,6 +461,7 @@ class MultimodalBeliefModel(nn.Module):
             row_ids = row_ids[:valid_len]
             row_labels = labels[row][:valid_len] if labels is not None else None
             row_embeds_cur = token_embed(row_ids)
+
             image_mask = row_ids.eq(self._image_token_id)
             image_token_count = int(image_mask.sum().item())
             row_image_features = image_features[row]
@@ -439,31 +476,38 @@ class MultimodalBeliefModel(nn.Module):
                     row_image_features.to(row_embeds_cur.device, row_embeds_cur.dtype),
                 )
 
-            if row_labels is not None:
-                non_mask = torch.nonzero(row_labels.ne(-100), as_tuple=False)
-                insert_at = int(non_mask[0].item()) if non_mask.numel() > 0 else valid_len
-            else:
-                insert_at = valid_len
+            if prompt_override_embeddings is not None and prompt_positions is not None:
+                positions = prompt_positions[row]
+                positions = positions[positions.ge(0)]
+                if positions.numel() > 0:
+                    row_prompt = prompt_override_embeddings[row][: positions.numel()].to(
+                        row_embeds_cur.device, row_embeds_cur.dtype
+                    )
+                    row_embeds_cur[positions] = row_prompt
 
-            if belief_features is not None:
+            belief_count = 0
+            if insert_belief_prefix and belief_features is not None:
+                if row_labels is not None:
+                    non_mask = torch.nonzero(row_labels.ne(-100), as_tuple=False)
+                    insert_at = int(non_mask[0].item()) if non_mask.numel() > 0 else valid_len
+                else:
+                    insert_at = valid_len
                 belief_row = belief_features[row].to(row_embeds_cur.device, row_embeds_cur.dtype)
                 row_embeds_cur = torch.cat(
                     [row_embeds_cur[:insert_at], belief_row, row_embeds_cur[insert_at:]],
                     dim=0,
                 )
                 belief_count = int(belief_row.shape[0])
-            else:
-                belief_count = 0
+
             row_embeds.append(row_embeds_cur)
             row_attention_masks.append(
                 torch.ones(row_embeds_cur.shape[0], dtype=attention_mask.dtype, device=attention_mask.device)
             )
-
             if row_labels is not None:
-                added_labels = torch.full((belief_count,), -100, dtype=row_labels.dtype, device=row_labels.device)
-                row_labels_out.append(
-                    torch.cat([row_labels[:insert_at], added_labels, row_labels[insert_at:]], dim=0)
-                )
+                if belief_count > 0:
+                    added_labels = torch.full((belief_count,), -100, dtype=row_labels.dtype, device=row_labels.device)
+                    row_labels = torch.cat([row_labels[:insert_at], added_labels, row_labels[insert_at:]], dim=0)
+                row_labels_out.append(row_labels)
 
         max_len = max(int(row.shape[0]) for row in row_embeds)
         padded_embeds = []
@@ -507,7 +551,7 @@ class MultimodalBeliefModel(nn.Module):
             adapter_dtype = self.image_token_adapter.weight.dtype
             image_features = self.image_token_adapter(image_features.to(dtype=adapter_dtype))
         image_tokens = image_features.view(batch_size, -1, image_features.shape[-1])
-        return image_tokens, frame_embeddings
+        return image_tokens, frame_embeddings, frames_per_sample
 
     def _extract_prompt_text_context(self, model_inputs, labels=None):
         input_ids = model_inputs["input_ids"]
@@ -515,6 +559,7 @@ class MultimodalBeliefModel(nn.Module):
         token_embed = self.backbone.model.get_input_embeddings()
         text_rows = []
         max_text_tokens = 0
+        position_rows = []
 
         for row in range(input_ids.shape[0]):
             row_ids = input_ids[row]
@@ -526,6 +571,55 @@ class MultimodalBeliefModel(nn.Module):
                 prompt_mask = row_labels.eq(-100)
             text_mask = prompt_mask & row_ids.ne(self._image_token_id)
             selected_ids = row_ids[text_mask]
+            if selected_ids.numel() == 0:
+                row_text = token_embed.weight.new_zeros((0, token_embed.embedding_dim))
+            else:
+                row_text = token_embed(selected_ids)
+            text_rows.append(row_text)
+            max_text_tokens = max(max_text_tokens, int(row_text.shape[0]))
+            position_rows.append(torch.nonzero(text_mask, as_tuple=False).squeeze(-1))
+
+        if max_text_tokens == 0:
+            return None, None, None
+
+        padded_rows = []
+        padding_masks = []
+        padded_positions = []
+        for row_text in text_rows:
+            pad_len = max_text_tokens - int(row_text.shape[0])
+            if pad_len > 0:
+                row_text = F.pad(row_text, (0, 0, 0, pad_len), value=0.0)
+            padded_rows.append(row_text)
+            padding_mask = torch.zeros(max_text_tokens, dtype=torch.bool, device=row_text.device)
+            if pad_len > 0:
+                padding_mask[-pad_len:] = True
+            padding_masks.append(padding_mask)
+        for positions in position_rows:
+            pad_len = max_text_tokens - int(positions.shape[0])
+            if pad_len > 0:
+                positions = F.pad(positions, (0, pad_len), value=-1)
+            padded_positions.append(positions)
+
+        return (
+            torch.stack(padded_rows, dim=0),
+            torch.stack(padding_masks, dim=0),
+            torch.stack(padded_positions, dim=0),
+        )
+
+    def _extract_answer_text_context(self, model_inputs, labels):
+        input_ids = model_inputs["input_ids"]
+        attention_mask = model_inputs["attention_mask"]
+        token_embed = self.backbone.model.get_input_embeddings()
+        text_rows = []
+        max_text_tokens = 0
+
+        for row in range(input_ids.shape[0]):
+            row_ids = input_ids[row]
+            valid_len = int(attention_mask[row].sum().item())
+            row_ids = row_ids[:valid_len]
+            row_labels = labels[row][:valid_len]
+            answer_mask = row_labels.ne(-100) & row_ids.ne(self._image_token_id)
+            selected_ids = row_ids[answer_mask]
             if selected_ids.numel() == 0:
                 row_text = token_embed.weight.new_zeros((0, token_embed.embedding_dim))
             else:
@@ -547,23 +641,86 @@ class MultimodalBeliefModel(nn.Module):
             if pad_len > 0:
                 padding_mask[-pad_len:] = True
             padding_masks.append(padding_mask)
-
         return torch.stack(padded_rows, dim=0), torch.stack(padding_masks, dim=0)
 
+    def _build_belief_state(self, image_tokens, text_embeddings, text_padding_mask, frames_per_sample):
+        predictor_dtype = next(self.belief_predictor.parameters()).dtype
+        projector_dtype = next(self.belief_adapter.parameters()).dtype
+        vision_tokens = image_tokens.to(self.backbone.device, dtype=predictor_dtype)
+        if text_embeddings is not None:
+            text_embeddings = text_embeddings.to(self.backbone.device, dtype=predictor_dtype)
+            text_padding_mask = text_padding_mask.to(self.backbone.device) if text_padding_mask is not None else None
+        else:
+            text_embeddings = vision_tokens.new_zeros((vision_tokens.shape[0], 1, vision_tokens.shape[-1]))
+            text_padding_mask = torch.zeros(vision_tokens.shape[0], 1, dtype=torch.bool, device=self.backbone.device)
+
+        tokens_per_frame = max(1, int(vision_tokens.shape[1] // max(frames_per_sample, 1)))
+        vision_per_frame = vision_tokens.view(vision_tokens.shape[0], frames_per_sample, tokens_per_frame, -1)
+        chunk_count = max(1, int(self.cfg.belief_temporal_chunks))
+        chunk_size = max(1, (frames_per_sample + chunk_count - 1) // chunk_count)
+        prev_belief = None
+        belief_outputs = []
+        for start in range(0, frames_per_sample, chunk_size):
+            end = min(frames_per_sample, start + chunk_size)
+            chunk_tokens = vision_per_frame[:, start:end].reshape(vision_tokens.shape[0], -1, vision_tokens.shape[-1])
+            vision_padding_mask = torch.zeros(
+                chunk_tokens.shape[0],
+                chunk_tokens.shape[1],
+                dtype=torch.bool,
+                device=self.backbone.device,
+            )
+            key_padding_mask = torch.cat([vision_padding_mask, text_padding_mask], dim=1)
+            prev_belief, _ = self.belief_predictor(
+                Z_v=chunk_tokens,
+                Z_x=text_embeddings,
+                prev_belief=prev_belief if self.cfg.belief_use_recurrence else None,
+                key_padding_mask=key_padding_mask,
+            )
+            belief_outputs.append(prev_belief)
+        belief_tokens = belief_outputs[-1]
+        belief_tokens = self.belief_adapter(belief_tokens.to(dtype=projector_dtype)).to(dtype=image_tokens.dtype)
+        belief_summary = belief_tokens.mean(dim=1)
+        return belief_tokens, belief_summary
+
+    def _apply_belief_fusion(self, image_tokens, prompt_text_embeddings, prompt_padding_mask, belief_tokens):
+        fused_image_tokens = image_tokens
+        fused_prompt_embeddings = prompt_text_embeddings
+        scope = self.cfg.belief_fusion_scope
+        if scope in {"vision_only", "vision_text"}:
+            delta_v, _ = self.belief_to_vision_attn(
+                query=image_tokens,
+                key=belief_tokens,
+                value=belief_tokens,
+            )
+            fused_image_tokens = image_tokens + torch.tanh(self.vision_fusion_gate) * delta_v
+        if scope == "vision_text" and prompt_text_embeddings is not None:
+            text_query = prompt_text_embeddings
+            delta_t, _ = self.belief_to_text_attn(
+                query=text_query,
+                key=belief_tokens,
+                value=belief_tokens,
+                key_padding_mask=None,
+            )
+            if prompt_padding_mask is not None:
+                delta_t = delta_t.masked_fill(prompt_padding_mask.unsqueeze(-1), 0.0)
+            fused_prompt_embeddings = text_query + torch.tanh(self.text_fusion_gate) * delta_t
+        return fused_image_tokens, fused_prompt_embeddings
+
     def _forward_with_future(self, model_inputs, labels, forward_kwargs):
-        image_tokens, context_frame_embeddings = self._extract_frame_context(model_inputs)
+        image_tokens, context_frame_embeddings, _ = self._extract_frame_context(model_inputs)
         predictor_dtype = next(self.future_predictor.parameters()).dtype
         adapter_dtype = next(self.future_adapter.parameters()).dtype
         context_frame_embeddings = context_frame_embeddings.to(dtype=predictor_dtype)
         future_pred = self.future_predictor(context_frame_embeddings, future_frames=self._future_frames)
         future_tokens = self.future_adapter(future_pred.to(dtype=adapter_dtype))
         future_tokens = future_tokens.to(dtype=image_tokens.dtype)
-        inputs_embeds, new_attention_mask, new_labels = self._compose_inputs_with_belief(
+        inputs_embeds, new_attention_mask, new_labels = self._compose_conditioned_inputs(
             input_ids=model_inputs["input_ids"],
             attention_mask=model_inputs["attention_mask"],
             labels=labels,
             image_features=image_tokens,
             belief_features=future_tokens,
+            insert_belief_prefix=True,
         )
         outputs = self.backbone.model(
             input_ids=None,
@@ -574,45 +731,36 @@ class MultimodalBeliefModel(nn.Module):
         )
         return {"loss": outputs.loss, "logits": outputs.logits}
 
-    def _forward_with_belief(self, model_inputs, labels, forward_kwargs):
-        image_tokens, _ = self._extract_frame_context(model_inputs)
-        text_embeddings, text_padding_mask = self._extract_prompt_text_context(model_inputs, labels=labels)
-        predictor_dtype = next(self.belief_predictor.parameters()).dtype
-        projector_dtype = next(self.belief_adapter.parameters()).dtype
-        vision_tokens = image_tokens.to(self.backbone.device, dtype=predictor_dtype)
-        if text_embeddings is not None:
-            text_embeddings = text_embeddings.to(self.backbone.device, dtype=predictor_dtype)
-            if text_padding_mask is not None:
-                text_padding_mask = text_padding_mask.to(self.backbone.device)
-        else:
-            text_embeddings = vision_tokens.new_zeros((vision_tokens.shape[0], 1, vision_tokens.shape[-1]))
-            text_padding_mask = torch.zeros(
-                vision_tokens.shape[0],
-                1,
-                dtype=torch.bool,
-                device=self.backbone.device,
+    def _forward_with_belief(self, model_inputs, labels, forward_kwargs, return_aux=False):
+        image_tokens, _, frames_per_sample = self._extract_frame_context(model_inputs)
+        text_embeddings, text_padding_mask, prompt_positions = self._extract_prompt_text_context(model_inputs, labels=labels)
+        belief_tokens, belief_summary = self._build_belief_state(
+            image_tokens=image_tokens,
+            text_embeddings=text_embeddings,
+            text_padding_mask=text_padding_mask,
+            frames_per_sample=frames_per_sample,
+        )
+        fused_image_tokens = image_tokens
+        fused_prompt_embeddings = text_embeddings
+        insert_belief_prefix = self.cfg.belief_fusion_scope == "late_prefix" and not self.cfg.disable_late_belief_prefix
+        if self.cfg.belief_fusion_scope in {"vision_only", "vision_text"}:
+            fused_image_tokens, fused_prompt_embeddings = self._apply_belief_fusion(
+                image_tokens=image_tokens,
+                prompt_text_embeddings=text_embeddings,
+                prompt_padding_mask=text_padding_mask,
+                belief_tokens=belief_tokens,
             )
-        vision_padding_mask = torch.zeros(
-            vision_tokens.shape[0],
-            vision_tokens.shape[1],
-            dtype=torch.bool,
-            device=self.backbone.device,
-        )
-        key_padding_mask = torch.cat([vision_padding_mask, text_padding_mask], dim=1)
-        belief_tokens, _ = self.belief_predictor(
-            Z_v=vision_tokens,
-            Z_x=text_embeddings,
-            prev_belief=None,
-            key_padding_mask=key_padding_mask,
-        )
-        belief_tokens = self.belief_adapter(belief_tokens.to(dtype=projector_dtype))
-        belief_tokens = belief_tokens.to(dtype=image_tokens.dtype)
-        inputs_embeds, new_attention_mask, new_labels = self._compose_inputs_with_belief(
+            insert_belief_prefix = False
+
+        inputs_embeds, new_attention_mask, new_labels = self._compose_conditioned_inputs(
             input_ids=model_inputs["input_ids"],
             attention_mask=model_inputs["attention_mask"],
             labels=labels,
-            image_features=image_tokens,
+            image_features=fused_image_tokens,
+            prompt_override_embeddings=fused_prompt_embeddings,
+            prompt_positions=prompt_positions,
             belief_features=belief_tokens,
+            insert_belief_prefix=insert_belief_prefix,
         )
         outputs = self.backbone.model(
             input_ids=None,
@@ -621,9 +769,19 @@ class MultimodalBeliefModel(nn.Module):
             labels=new_labels,
             **forward_kwargs,
         )
-        return {"loss": outputs.loss, "logits": outputs.logits}
+        result = {"loss": outputs.loss, "logits": outputs.logits}
+        if return_aux:
+            result["belief_tokens"] = belief_tokens
+            result["belief_summary"] = self.belief_summary_head(belief_summary)
+            if labels is not None:
+                answer_embeddings, answer_padding_mask = self._extract_answer_text_context(model_inputs, labels)
+                if answer_embeddings is not None:
+                    valid_mask = (~answer_padding_mask).unsqueeze(-1)
+                    pooled_answers = (answer_embeddings * valid_mask).sum(dim=1) / valid_mask.sum(dim=1).clamp_min(1.0)
+                    result["choice_text_summary"] = self.choice_text_head(pooled_answers)
+        return result
 
-    def forward(self, inputs, labels=None):
+    def forward(self, inputs, labels=None, return_aux=False):
         model_inputs = self.backbone._move_inputs_to_device(inputs)
         forward_kwargs = {"return_dict": True}
         if hasattr(self.backbone.model, "config") and hasattr(self.backbone.model.config, "use_cache"):
@@ -632,15 +790,18 @@ class MultimodalBeliefModel(nn.Module):
         if self.future_predictor is not None:
             return self._forward_with_future(model_inputs, labels, forward_kwargs)
         if self.belief_predictor is not None:
-            return self._forward_with_belief(model_inputs, labels, forward_kwargs)
+            return self._forward_with_belief(model_inputs, labels, forward_kwargs, return_aux=return_aux)
         if labels is not None:
             model_inputs["labels"] = labels
         outputs = self.backbone.model(**model_inputs, **forward_kwargs)
         return {"loss": outputs.loss, "logits": outputs.logits}
 
     def _build_conditioned_generation_inputs(self, model_inputs):
-        image_tokens, frame_embeddings = self._extract_frame_context(model_inputs)
+        image_tokens, frame_embeddings, frames_per_sample = self._extract_frame_context(model_inputs)
         belief_features = None
+        prompt_embeddings = None
+        prompt_padding_mask = None
+        prompt_positions = None
         if self.future_predictor is not None:
             predictor_dtype = next(self.future_predictor.parameters()).dtype
             adapter_dtype = next(self.future_adapter.parameters()).dtype
@@ -650,44 +811,31 @@ class MultimodalBeliefModel(nn.Module):
             )
             belief_features = self.future_adapter(future_pred.to(dtype=adapter_dtype)).to(dtype=image_tokens.dtype)
         elif self.belief_predictor is not None:
-            predictor_dtype = next(self.belief_predictor.parameters()).dtype
-            projector_dtype = next(self.belief_adapter.parameters()).dtype
-            text_embeddings, text_padding_mask = self._extract_prompt_text_context(model_inputs, labels=None)
-            vision_tokens = image_tokens.to(self.backbone.device, dtype=predictor_dtype)
-            if text_embeddings is not None:
-                text_embeddings = text_embeddings.to(self.backbone.device, dtype=predictor_dtype)
-                if text_padding_mask is not None:
-                    text_padding_mask = text_padding_mask.to(self.backbone.device)
-            else:
-                text_embeddings = vision_tokens.new_zeros((vision_tokens.shape[0], 1, vision_tokens.shape[-1]))
-                text_padding_mask = torch.zeros(
-                    vision_tokens.shape[0],
-                    1,
-                    dtype=torch.bool,
-                    device=self.backbone.device,
+            prompt_embeddings, prompt_padding_mask, prompt_positions = self._extract_prompt_text_context(
+                model_inputs, labels=None
+            )
+            belief_features, _ = self._build_belief_state(
+                image_tokens=image_tokens,
+                text_embeddings=prompt_embeddings,
+                text_padding_mask=prompt_padding_mask,
+                frames_per_sample=frames_per_sample,
+            )
+            if self.cfg.belief_fusion_scope in {"vision_only", "vision_text"}:
+                image_tokens, prompt_embeddings = self._apply_belief_fusion(
+                    image_tokens=image_tokens,
+                    prompt_text_embeddings=prompt_embeddings,
+                    prompt_padding_mask=prompt_padding_mask,
+                    belief_tokens=belief_features,
                 )
-            vision_padding_mask = torch.zeros(
-                vision_tokens.shape[0],
-                vision_tokens.shape[1],
-                dtype=torch.bool,
-                device=self.backbone.device,
-            )
-            key_padding_mask = torch.cat([vision_padding_mask, text_padding_mask], dim=1)
-            belief_tokens, _ = self.belief_predictor(
-                Z_v=vision_tokens,
-                Z_x=text_embeddings,
-                prev_belief=None,
-                key_padding_mask=key_padding_mask,
-            )
-            belief_features = self.belief_adapter(
-                belief_tokens.to(dtype=projector_dtype)
-            ).to(dtype=image_tokens.dtype)
-        inputs_embeds, new_attention_mask, _ = self._compose_inputs_with_belief(
+        inputs_embeds, new_attention_mask, _ = self._compose_conditioned_inputs(
             input_ids=model_inputs["input_ids"],
             attention_mask=model_inputs["attention_mask"],
             labels=None,
             image_features=image_tokens,
+            prompt_override_embeddings=prompt_embeddings,
+            prompt_positions=prompt_positions,
             belief_features=belief_features,
+            insert_belief_prefix=self.cfg.belief_fusion_scope == "late_prefix" and not self.cfg.disable_late_belief_prefix,
         )
         return {"inputs_embeds": inputs_embeds, "attention_mask": new_attention_mask}
 

@@ -13,8 +13,11 @@ from data_loading import (
     _resolve_hd_epic_clip_window,
     _resolve_hd_epic_video_path,
     build_sft_example,
+    build_choice_examples,
     collate_sft_batch,
     decode_mp4_frames,
+    resolve_correct_choice_index,
+    resolve_record_choices,
 )
 from train import _apply_peft, _configure_memory_optimizations, _resolve_vl_model_preset, build_model
 
@@ -51,6 +54,10 @@ def parse_args():
     parser.add_argument("--belief_num_heads", type=int, default=None)
     parser.add_argument("--belief_num_tokens", type=int, default=None)
     parser.add_argument("--belief_dropout", type=float, default=None)
+    parser.add_argument("--belief_fusion_scope", type=str, default=None)
+    parser.add_argument("--belief_use_recurrence", action="store_true")
+    parser.add_argument("--belief_temporal_chunks", type=int, default=None)
+    parser.add_argument("--disable_late_belief_prefix", action="store_true")
     parser.add_argument("--belief_target_frames", type=int, default=None)
     parser.add_argument("--belief_aux_weight", type=float, default=None)
     parser.add_argument("--belief_future_weight", type=float, default=None)
@@ -101,6 +108,8 @@ def _merge_args(cli_args, ckpt_args):
         "belief_num_heads",
         "belief_num_tokens",
         "belief_dropout",
+        "belief_fusion_scope",
+        "belief_temporal_chunks",
         "belief_target_frames",
         "belief_aux_weight",
         "belief_future_weight",
@@ -125,6 +134,10 @@ def _merge_args(cli_args, ckpt_args):
         merged["future_predictor_checkpoint"] = cli_args.future_predictor_checkpoint
     if cli_args.use_belief_model:
         merged["use_belief_model"] = True
+    if cli_args.belief_use_recurrence:
+        merged["belief_use_recurrence"] = True
+    if cli_args.disable_late_belief_prefix:
+        merged["disable_late_belief_prefix"] = True
 
     merged.setdefault("vl_backend", "internvl")
     merged.setdefault("vl_model_preset", "internvl3_5_1b")
@@ -144,6 +157,10 @@ def _merge_args(cli_args, ckpt_args):
     merged.setdefault("belief_num_heads", 8)
     merged.setdefault("belief_num_tokens", 4)
     merged.setdefault("belief_dropout", 0.1)
+    merged.setdefault("belief_fusion_scope", "vision_text")
+    merged.setdefault("belief_use_recurrence", False)
+    merged.setdefault("belief_temporal_chunks", 4)
+    merged.setdefault("disable_late_belief_prefix", False)
     merged.setdefault("belief_target_frames", 2)
     merged.setdefault("belief_aux_weight", 0.2)
     merged.setdefault("belief_future_weight", 1.0)
@@ -230,29 +247,16 @@ def _load_model(checkpoint_path, args, device):
 def _build_eval_prompt(record, args):
     prompt = _get_first(record, [args.question_column, "question", "prompt", "instruction", "query"])
     prompt = _normalize_text(prompt)
-    choices = _get_first(record, [args.options_column, "options", "choices", "answer_options"])
-    if not isinstance(choices, (list, tuple)):
+    choices = resolve_record_choices(record, args.options_column)
+    if not choices:
         raise RuntimeError(
             "HD-EPIC VQA evaluation expects multiple-choice records with a `choices` field."
         )
-    choices = [_normalize_text(choice) for choice in choices]
     prompt_with_options = prompt
     options_text = _normalize_text(choices)
     if options_text:
         prompt_with_options = f"{prompt_with_options}\nOptions:\n{options_text}"
     return prompt_with_options, choices
-
-
-def _resolve_correct_choice_index(record, num_choices):
-    correct_idx = _get_first(record, ["correct_idx", "answer_idx", "label_idx"])
-    if correct_idx in (None, ""):
-        raise RuntimeError("Record is missing `correct_idx` for multiple-choice evaluation.")
-    idx = int(correct_idx)
-    if 0 <= idx < num_choices:
-        return idx
-    if 1 <= idx <= num_choices:
-        return idx - 1
-    raise RuntimeError(f"Choice index {idx} is out of range for {num_choices} choices.")
 
 
 def _sequence_nll(logits, labels):
@@ -317,15 +321,14 @@ def evaluate(args):
         )
 
         choice_examples = []
-        for choice_text in choices:
-            packed = build_sft_example(
-                processor=processor,
-                frames=frames,
-                prompt=prompt,
-                answer=choice_text,
-                vl_backend=merged_args.vl_backend,
-                max_text_len=merged_args.vl_max_text_len,
-            )
+        for packed in build_choice_examples(
+            processor=processor,
+            frames=frames,
+            prompt=prompt,
+            choices=choices,
+            vl_backend=merged_args.vl_backend,
+            max_text_len=merged_args.vl_max_text_len,
+        ):
             choice_examples.append(
                 {
                     "inputs": {k: v for k, v in packed.items() if k not in {"labels", "prompt_text", "answer_text"}},

@@ -4,7 +4,9 @@ import inspect
 import os
 
 import torch
+import torch.nn.functional as F
 from accelerate import Accelerator
+from transformers import get_cosine_schedule_with_warmup
 
 try:
     from accelerate import DataLoaderConfiguration
@@ -107,6 +109,10 @@ def parse_args():
     parser.add_argument("--belief_num_heads", type=int, default=8)
     parser.add_argument("--belief_num_tokens", type=int, default=4)
     parser.add_argument("--belief_dropout", type=float, default=0.1)
+    parser.add_argument("--belief_fusion_scope", type=str, default="vision_text", choices=["vision_only", "vision_text", "late_prefix"])
+    parser.add_argument("--belief_use_recurrence", action="store_true")
+    parser.add_argument("--belief_temporal_chunks", type=int, default=4)
+    parser.add_argument("--disable_late_belief_prefix", action="store_true")
 
     parser.add_argument("--peft", type=str, default="none", choices=["none", "lora", "qlora"])
     parser.add_argument("--lora_r", type=int, default=16)
@@ -120,6 +126,14 @@ def parse_args():
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--log_every", type=int, default=20)
+    parser.add_argument("--train_objective", type=str, default="hybrid", choices=["generative", "mc", "hybrid"])
+    parser.add_argument("--lm_loss_weight", type=float, default=1.0)
+    parser.add_argument("--mc_loss_weight", type=float, default=1.0)
+    parser.add_argument("--belief_aux_loss_weight", type=float, default=0.25)
+    parser.add_argument("--mc_train_num_choices", type=int, default=0)
+    parser.add_argument("--lr_scheduler", type=str, default="cosine", choices=["constant", "cosine"])
+    parser.add_argument("--warmup_ratio", type=float, default=0.03)
+    parser.add_argument("--save_best_metric", type=str, default="val_mc_acc", choices=["val_mc_acc", "val_loss"])
     parser.add_argument("--save_dir", type=str, default="checkpoints_belief_sft")
     parser.add_argument("--resume_checkpoint", type=str, default="")
     parser.add_argument("--load_model_only", action="store_true")
@@ -204,6 +218,10 @@ def build_model(args, device):
         belief_num_tokens=args.belief_num_tokens,
         belief_dropout=args.belief_dropout,
         belief_max_text_tokens=args.vl_max_text_len,
+        belief_fusion_scope=args.belief_fusion_scope,
+        belief_use_recurrence=args.belief_use_recurrence,
+        belief_temporal_chunks=args.belief_temporal_chunks,
+        disable_late_belief_prefix=args.disable_late_belief_prefix,
     )
     return MultimodalBeliefModel(cfg, device=device)
 
@@ -269,63 +287,201 @@ def _restore_bundled_future_predictor_args(args, ckpt):
         args.future_frames = int(bundle_args.get("future_frames", args.future_frames or 0))
 
 
+def _sequence_nll(logits, labels):
+    seq_len = min(int(logits.shape[1]), int(labels.shape[1]))
+    logits = logits[:, :seq_len, :]
+    labels = labels[:, :seq_len]
+    shift_logits = logits[:, :-1, :].float().contiguous()
+    shift_labels = labels[:, 1:].contiguous()
+    token_losses = F.cross_entropy(
+        shift_logits.view(-1, shift_logits.size(-1)),
+        shift_labels.view(-1),
+        reduction="none",
+        ignore_index=-100,
+    ).view(shift_labels.size(0), shift_labels.size(1))
+    mask = shift_labels.ne(-100)
+    denom = mask.sum(dim=1).clamp_min(1)
+    return (token_losses * mask).sum(dim=1) / denom
 
-def run_epoch(model, loader, optimizer, accelerator, args, train, global_step):
+
+def _reshape_choice_scores(flat_scores, choice_group_sizes):
+    max_choices = int(choice_group_sizes.max().item())
+    grouped = flat_scores.new_full((choice_group_sizes.shape[0], max_choices), -1e9)
+    start = 0
+    for row, group_size in enumerate(choice_group_sizes.tolist()):
+        grouped[row, :group_size] = flat_scores[start:start + group_size]
+        start += group_size
+    return grouped
+
+
+def _compute_choice_losses(model, choice_inputs, choice_labels, choice_group_sizes, correct_choice_idx):
+    outputs = model(choice_inputs, labels=choice_labels, return_aux=True)
+    choice_nll = _sequence_nll(outputs["logits"], choice_labels)
+    choice_scores = _reshape_choice_scores(-choice_nll, choice_group_sizes)
+    mc_loss = F.cross_entropy(choice_scores, correct_choice_idx)
+    mc_acc = (choice_scores.argmax(dim=1) == correct_choice_idx).float().mean()
+    result = {
+        "mc_loss": mc_loss,
+        "mc_acc": mc_acc,
+        "choice_scores": choice_scores,
+    }
+    belief_summary = outputs.get("belief_summary")
+    choice_text_summary = outputs.get("choice_text_summary")
+    if belief_summary is not None and choice_text_summary is not None:
+        belief_summary = F.normalize(belief_summary.float(), dim=-1)
+        choice_text_summary = F.normalize(choice_text_summary.float(), dim=-1)
+        flat_aux_scores = (belief_summary * choice_text_summary).sum(dim=-1)
+        aux_scores = _reshape_choice_scores(flat_aux_scores, choice_group_sizes)
+        result["belief_aux_loss"] = F.cross_entropy(aux_scores, correct_choice_idx)
+        result["belief_aux_acc"] = (aux_scores.argmax(dim=1) == correct_choice_idx).float().mean()
+    return result
+
+
+def _estimate_train_steps(loader, args):
+    try:
+        return max(1, len(loader) * max(1, args.epochs))
+    except TypeError:
+        dataset = getattr(loader, "dataset", None)
+        records = getattr(dataset, "records", None)
+        if records is None:
+            return max(1, args.epochs)
+        val_ratio = max(0.0, min(0.5, float(args.val_ratio)))
+        if val_ratio > 0.0:
+            approx_records = int(round(len(records) * (1.0 - val_ratio)))
+        else:
+            approx_records = len(records)
+        batch_size = max(1, int(args.batch_size))
+        approx_batches = max(1, (approx_records + batch_size - 1) // batch_size)
+        return max(1, approx_batches * max(1, args.epochs))
+
+
+
+def run_epoch(model, loader, optimizer, scheduler, accelerator, args, train, global_step):
     model.train() if train else model.eval()
     total_loss = 0.0
     total_examples = 0
     step = 0
+    total_lm_loss = 0.0
+    total_mc_loss = 0.0
+    total_belief_aux_loss = 0.0
+    total_mc_acc = 0.0
 
     for batch in loader:
         step += 1
-        labels = batch["labels"].to(accelerator.device)
-        inputs = {
-            key: value.to(accelerator.device) if torch.is_tensor(value) else value
-            for key, value in batch["inputs"].items()
-        }
-
         with accelerator.accumulate(model):
             with torch.set_grad_enabled(train):
-                outputs = model(inputs, labels=labels)
-                if args.debug_generate and args.debug_generate_every > 0 and step % args.debug_generate_every == 0:
-                    debug_ids = accelerator.unwrap_model(model).generate(
-                        inputs, max_new_tokens=args.eval_max_new_tokens
+                metrics = {}
+                batch_size = 0
+                loss = None
+
+                if args.train_objective == "generative":
+                    labels = batch["labels"].to(accelerator.device)
+                    inputs = {
+                        key: value.to(accelerator.device) if torch.is_tensor(value) else value
+                        for key, value in batch["inputs"].items()
+                    }
+                    outputs = model(inputs, labels=labels)
+                    loss = outputs["loss"]
+                    batch_size = labels.size(0)
+                    metrics["lm_loss"] = loss.detach()
+                    if args.debug_generate and args.debug_generate_every > 0 and step % args.debug_generate_every == 0:
+                        debug_ids = accelerator.unwrap_model(model).generate(inputs, max_new_tokens=args.eval_max_new_tokens)
+                        prompt_len = int(inputs["input_ids"].shape[1])
+                        debug_new_tokens = debug_ids[:, prompt_len:]
+                        debug_text = accelerator.unwrap_model(model).backbone.tokenizer.batch_decode(
+                            debug_new_tokens, skip_special_tokens=True
+                        )
+                        accelerator.print(f"debug_text step={step}: {debug_text}")
+                else:
+                    gold_labels = batch["gold_labels"].to(accelerator.device)
+                    gold_inputs = {
+                        key: value.to(accelerator.device) if torch.is_tensor(value) else value
+                        for key, value in batch["gold_inputs"].items()
+                    }
+                    choice_labels = batch["choice_labels"].to(accelerator.device)
+                    choice_inputs = {
+                        key: value.to(accelerator.device) if torch.is_tensor(value) else value
+                        for key, value in batch["choice_inputs"].items()
+                    }
+                    choice_group_sizes = batch["choice_group_sizes"].to(accelerator.device)
+                    correct_choice_idx = batch["correct_choice_idx"].to(accelerator.device)
+                    batch_size = correct_choice_idx.size(0)
+                    loss = gold_labels.new_zeros((), dtype=torch.float32)
+
+                    if args.train_objective in {"generative", "hybrid"}:
+                        gold_outputs = model(gold_inputs, labels=gold_labels)
+                        lm_loss = gold_outputs["loss"]
+                        metrics["lm_loss"] = lm_loss.detach()
+                        loss = loss + args.lm_loss_weight * lm_loss
+
+                    choice_metrics = _compute_choice_losses(
+                        model=model,
+                        choice_inputs=choice_inputs,
+                        choice_labels=choice_labels,
+                        choice_group_sizes=choice_group_sizes,
+                        correct_choice_idx=correct_choice_idx,
                     )
-                    prompt_len = int(inputs["input_ids"].shape[1])
-                    debug_new_tokens = debug_ids[:, prompt_len:]
-                    debug_text = accelerator.unwrap_model(model).backbone.tokenizer.batch_decode(
-                        debug_new_tokens, skip_special_tokens=True
-                    )
-                    accelerator.print(f"debug_text step={step}: {debug_text}")
-                loss = outputs["loss"]
+                    metrics.update({k: v.detach() if torch.is_tensor(v) else v for k, v in choice_metrics.items() if k != "choice_scores"})
+                    loss = loss + args.mc_loss_weight * choice_metrics["mc_loss"]
+                    if "belief_aux_loss" in choice_metrics:
+                        loss = loss + args.belief_aux_loss_weight * choice_metrics["belief_aux_loss"]
+
                 if train:
                     accelerator.backward(loss)
                     if args.max_grad_norm > 0:
                         accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
                     optimizer.step()
+                    if scheduler is not None:
+                        scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
 
-        batch_size = labels.size(0)
         total_loss += loss.detach().item() * batch_size
         total_examples += batch_size
+        if "lm_loss" in metrics:
+            total_lm_loss += float(metrics["lm_loss"].item()) * batch_size
+        if "mc_loss" in metrics:
+            total_mc_loss += float(metrics["mc_loss"].item()) * batch_size
+        if "belief_aux_loss" in metrics:
+            total_belief_aux_loss += float(metrics["belief_aux_loss"].item()) * batch_size
+        if "mc_acc" in metrics:
+            total_mc_acc += float(metrics["mc_acc"].item()) * batch_size
 
         if args.log_every > 0 and step % args.log_every == 0:
             avg_loss = total_loss / max(total_examples, 1)
             phase = "train" if train else "val"
-            accelerator.print(f"{phase} step={step} loss={avg_loss:.4f}")
+            message = f"{phase} step={step} loss={avg_loss:.4f}"
+            if total_lm_loss > 0:
+                message += f" lm_loss={total_lm_loss / max(total_examples, 1):.4f}"
+            if total_mc_loss > 0:
+                message += f" mc_loss={total_mc_loss / max(total_examples, 1):.4f}"
+                message += f" mc_acc={total_mc_acc / max(total_examples, 1):.4f}"
+            if total_belief_aux_loss > 0:
+                message += f" belief_aux_loss={total_belief_aux_loss / max(total_examples, 1):.4f}"
+            accelerator.print(message)
             if args.wandb:
-                metrics = {f"{phase}/loss": avg_loss}
-                for key in ("lm_loss", "aux_loss", "belief_future_loss", "belief_reconstruction_loss", "belief_kl_loss"):
-                    if key in outputs:
-                        metrics[f"{phase}/{key}"] = float(outputs[key].detach().item())
+                wandb_metrics = {f"{phase}/loss": avg_loss}
+                if total_lm_loss > 0:
+                    wandb_metrics[f"{phase}/lm_loss"] = total_lm_loss / max(total_examples, 1)
+                if total_mc_loss > 0:
+                    wandb_metrics[f"{phase}/mc_loss"] = total_mc_loss / max(total_examples, 1)
+                    wandb_metrics[f"{phase}/mc_acc"] = total_mc_acc / max(total_examples, 1)
+                if total_belief_aux_loss > 0:
+                    wandb_metrics[f"{phase}/belief_aux_loss"] = total_belief_aux_loss / max(total_examples, 1)
                 if train:
-                    metrics["train/lr"] = optimizer.param_groups[0]["lr"]
-                    accelerator.log(metrics, step=global_step + step)
+                    wandb_metrics["train/lr"] = optimizer.param_groups[0]["lr"]
+                    accelerator.log(wandb_metrics, step=global_step + step)
                 else:
-                    accelerator.log(metrics, step=global_step)
+                    accelerator.log(wandb_metrics, step=global_step)
 
-    avg_loss = total_loss / max(total_examples, 1)
-    return avg_loss, (global_step + step if train else global_step)
+    denom = max(total_examples, 1)
+    return {
+        "loss": total_loss / denom,
+        "lm_loss": total_lm_loss / denom if total_lm_loss > 0 else 0.0,
+        "mc_loss": total_mc_loss / denom if total_mc_loss > 0 else 0.0,
+        "belief_aux_loss": total_belief_aux_loss / denom if total_belief_aux_loss > 0 else 0.0,
+        "mc_acc": total_mc_acc / denom if total_mc_acc > 0 else 0.0,
+        "global_step": (global_step + step if train else global_step),
+    }
 
 
 def main():
@@ -341,6 +497,8 @@ def main():
         raise RuntimeError("Use either --use_future_predictor or --use_belief_model, not both.")
     if args.use_belief_model and args.video_frames < 1:
         raise RuntimeError("--use_belief_model requires --video_frames >= 1.")
+    if args.train_objective in {"mc", "hybrid"} and not args.annotation_path:
+        raise RuntimeError("Multiple-choice training requires annotation records with choices.")
 
     if args.detect_anomaly:
         torch.autograd.set_detect_anomaly(True)
@@ -454,13 +612,26 @@ def main():
         lr=args.lr,
         weight_decay=args.weight_decay,
     )
+    total_training_steps = _estimate_train_steps(train_loader, args)
+    if args.lr_scheduler == "cosine":
+        warmup_steps = int(total_training_steps * max(0.0, float(args.warmup_ratio)))
+        scheduler = get_cosine_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=warmup_steps,
+            num_training_steps=total_training_steps,
+        )
+    else:
+        scheduler = None
 
     model, optimizer, train_loader = accelerator.prepare(model, optimizer, train_loader)
     if val_loader is not None:
         val_loader = accelerator.prepare(val_loader)
+    if scheduler is not None:
+        scheduler = accelerator.prepare(scheduler)
 
     start_epoch = 0
     global_step = 0
+    best_metric = float("-inf") if args.save_best_metric == "val_mc_acc" else float("inf")
     if args.resume_checkpoint:
         ckpt = resume_ckpt
         _load_checkpoint_state(model, ckpt["model"], accelerator)
@@ -468,41 +639,92 @@ def main():
             optimizer.load_state_dict(ckpt["optimizer"])
             start_epoch = int(ckpt.get("epoch", -1)) + 1
             global_step = int(ckpt.get("global_step", 0))
+            best_metric = float(ckpt.get("best_metric", best_metric))
             accelerator.print(f"resumed checkpoint={args.resume_checkpoint} start_epoch={start_epoch}")
 
     for epoch in range(start_epoch, args.epochs):
-        train_loss, global_step = run_epoch(
+        train_metrics = run_epoch(
             model=model,
             loader=train_loader,
             optimizer=optimizer,
+            scheduler=scheduler,
             accelerator=accelerator,
             args=args,
             train=True,
             global_step=global_step,
         )
-        accelerator.print(f"epoch={epoch} train_loss={train_loss:.4f}")
+        global_step = int(train_metrics["global_step"])
+        accelerator.print(
+            f"epoch={epoch} train_loss={train_metrics['loss']:.4f} "
+            f"train_lm_loss={train_metrics['lm_loss']:.4f} "
+            f"train_mc_loss={train_metrics['mc_loss']:.4f} "
+            f"train_mc_acc={train_metrics['mc_acc']:.4f}"
+        )
         if args.wandb:
-            accelerator.log({"train/epoch_loss": train_loss}, step=global_step)
+            accelerator.log(
+                {
+                    "train/epoch_loss": train_metrics["loss"],
+                    "train/epoch_lm_loss": train_metrics["lm_loss"],
+                    "train/epoch_mc_loss": train_metrics["mc_loss"],
+                    "train/epoch_mc_acc": train_metrics["mc_acc"],
+                },
+                step=global_step,
+            )
 
+        val_metrics = None
         if val_loader is not None:
             with torch.no_grad():
-                val_loss, _ = run_epoch(
+                val_metrics = run_epoch(
                     model=model,
                     loader=val_loader,
                     optimizer=optimizer,
+                    scheduler=None,
                     accelerator=accelerator,
                     args=args,
                     train=False,
                     global_step=global_step,
                 )
-            accelerator.print(f"epoch={epoch} val_loss={val_loss:.4f}")
+            accelerator.print(
+                f"epoch={epoch} val_loss={val_metrics['loss']:.4f} "
+                f"val_lm_loss={val_metrics['lm_loss']:.4f} "
+                f"val_mc_loss={val_metrics['mc_loss']:.4f} "
+                f"val_mc_acc={val_metrics['mc_acc']:.4f}"
+            )
             if args.wandb:
-                accelerator.log({"val/epoch_loss": val_loss}, step=global_step)
+                accelerator.log(
+                    {
+                        "val/epoch_loss": val_metrics["loss"],
+                        "val/epoch_lm_loss": val_metrics["lm_loss"],
+                        "val/epoch_mc_loss": val_metrics["mc_loss"],
+                        "val/epoch_mc_acc": val_metrics["mc_acc"],
+                    },
+                    step=global_step,
+                )
 
         accelerator.wait_for_everyone()
         if accelerator.is_main_process:
             unwrapped = accelerator.unwrap_model(model)
             ckpt_path = os.path.join(args.save_dir, f"ckpt_epoch_{epoch}.pt")
+            current_metric = None
+            if val_metrics is not None:
+                current_metric = val_metrics["mc_acc"] if args.save_best_metric == "val_mc_acc" else val_metrics["loss"]
+                is_better = current_metric > best_metric if args.save_best_metric == "val_mc_acc" else current_metric < best_metric
+                if is_better:
+                    best_metric = current_metric
+                    best_path = os.path.join(args.save_dir, "best_model.pt")
+                    torch.save(
+                        {
+                            "model": unwrapped.state_dict(),
+                            "optimizer": optimizer.state_dict(),
+                            "epoch": epoch,
+                            "global_step": global_step,
+                            "args": vars(args),
+                            "future_predictor": unwrapped.export_future_predictor_bundle(),
+                            "best_metric": best_metric,
+                        },
+                        best_path,
+                    )
+                    accelerator.print(f"saved {best_path}")
             torch.save(
                 {
                     "model": unwrapped.state_dict(),
@@ -511,6 +733,7 @@ def main():
                     "global_step": global_step,
                     "args": vars(args),
                     "future_predictor": unwrapped.export_future_predictor_bundle(),
+                    "best_metric": best_metric,
                 },
                 ckpt_path,
             )

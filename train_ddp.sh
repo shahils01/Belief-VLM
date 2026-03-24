@@ -22,7 +22,7 @@ CMD=(
   --answer_column "$ANSWER_COLUMN"
   --video_id_column "$VIDEO_ID_COLUMN"
   --participant_column "$PARTICIPANT_COLUMN"
-  --val_ratio 0.01
+  --val_ratio 0.05
   --batch_size 4
   --num_workers 4
   --video_frames 20
@@ -31,6 +31,16 @@ CMD=(
   --allow_tf32
   --epochs 200
   --log_every 1
+  --train_objective hybrid
+  --belief_fusion_scope vision_text
+  --belief_use_recurrence
+  --belief_temporal_chunks 4
+  --mc_loss_weight 1.0
+  --lm_loss_weight 1.0
+  --belief_aux_loss_weight 0.25
+  --lr_scheduler cosine
+  --warmup_ratio 0.03
+  --save_best_metric val_mc_acc
   --vl_model_preset "$VL_MODEL_PRESET"
   --gradient_checkpointing
   --save_dir checkpoints_belief_hd_epic_ddp_ca_belief

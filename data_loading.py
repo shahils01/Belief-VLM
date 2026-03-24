@@ -240,6 +240,20 @@ def build_sft_example(processor, frames, prompt, answer, vl_backend, max_text_le
     return packed
 
 
+def build_choice_examples(processor, frames, prompt, choices, vl_backend, max_text_len):
+    return [
+        build_sft_example(
+            processor=processor,
+            frames=frames,
+            prompt=prompt,
+            answer=choice,
+            vl_backend=vl_backend,
+            max_text_len=max_text_len,
+        )
+        for choice in choices
+    ]
+
+
 def _stable_fold(value: str, seed: int) -> float:
     digest = hashlib.md5(f"{seed}:{value}".encode("utf-8")).hexdigest()
     return int(digest[:8], 16) / 0xFFFFFFFF
@@ -516,6 +530,27 @@ def _build_prompt_answer(args, record):
     return prompt, answer
 
 
+def resolve_record_choices(record, options_column):
+    choices = _get_first(record, [options_column, "options", "choices", "answer_options"])
+    if not isinstance(choices, (list, tuple)):
+        return None
+    normalized = [_normalize_text(choice) for choice in choices]
+    normalized = [choice for choice in normalized if choice]
+    return normalized or None
+
+
+def resolve_correct_choice_index(record, num_choices):
+    correct_idx = _get_first(record, ["correct_idx", "answer_idx", "label_idx"])
+    if correct_idx in (None, ""):
+        raise RuntimeError("Record is missing `correct_idx` for multiple-choice supervision.")
+    idx = int(correct_idx)
+    if 0 <= idx < num_choices:
+        return idx
+    if 1 <= idx <= num_choices:
+        return idx - 1
+    raise RuntimeError(f"Choice index {idx} is out of range for {num_choices} choices.")
+
+
 def _round_list(values, ndigits=3):
     return [round(float(v), ndigits) for v in values]
 
@@ -616,6 +651,9 @@ class LocalHD_EPICDataset(IterableDataset):
                 prompt, answer = _build_prompt_answer(self.args, record)
             else:
                 prompt, answer = _build_prompt_answer_from_metadata(record)
+            choices = resolve_record_choices(record, self.args.options_column)
+            if self.args.train_objective in {"mc", "hybrid"} and not choices:
+                continue
             start_time_sec, end_time_sec = _resolve_hd_epic_clip_window(record)
             frames = decode_mp4_frames(
                 video_path,
@@ -631,11 +669,49 @@ class LocalHD_EPICDataset(IterableDataset):
                 vl_backend=self.args.vl_backend,
                 max_text_len=self.args.vl_max_text_len,
             )
+            choice_examples = []
+            correct_choice_idx = -1
+            if choices:
+                choice_limit = int(getattr(self.args, "mc_train_num_choices", 0) or 0)
+                if choice_limit > 0:
+                    choices = choices[:choice_limit]
+                try:
+                    correct_choice_idx = resolve_correct_choice_index(record, len(choices))
+                except RuntimeError:
+                    if self.args.train_objective in {"mc", "hybrid"}:
+                        continue
+                if 0 <= correct_choice_idx < len(choices):
+                    choice_examples = build_choice_examples(
+                        processor=self.processor,
+                        frames=frames,
+                        prompt=prompt,
+                        choices=choices,
+                        vl_backend=self.args.vl_backend,
+                        max_text_len=self.args.vl_max_text_len,
+                    )
+                elif self.args.train_objective in {"mc", "hybrid"}:
+                    continue
 
             sample_count += 1
-            yield {
+            gold_example = {
                 "inputs": {k: v for k, v in packed.items() if k not in {"labels", "prompt_text", "answer_text"}},
                 "labels": packed["labels"],
+            }
+            if self.args.train_objective == "generative":
+                yield gold_example
+                continue
+
+            yield {
+                "gold_example": gold_example,
+                "choice_examples": [
+                    {
+                        "inputs": {k: v for k, v in item.items() if k not in {"labels", "prompt_text", "answer_text"}},
+                        "labels": item["labels"],
+                    }
+                    for item in choice_examples
+                ],
+                "correct_choice_idx": correct_choice_idx,
+                "has_choices": bool(choice_examples),
             }
 
 
@@ -734,6 +810,31 @@ def collate_sft_batch(batch):
     }
 
 
+def collate_hybrid_batch(batch):
+    valid_batch = [item for item in batch if item.get("has_choices")]
+    if not valid_batch:
+        raise RuntimeError("No valid multiple-choice samples were produced for the current batch.")
+
+    gold_batch = collate_sft_batch([item["gold_example"] for item in valid_batch])
+    flat_choice_examples = []
+    choice_group_sizes = []
+    for item in valid_batch:
+        choice_group_sizes.append(len(item["choice_examples"]))
+        flat_choice_examples.extend(item["choice_examples"])
+    choice_batch = collate_sft_batch(flat_choice_examples)
+    return {
+        "gold_inputs": gold_batch["inputs"],
+        "gold_labels": gold_batch["labels"],
+        "choice_inputs": choice_batch["inputs"],
+        "choice_labels": choice_batch["labels"],
+        "choice_group_sizes": torch.tensor(choice_group_sizes, dtype=torch.long),
+        "correct_choice_idx": torch.tensor(
+            [int(item["correct_choice_idx"]) for item in valid_batch],
+            dtype=torch.long,
+        ),
+    }
+
+
 def collate_future_batch(batch):
     return {
         "ids": [item["id"] for item in batch],
@@ -764,7 +865,7 @@ def build_train_loader(args, split: str, batch_size: int, num_workers: int, is_t
         dataset,
         batch_size=batch_size,
         num_workers=num_workers,
-        collate_fn=collate_sft_batch,
+        collate_fn=collate_sft_batch if getattr(args, "train_objective", "generative") == "generative" else collate_hybrid_batch,
         pin_memory=torch.cuda.is_available(),
     )
 
