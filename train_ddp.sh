@@ -26,7 +26,7 @@ CMD=(
   --batch_size 2
   --num_workers 4
   --video_frames 8
-  --grad_accum_steps 16
+  --grad_accum_steps 32
   --mixed_precision bf16
   --allow_tf32
   --epochs 200
@@ -45,8 +45,6 @@ CMD=(
   --vl_model_preset "$VL_MODEL_PRESET"
   --gradient_checkpointing
   --save_dir checkpoints_belief_hd_epic_ddp_ca_belief
-  --resume_checkpoint /scratch/shahils/Belief-VLM/checkpoints_belief_hd_epic_ddp_07/ckpt_epoch_99.pt
-  --load_model_only
   --wandb
 )
 
@@ -62,3 +60,6 @@ if [[ "$USE_BELIEF_MODEL" == "1" ]]; then
 fi
 
 "${CMD[@]}"
+
+  # --resume_checkpoint /scratch/shahils/Belief-VLM/checkpoints_belief_hd_epic_ddp_07/ckpt_epoch_99.pt
+  # --load_model_only
