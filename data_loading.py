@@ -8,12 +8,21 @@ from typing import Iterable
 import cv2
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset, IterableDataset, get_worker_info
 
 
 DEFAULT_PROMPT = "Describe what is happening in this egocentric video."
+
+
+def _get_distributed_rank_info():
+    if dist.is_available() and dist.is_initialized():
+        return int(dist.get_rank()), int(dist.get_world_size())
+    rank = int(os.environ.get("RANK", "0") or 0)
+    world_size = int(os.environ.get("WORLD_SIZE", "1") or 1)
+    return rank, max(world_size, 1)
 
 
 def _normalize_media_size(image_size):
@@ -610,7 +619,37 @@ def _build_prompt_answer_from_metadata(record):
 
 class LocalHD_EPICDataset(IterableDataset):
     def __init__(self, records, processor, args, split_name: str, is_train: bool):
-        self.records = records
+        filtered_records = []
+        for idx, record in enumerate(records):
+            sample_id = str(
+                _get_first(record, [args.id_column, "id", "sample_id", "uid", "video_id"]) or idx
+            )
+            val_ratio = max(0.0, min(0.5, float(args.val_ratio)))
+            if val_ratio > 0.0:
+                fold = _stable_fold(sample_id, args.seed)
+                in_val = fold < val_ratio
+                if is_train and in_val:
+                    continue
+                if (not is_train) and (not in_val):
+                    continue
+            choices = resolve_record_choices(record, args.options_column)
+            if args.train_objective in {"mc", "hybrid"}:
+                if not choices:
+                    continue
+                choice_limit = int(getattr(args, "mc_train_num_choices", 0) or 0)
+                if choice_limit > 0:
+                    choices = choices[:choice_limit]
+                try:
+                    correct_choice_idx = resolve_correct_choice_index(record, len(choices))
+                except RuntimeError:
+                    continue
+                if not (0 <= correct_choice_idx < len(choices)):
+                    continue
+            filtered_records.append(record)
+            if args.max_samples_per_split > 0 and len(filtered_records) >= args.max_samples_per_split:
+                break
+
+        self.records = filtered_records
         self.processor = processor
         self.args = args
         self.split_name = split_name
@@ -620,40 +659,24 @@ class LocalHD_EPICDataset(IterableDataset):
         worker = get_worker_info()
         worker_id = worker.id if worker is not None else 0
         num_workers = worker.num_workers if worker is not None else 1
-        indices = list(range(worker_id, len(self.records), num_workers))
+        rank, world_size = _get_distributed_rank_info()
+        global_worker_id = rank * num_workers + worker_id
+        global_num_workers = world_size * num_workers
+        indices = list(range(global_worker_id, len(self.records), global_num_workers))
         if self.is_train and indices:
-            generator = np.random.default_rng(self.args.seed + worker_id)
+            generator = np.random.default_rng(self.args.seed + global_worker_id)
             generator.shuffle(indices)
         for idx in indices:
             yield self.records[idx]
 
-    def _keep_sample(self, sample_id: str) -> bool:
-        val_ratio = max(0.0, min(0.5, float(self.args.val_ratio)))
-        if val_ratio == 0.0:
-            return self.is_train or self.split_name != self.args.val_split
-        fold = _stable_fold(sample_id, self.args.seed)
-        in_val = fold < val_ratio
-        return (not in_val) if self.is_train else in_val
-
     def __iter__(self):
-        sample_count = 0
         for record in self._iter_records():
-            sample_id = str(
-                _get_first(record, [self.args.id_column, "id", "sample_id", "uid", "video_id"]) or sample_count
-            )
-            if not self._keep_sample(sample_id):
-                continue
-            if self.args.max_samples_per_split > 0 and sample_count >= self.args.max_samples_per_split:
-                break
-
             video_path = _resolve_hd_epic_video_path(self.args, record)
             if self.args.annotation_path:
                 prompt, answer = _build_prompt_answer(self.args, record)
             else:
                 prompt, answer = _build_prompt_answer_from_metadata(record)
             choices = resolve_record_choices(record, self.args.options_column)
-            if self.args.train_objective in {"mc", "hybrid"} and not choices:
-                continue
             start_time_sec, end_time_sec = _resolve_hd_epic_clip_window(record)
             frames = decode_mp4_frames(
                 video_path,
@@ -692,7 +715,6 @@ class LocalHD_EPICDataset(IterableDataset):
                 elif self.args.train_objective in {"mc", "hybrid"}:
                     continue
 
-            sample_count += 1
             gold_example = {
                 "inputs": {k: v for k, v in packed.items() if k not in {"labels", "prompt_text", "answer_text"}},
                 "labels": packed["labels"],
@@ -866,6 +888,7 @@ def build_train_loader(args, split: str, batch_size: int, num_workers: int, is_t
         batch_size=batch_size,
         num_workers=num_workers,
         collate_fn=collate_sft_batch if getattr(args, "train_objective", "generative") == "generative" else collate_hybrid_batch,
+        drop_last=is_train,
         pin_memory=torch.cuda.is_available(),
     )
 
