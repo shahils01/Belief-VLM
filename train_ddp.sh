@@ -42,6 +42,10 @@ CMD=(
   --lr_scheduler cosine
   --warmup_ratio 0.03
   --save_best_metric val_mc_acc
+  --peft qlora
+  --lora_r 16
+  --lora_alpha 32
+  --lora_dropout 0.05
   --vl_model_preset "$VL_MODEL_PRESET"
   --gradient_checkpointing
   --save_dir checkpoints_belief_hd_epic_ddp_ca_belief
