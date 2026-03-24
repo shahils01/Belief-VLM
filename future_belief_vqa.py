@@ -13,6 +13,8 @@ from data_loading import (
     _resolve_hd_epic_future_window,
     _resolve_hd_epic_video_path,
     _stable_fold,
+    build_sft_example,
+    collate_sft_batch,
     decode_mp4_frames,
 )
 
@@ -120,6 +122,32 @@ def build_future_belief_vqa_loader(args, batch_size: int, num_workers: int, is_t
         collate_fn=collate_future_belief_vqa,
         pin_memory=torch.cuda.is_available(),
     )
+
+
+def build_future_vqa_option_batch(processor, batch, args):
+    candidates = []
+    labels = batch["labels"]
+    num_options = len(batch["options"][0])
+    for future_frames, question, options in zip(batch["future_frames"], batch["questions"], batch["options"]):
+        options_text = "\n".join(f"{idx}. {option}" for idx, option in enumerate(options))
+        prompt = f"{question}\nOptions:\n{options_text}"
+        for option in options:
+            packed = build_sft_example(
+                processor=processor,
+                frames=future_frames,
+                prompt=prompt,
+                answer=option,
+                vl_backend=args.vl_backend,
+                max_text_len=args.vl_max_text_len,
+            )
+            candidates.append(
+                {
+                    "inputs": {k: v for k, v in packed.items() if k not in {"labels", "prompt_text", "answer_text"}},
+                    "labels": packed["labels"],
+                }
+            )
+    collated = collate_sft_batch(candidates)
+    return collated, labels, num_options
 
 
 @dataclass
