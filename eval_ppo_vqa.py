@@ -4,14 +4,27 @@ from collections import defaultdict
 from types import SimpleNamespace
 
 import torch
+import torch.nn.functional as F
 
-from data_loading import build_rl_vqa_loader
+from data_loading import (
+    _get_first,
+    _load_records,
+    _normalize_text,
+    _resolve_hd_epic_clip_window,
+    _resolve_hd_epic_video_path,
+    _stable_fold,
+    build_rl_vqa_loader,
+    build_sft_example,
+    collate_sft_batch,
+    decode_mp4_frames,
+)
 from train import _apply_peft, _configure_memory_optimizations, _resolve_vl_model_preset, build_model
 from train_ppo_vqa import PPOAnswerPolicy, _build_quant_config, _masked_logits
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate PPO VQA policy checkpoints.")
+    parser.add_argument("--eval_mode", type=str, default="ppo", choices=["ppo", "vlm"])
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--annotation_path", type=str, required=True)
     parser.add_argument("--video_root", type=str, required=True)
@@ -41,6 +54,7 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--max_samples_per_split", type=int, default=0)
+    parser.add_argument("--val_ratio", type=float, default=None)
     parser.add_argument("--max_samples", type=int, default=0)
     parser.add_argument("--print_samples", type=int, default=10)
     parser.add_argument("--progress_every", type=int, default=50)
@@ -80,6 +94,7 @@ def _merge_args(cli_args, ckpt_args):
         "peft",
         "state_pooling",
         "max_choice_options",
+        "val_ratio",
     )
     for key in optional_overrides:
         value = getattr(cli_args, key)
@@ -120,6 +135,7 @@ def _merge_args(cli_args, ckpt_args):
     merged.setdefault("policy_dropout", 0.1)
     merged.setdefault("max_choice_options", 8)
     merged.setdefault("train_vlm_with_rl", False)
+    merged.setdefault("seed", 42)
     return SimpleNamespace(**merged)
 
 
@@ -147,11 +163,84 @@ def _load_model_and_policy(checkpoint_path, args, device):
     return model, policy, ckpt
 
 
-def evaluate(args):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    ckpt = torch.load(args.checkpoint, map_location="cpu")
-    ckpt_args = ckpt.get("args", {}) if isinstance(ckpt, dict) else {}
-    merged_args = _merge_args(args, ckpt_args)
+def _load_vlm_model(checkpoint_path, args, device):
+    ckpt = torch.load(checkpoint_path, map_location="cpu")
+    args.quantization_config = _build_quant_config(args)
+    _resolve_vl_model_preset(args)
+    model = build_model(args, device=device)
+    model = _apply_peft(model, args)
+    _configure_memory_optimizations(model, args)
+    state_dict = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
+    model.load_state_dict(state_dict, strict=False)
+    model.eval()
+    return model, ckpt
+
+
+def _iter_validation_records(args):
+    records = _load_records(args)
+    val_ratio = max(0.0, min(0.5, float(args.val_ratio)))
+    if val_ratio == 0.0:
+        for idx, record in enumerate(records):
+            if args.max_samples_per_split > 0 and idx >= args.max_samples_per_split:
+                break
+            yield record
+        return
+
+    yielded = 0
+    for idx, record in enumerate(records):
+        sample_id = str(_get_first(record, [args.id_column, "id", "sample_id", "uid", "video_id"]) or idx)
+        fold = _stable_fold(sample_id, args.seed)
+        if fold >= val_ratio:
+            continue
+        yield record
+        yielded += 1
+        if args.max_samples_per_split > 0 and yielded >= args.max_samples_per_split:
+            break
+
+
+def _build_eval_prompt(record, args):
+    prompt = _get_first(record, [args.question_column, "question", "prompt", "instruction", "query"])
+    prompt = _normalize_text(prompt)
+    choices = _get_first(record, [args.options_column, "options", "choices", "answer_options"])
+    if not isinstance(choices, (list, tuple)):
+        raise RuntimeError("Multiple-choice evaluation expects a choices/options field.")
+    choices = [_normalize_text(choice) for choice in choices]
+    options_text = _normalize_text(choices)
+    if options_text:
+        prompt = f"{prompt}\nOptions:\n{options_text}"
+    return prompt, choices
+
+
+def _resolve_correct_choice_index(record, num_choices):
+    correct_idx = _get_first(record, ["correct_idx", "answer_idx", "label_idx"])
+    if correct_idx in (None, ""):
+        raise RuntimeError("Record is missing correct_idx/answer_idx/label_idx.")
+    idx = int(correct_idx)
+    if 0 <= idx < num_choices:
+        return idx
+    if 1 <= idx <= num_choices:
+        return idx - 1
+    raise RuntimeError(f"Choice index {idx} is out of range for {num_choices} choices.")
+
+
+def _sequence_nll(logits, labels):
+    seq_len = min(int(logits.shape[1]), int(labels.shape[1]))
+    logits = logits[:, :seq_len, :]
+    labels = labels[:, :seq_len]
+    shift_logits = logits[:, :-1, :].float().contiguous()
+    shift_labels = labels[:, 1:].contiguous()
+    token_losses = F.cross_entropy(
+        shift_logits.view(-1, shift_logits.size(-1)),
+        shift_labels.view(-1),
+        reduction="none",
+        ignore_index=-100,
+    ).view(shift_labels.size(0), shift_labels.size(1))
+    mask = shift_labels.ne(-100)
+    denom = mask.sum(dim=1).clamp_min(1)
+    return (token_losses * mask).sum(dim=1) / denom
+
+
+def _evaluate_ppo(args, merged_args, device):
     model, policy, _ = _load_model_and_policy(args.checkpoint, merged_args, device=device)
 
     loader = build_rl_vqa_loader(
@@ -199,13 +288,14 @@ def evaluate(args):
             correct_choice_idx = int(correct_idx[row].item())
             valid_probs = probs[row, :num_valid].detach().cpu().tolist()
             prediction = {
+                "mode": "ppo",
                 "id": sample_id,
                 "task_name": task_name,
                 "pred_idx": pred_choice_idx,
                 "correct_idx": correct_choice_idx,
                 "pred_choice": choices[pred_choice_idx],
                 "correct_choice": choices[correct_choice_idx],
-                "choice_probs": [float(x) for x in valid_probs],
+                "choice_scores": [float(x) for x in valid_probs],
                 "value": float(values[row].item()),
                 "is_correct": bool(is_correct),
             }
@@ -218,7 +308,7 @@ def evaluate(args):
 
             if total <= args.print_samples:
                 print(
-                    f"[{total}] task={task_name} id={sample_id} pred={pred_choice_idx} gt={correct_choice_idx} "
+                    f"[{total}] mode=ppo task={task_name} id={sample_id} pred={pred_choice_idx} gt={correct_choice_idx} "
                     f"correct={bool(is_correct)}\n"
                     f"prompt={batch['prompts'][row]}\n"
                     f"pred_choice={choices[pred_choice_idx]}\n"
@@ -228,8 +318,110 @@ def evaluate(args):
             if args.progress_every > 0 and total % args.progress_every == 0:
                 print(f"progress {total} accuracy={correct / max(total, 1):.4f}")
 
+    return total, correct, by_task, predictions
+
+
+def _evaluate_vlm(args, merged_args, device):
+    model, _ = _load_vlm_model(args.checkpoint, merged_args, device=device)
+    processor = model.backbone.processor
+
+    total = 0
+    correct = 0
+    by_task = defaultdict(lambda: {"correct": 0, "total": 0})
+    predictions = []
+
+    for record in _iter_validation_records(merged_args):
+        if args.max_samples > 0 and total >= args.max_samples:
+            break
+
+        prompt, choices = _build_eval_prompt(record, merged_args)
+        correct_idx = _resolve_correct_choice_index(record, len(choices))
+        video_path = _resolve_hd_epic_video_path(merged_args, record)
+        start_time_sec, end_time_sec = _resolve_hd_epic_clip_window(record)
+        frames = decode_mp4_frames(
+            video_path,
+            merged_args.video_frames,
+            start_time_sec=start_time_sec,
+            end_time_sec=end_time_sec,
+        )
+
+        choice_examples = []
+        for choice_text in choices:
+            packed = build_sft_example(
+                processor=processor,
+                frames=frames,
+                prompt=prompt,
+                answer=choice_text,
+                vl_backend=merged_args.vl_backend,
+                max_text_len=merged_args.vl_max_text_len,
+            )
+            choice_examples.append(
+                {
+                    "inputs": {k: v for k, v in packed.items() if k not in {"labels", "prompt_text", "answer_text"}},
+                    "labels": packed["labels"],
+                }
+            )
+
+        batch = collate_sft_batch(choice_examples)
+        labels = batch["labels"].to(device)
+        inputs = {
+            key: value.to(device) if torch.is_tensor(value) else value
+            for key, value in batch["inputs"].items()
+        }
+
+        with torch.no_grad():
+            outputs = model(inputs, labels=labels)
+            choice_losses = _sequence_nll(outputs["logits"], labels)
+
+        pred_idx = int(torch.argmin(choice_losses).item())
+        is_correct = pred_idx == correct_idx
+        task_name = record.get("task_name", "unknown")
+        sample_id = str(record.get("id", total))
+
+        total += 1
+        correct += int(is_correct)
+        by_task[task_name]["correct"] += int(is_correct)
+        by_task[task_name]["total"] += 1
+        prediction = {
+            "mode": "vlm",
+            "id": sample_id,
+            "task_name": task_name,
+            "pred_idx": pred_idx,
+            "correct_idx": correct_idx,
+            "pred_choice": choices[pred_idx],
+            "correct_choice": choices[correct_idx],
+            "choice_scores": [float(x) for x in (-choice_losses).tolist()],
+            "is_correct": bool(is_correct),
+        }
+        predictions.append(prediction)
+
+        if total <= args.print_samples:
+            print(
+                f"[{total}] mode=vlm task={task_name} id={sample_id} pred={pred_idx} gt={correct_idx} "
+                f"correct={bool(is_correct)}\n"
+                f"prompt={prompt}\n"
+                f"pred_choice={choices[pred_idx]}\n"
+                f"gt_choice={choices[correct_idx]}\n"
+            )
+
+        if args.progress_every > 0 and total % args.progress_every == 0:
+            print(f"progress {total} accuracy={correct / max(total, 1):.4f}")
+
+    return total, correct, by_task, predictions
+
+
+def evaluate(args):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    ckpt = torch.load(args.checkpoint, map_location="cpu")
+    ckpt_args = ckpt.get("args", {}) if isinstance(ckpt, dict) else {}
+    merged_args = _merge_args(args, ckpt_args)
+    if args.eval_mode == "ppo":
+        total, correct, by_task, predictions = _evaluate_ppo(args, merged_args, device=device)
+    else:
+        total, correct, by_task, predictions = _evaluate_vlm(args, merged_args, device=device)
+
     accuracy = correct / max(total, 1)
-    print(f"final accuracy={accuracy:.4f} ({correct}/{total})")
+    print(f"final mode={args.eval_mode} accuracy={accuracy:.4f} ({correct}/{total})")
     print("per-task accuracy:")
     for task_name in sorted(by_task.keys()):
         stats = by_task[task_name]
@@ -241,6 +433,7 @@ def evaluate(args):
             json.dump(
                 {
                     "accuracy": accuracy,
+                    "mode": args.eval_mode,
                     "correct": correct,
                     "total": total,
                     "per_task": by_task,
