@@ -20,7 +20,7 @@ WUPS_T1="${WUPS_T1:-0.9}"
 WUPS_T2="${WUPS_T2:-0.1}"
 COMMONSENSE_WEIGHT="${COMMONSENSE_WEIGHT:-0.5}"
 
-SAVE_DIR="${SAVE_DIR:-/scratch/shahils/Belief-VLM/checkpoints_belief_intent_vqa}"
+SAVE_DIR="${SAVE_DIR:-/scratch/anshuln/Belief-VLM/checkpoints/belief_intent_vqa}"
 
 accelerate launch --num_processes 1 train_belief_IntentVQA.py \
   --dataset_source "$DATASET_SOURCE" \

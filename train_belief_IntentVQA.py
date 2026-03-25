@@ -26,7 +26,7 @@ from train import _configure_memory_optimizations, _load_checkpoint_state, _reso
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train IntentQA-style context-aware VQA model in Belief-VLM.")
-    parser.add_argument("--dataset_source", type=str, default="hd_epic", choices=["hd_epic", "nextvqa"])
+    parser.add_argument("--dataset_source", type=str, default="nextvqa", choices=["hd_epic", "nextvqa"])
     parser.add_argument("--annotation_path", type=str, required=True)
     parser.add_argument("--video_root", type=str, required=True)
     parser.add_argument("--video_extension", type=str, default="mp4")
