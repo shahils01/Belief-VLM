@@ -170,19 +170,10 @@ class MultimodalVLMModel(nn.Module):
         self.cfg = cfg
         self.backbone = InternVLBackbone(cfg, device=device)
 
-    def encode_inputs(self, inputs, pooling: str = "last"):
-        model_inputs = self.backbone._move_inputs_to_device(inputs)
-        outputs = self.backbone.model(
-            **model_inputs,
-            return_dict=True,
-            output_hidden_states=True,
-            use_cache=False,
-        )
-        hidden_states = getattr(outputs, "hidden_states", None)
+    def _pool_hidden_states(self, hidden_states, attention_mask, pooling: str):
         if not hidden_states:
             raise RuntimeError("The selected VLM backend did not return hidden states.")
         sequence_hidden = hidden_states[-1]
-        attention_mask = model_inputs.get("attention_mask")
         if attention_mask is None:
             pooled = sequence_hidden[:, -1, :]
         elif pooling == "mean":
@@ -197,15 +188,40 @@ class MultimodalVLMModel(nn.Module):
             "attention_mask": attention_mask,
         }
 
-    def forward(self, inputs, labels=None):
+    def encode_inputs(self, inputs, pooling: str = "last"):
+        model_inputs = self.backbone._move_inputs_to_device(inputs)
+        outputs = self.backbone.model(
+            **model_inputs,
+            return_dict=True,
+            output_hidden_states=True,
+            use_cache=False,
+        )
+        return self._pool_hidden_states(
+            hidden_states=getattr(outputs, "hidden_states", None),
+            attention_mask=model_inputs.get("attention_mask"),
+            pooling=pooling,
+        )
+
+    def forward(self, inputs, labels=None, return_hidden_states: bool = False, pooling: str = "last"):
         model_inputs = self.backbone._move_inputs_to_device(inputs)
         forward_kwargs = {"return_dict": True}
         if hasattr(self.backbone.model, "config") and hasattr(self.backbone.model.config, "use_cache"):
             forward_kwargs["use_cache"] = False
+        if return_hidden_states:
+            forward_kwargs["output_hidden_states"] = True
         if labels is not None:
             model_inputs["labels"] = labels.to(self.backbone.device)
         outputs = self.backbone.model(**model_inputs, **forward_kwargs)
-        return {"loss": outputs.loss, "logits": outputs.logits}
+        result = {"loss": outputs.loss, "logits": outputs.logits}
+        if return_hidden_states:
+            result.update(
+                self._pool_hidden_states(
+                    hidden_states=getattr(outputs, "hidden_states", None),
+                    attention_mask=model_inputs.get("attention_mask"),
+                    pooling=pooling,
+                )
+            )
+        return result
 
     @torch.no_grad()
     def generate(self, inputs, max_new_tokens=64):

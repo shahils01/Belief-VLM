@@ -179,7 +179,7 @@ def _masked_logits(logits, num_choices):
 def _extract_state(model, batch_inputs, args):
     ctx = nullcontext() if args.train_vlm_with_rl else torch.no_grad()
     with ctx:
-        encoded = model.encode_inputs(batch_inputs, pooling=args.state_pooling)
+        encoded = model(batch_inputs, return_hidden_states=True, pooling=args.state_pooling)
     pooled_state = encoded["pooled_state"]
     if not args.train_vlm_with_rl:
         pooled_state = pooled_state.detach()
@@ -406,7 +406,7 @@ def main():
 
     probe_batch = next(iter(build_rl_vqa_loader(args, args.train_split, batch_size=1, num_workers=0, is_train=True)))
     with torch.no_grad():
-        probe_state = model.encode_inputs(probe_batch["inputs"], pooling=args.state_pooling)["pooled_state"]
+        probe_state = model(probe_batch["inputs"], return_hidden_states=True, pooling=args.state_pooling)["pooled_state"]
     policy = PPOAnswerPolicy(
         hidden_dim=int(probe_state.shape[-1]),
         action_dim=args.max_choice_options,
