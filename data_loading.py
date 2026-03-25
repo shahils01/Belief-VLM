@@ -123,20 +123,34 @@ def decode_mp4_frames(video_path: str, num_frames: int, start_time_sec=None, end
         if end_time_sec is not None:
             end_frame = max(start_frame, min(frame_count - 1, int(end_time_sec * fps)))
     clip_frame_count = max(1, end_frame - start_frame + 1)
-    wanted = {start_frame + idx for idx in _sample_frame_indices(clip_frame_count, num_frames)}
+    target_indices = [start_frame + idx for idx in _sample_frame_indices(clip_frame_count, num_frames)]
     frames = []
-    cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
-    cur = start_frame
-    while True:
+
+    # Prefer direct random seeks so decode cost scales with requested frames,
+    # not with the full clip duration.
+    for frame_idx in target_indices:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_idx))
         ok, frame = cap.read()
         if not ok:
-            break
-        if cur > end_frame:
-            break
-        if cur in wanted:
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            frames.append(Image.fromarray(frame))
-        cur += 1
+            continue
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frames.append(Image.fromarray(frame))
+
+    # Some codecs/containers seek imprecisely with OpenCV. Fall back to a
+    # linear scan only if random access failed to recover enough frames.
+    if len(frames) < min(num_frames, len(target_indices)):
+        frames = []
+        wanted = set(target_indices)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+        cur = start_frame
+        while True:
+            ok, frame = cap.read()
+            if not ok or cur > end_frame:
+                break
+            if cur in wanted:
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                frames.append(Image.fromarray(frame))
+            cur += 1
     cap.release()
 
     if not frames:
