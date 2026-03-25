@@ -8,6 +8,7 @@ from typing import Iterable
 import cv2
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from PIL import Image
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
@@ -308,6 +309,30 @@ def build_prompt_only_example(processor, frames, prompt, vl_backend, max_text_le
 def _stable_fold(value: str, seed: int) -> float:
     digest = hashlib.md5(f"{seed}:{value}".encode("utf-8")).hexdigest()
     return int(digest[:8], 16) / 0xFFFFFFFF
+
+
+def _get_distributed_rank_info():
+    if dist.is_available() and dist.is_initialized():
+        return int(dist.get_rank()), int(dist.get_world_size())
+
+    rank = os.environ.get("RANK")
+    world_size = os.environ.get("WORLD_SIZE")
+    if rank is not None and world_size is not None:
+        try:
+            return int(rank), int(world_size)
+        except ValueError:
+            pass
+    return 0, 1
+
+
+def _build_distributed_worker_indices(num_records: int):
+    rank, world_size = _get_distributed_rank_info()
+    global_indices = list(range(rank, num_records, world_size))
+
+    worker = get_worker_info()
+    worker_id = worker.id if worker is not None else 0
+    num_workers = worker.num_workers if worker is not None else 1
+    return global_indices[worker_id::num_workers], worker_id
 
 
 def _expand_annotation_paths(path_spec: str):
@@ -654,10 +679,7 @@ class LocalHD_EPICDataset(IterableDataset):
         self.is_train = is_train
 
     def _iter_records(self):
-        worker = get_worker_info()
-        worker_id = worker.id if worker is not None else 0
-        num_workers = worker.num_workers if worker is not None else 1
-        indices = list(range(worker_id, len(self.records), num_workers))
+        indices, worker_id = _build_distributed_worker_indices(len(self.records))
         if self.is_train and indices:
             generator = np.random.default_rng(self.args.seed + worker_id)
             generator.shuffle(indices)
@@ -720,10 +742,7 @@ class LocalHD_EPICRLVQADataset(IterableDataset):
         self.is_train = is_train
 
     def _iter_records(self):
-        worker = get_worker_info()
-        worker_id = worker.id if worker is not None else 0
-        num_workers = worker.num_workers if worker is not None else 1
-        indices = list(range(worker_id, len(self.records), num_workers))
+        indices, worker_id = _build_distributed_worker_indices(len(self.records))
         if self.is_train and indices:
             generator = np.random.default_rng(self.args.seed + worker_id)
             generator.shuffle(indices)
