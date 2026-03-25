@@ -55,6 +55,10 @@ def parse_args():
     parser.add_argument("--resume_checkpoint", type=str, default="")
     parser.add_argument("--mixed_precision", type=str, default="bf16", choices=["no", "fp16", "bf16"])
     parser.add_argument("--allow_tf32", action="store_true")
+    parser.add_argument("--wandb", action="store_true")
+    parser.add_argument("--wandb_project", type=str, default="Belief_VLM")
+    parser.add_argument("--wandb_entity", type=str, default="i2rLAB")
+    parser.add_argument("--wandb_run_name", type=str, default="Contrastive")
 
     parser.add_argument("--vl_backend", type=str, default="internvl", choices=["internvl"])
     parser.add_argument("--vl_model_name", type=str, default="OpenGVLab/InternVL3_5-2B-HF")
@@ -510,6 +514,7 @@ def run_epoch(
     accelerator,
     args,
     train: bool,
+    global_step: int = 0,
 ):
     model.train() if train else model.eval()
     if args.freeze_bert:
@@ -522,6 +527,7 @@ def run_epoch(
     total_triplet = 0.0
     total_acc = 0.0
     total = 0
+    step = 0
 
     for step, batch in enumerate(loader, start=1):
         labels = batch["labels"].to(accelerator.device)
@@ -575,6 +581,18 @@ def run_epoch(
                 f"triplet={total_triplet / denom:.4f} "
                 f"acc={total_acc / denom:.4f}"
             )
+            if args.wandb:
+                metrics = {
+                    f"{phase}/loss": total_loss / denom,
+                    f"{phase}/ce": total_ce / denom,
+                    f"{phase}/triplet": total_triplet / denom,
+                    f"{phase}/acc": total_acc / denom,
+                }
+                if train:
+                    metrics["train/lr"] = optimizer.param_groups[0]["lr"]
+                    accelerator.log(metrics, step=global_step + step)
+                else:
+                    accelerator.log(metrics, step=global_step)
 
     denom = max(total, 1)
     return {
@@ -582,7 +600,7 @@ def run_epoch(
         "ce": total_ce / denom,
         "triplet": total_triplet / denom,
         "acc": total_acc / denom,
-    }
+    }, (global_step + step if train else global_step)
 
 
 def main():
@@ -590,7 +608,15 @@ def main():
     _resolve_vl_model_preset(args)
     os.makedirs(args.save_dir, exist_ok=True)
 
-    accelerator = Accelerator(mixed_precision=args.mixed_precision)
+    accelerator = Accelerator(mixed_precision=args.mixed_precision, log_with="wandb" if args.wandb else None)
+    if args.wandb:
+        tracker_cfg = {"entity": args.wandb_entity} if args.wandb_entity else {}
+        run_name = args.wandb_run_name if args.wandb_run_name else None
+        accelerator.init_trackers(
+            project_name=args.wandb_project,
+            config=vars(args),
+            init_kwargs={"wandb": {"name": run_name, **tracker_cfg}},
+        )
     visual_backbone = build_visual_backbone(args, accelerator.device)
     qa_tokenizer, qa_encoder = build_bert_encoder(args, accelerator.device)
 
@@ -631,6 +657,7 @@ def main():
 
     start_epoch = 0
     best_val_acc = -1.0
+    global_step = 0
     if args.resume_checkpoint:
         ckpt = torch.load(args.resume_checkpoint, map_location="cpu")
         _load_checkpoint_state(model, ckpt["model"], accelerator)
@@ -639,7 +666,7 @@ def main():
         best_val_acc = float(ckpt.get("best_val_acc", -1.0))
 
     for epoch in range(start_epoch, args.epochs):
-        train_metrics = run_epoch(
+        train_metrics, global_step = run_epoch(
             visual_backbone,
             qa_tokenizer,
             qa_encoder,
@@ -649,6 +676,7 @@ def main():
             accelerator,
             args,
             train=True,
+            global_step=global_step,
         )
         print(
             f"epoch={epoch} train_loss={train_metrics['loss']:.4f} "
@@ -657,7 +685,7 @@ def main():
         )
 
         with torch.no_grad():
-            val_metrics = run_epoch(
+            val_metrics, global_step = run_epoch(
                 visual_backbone,
                 qa_tokenizer,
                 qa_encoder,
@@ -667,12 +695,23 @@ def main():
                 accelerator,
                 args,
                 train=False,
+                global_step=global_step,
             )
         print(
             f"epoch={epoch} val_loss={val_metrics['loss']:.4f} "
             f"val_ce={val_metrics['ce']:.4f} val_triplet={val_metrics['triplet']:.4f} "
             f"val_acc={val_metrics['acc']:.4f}"
         )
+        if args.wandb:
+            accelerator.log(
+                {
+                    "epoch/train_loss": train_metrics["loss"],
+                    "epoch/train_acc": train_metrics["acc"],
+                    "epoch/val_loss": val_metrics["loss"],
+                    "epoch/val_acc": val_metrics["acc"],
+                },
+                step=global_step,
+            )
 
         accelerator.wait_for_everyone()
         if accelerator.is_main_process:
@@ -693,6 +732,9 @@ def main():
                 state["best_val_acc"] = best_val_acc
                 torch.save(state, best_path)
                 print(f"saved {best_path}")
+
+    if args.wandb:
+        accelerator.end_training()
 
 
 if __name__ == "__main__":
