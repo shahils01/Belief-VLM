@@ -110,14 +110,49 @@ def _parse_choices(raw_choices):
     return []
 
 
+def _parse_choices_from_record(record, options_column: str):
+    choices = _parse_choices(_get_first(record, [options_column, "options", "choices", "answer_options"]))
+    if choices:
+        return choices
+
+    # NExT-QA / IntentQA style choices are often stored as a0..a4 columns.
+    by_index_cols = []
+    i = 0
+    while True:
+        key = f"a{i}"
+        if key not in record:
+            break
+        val = _normalize_text(record.get(key))
+        if val:
+            by_index_cols.append(val)
+        i += 1
+    if by_index_cols:
+        return by_index_cols
+
+    # Generic fallback for option-like column names.
+    generic = []
+    for k, v in record.items():
+        lk = str(k).strip().lower()
+        if lk in {options_column.lower(), "options", "choices", "answer_options"}:
+            continue
+        if lk.startswith("option"):
+            val = _normalize_text(v)
+            if val:
+                generic.append(val)
+    return generic
+
+
 def _resolve_label(record, args, choices):
-    idx = _get_first(record, ["correct_idx", "answer_idx", "label_idx"])
+    idx = _get_first(record, ["correct_idx", "answer_idx", "label_idx", args.answer_column, "answer"])
     if idx not in (None, ""):
-        idx = int(idx)
-        if 0 <= idx < len(choices):
-            return idx
-        if 1 <= idx <= len(choices):
-            return idx - 1
+        try:
+            idx = int(idx)
+            if 0 <= idx < len(choices):
+                return idx
+            if 1 <= idx <= len(choices):
+                return idx - 1
+        except (TypeError, ValueError):
+            pass
     answer = _normalize_text(_get_first(record, [args.answer_column, "answer"]))
     if answer:
         for i, choice in enumerate(choices):
@@ -141,6 +176,8 @@ class IntentQADataset(Dataset):
     def __init__(self, records, args, is_train: bool):
         self.args = args
         selected = []
+        dropped_no_choices = 0
+        dropped_no_label = 0
         for idx, record in enumerate(records):
             sample_id = str(_get_first(record, [args.id_column, "id", "sample_id", "uid", "video_id"]) or idx)
             val_ratio = max(0.0, min(0.5, float(args.val_ratio)))
@@ -151,10 +188,26 @@ class IntentQADataset(Dataset):
                     continue
                 if (not is_train) and (not in_val):
                     continue
+
+            choices = _parse_choices_from_record(record, args.options_column)
+            if not choices:
+                dropped_no_choices += 1
+                continue
+            label = _resolve_label(record, args, choices)
+            if label is None:
+                dropped_no_label += 1
+                continue
+
             selected.append(record)
             if args.max_samples_per_split > 0 and len(selected) >= args.max_samples_per_split:
                 break
         self.records = selected
+        if dropped_no_choices or dropped_no_label:
+            split_name = "train" if is_train else "validation"
+            print(
+                f"[IntentQADataset:{split_name}] dropped {dropped_no_choices} samples with no choices "
+                f"and {dropped_no_label} samples with no valid label."
+            )
 
     def __len__(self):
         return len(self.records)
@@ -171,9 +224,7 @@ class IntentQADataset(Dataset):
         question = _normalize_text(
             _get_first(record, [self.args.question_column, "question", "prompt", "instruction", "query"])
         )
-        choices = _parse_choices(
-            _get_first(record, [self.args.options_column, "options", "choices", "answer_options"])
-        )
+        choices = _parse_choices_from_record(record, self.args.options_column)
         if not choices:
             raise RuntimeError(f"Sample {sample_id} has no answer options.")
         label = _resolve_label(record, self.args, choices)
@@ -544,7 +595,13 @@ def main():
     qa_tokenizer, qa_encoder = build_bert_encoder(args, accelerator.device)
 
     probe_loader = build_loader(args, split_name="train", batch_size=1, num_workers=0, is_train=True)
-    probe = next(iter(probe_loader))
+    try:
+        probe = next(iter(probe_loader))
+    except StopIteration as exc:
+        raise RuntimeError(
+            "No valid training samples found after filtering. "
+            "Check options/answer columns and dataset paths."
+        ) from exc
     probe_regions = extract_region_nodes(visual_backbone, probe["frames"], accelerator.device)
     probe_qa = encode_qa_features(
         qa_tokenizer,
