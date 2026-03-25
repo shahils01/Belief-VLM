@@ -123,6 +123,7 @@ def decode_mp4_frames(video_path: str, num_frames: int, start_time_sec=None, end
     clip_frame_count = max(1, end_frame - start_frame + 1)
     wanted = {start_frame + idx for idx in _sample_frame_indices(clip_frame_count, num_frames)}
     frames = []
+    bad_reads = 0
     cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
     cur = start_frame
     while True:
@@ -132,13 +133,26 @@ def decode_mp4_frames(video_path: str, num_frames: int, start_time_sec=None, end
         if cur > end_frame:
             break
         if cur in wanted:
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            frames.append(Image.fromarray(frame))
+            try:
+                if frame is None or getattr(frame, "size", 0) == 0:
+                    bad_reads += 1
+                    cur += 1
+                    continue
+                if frame.ndim == 2:
+                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
+                else:
+                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                frames.append(Image.fromarray(frame_rgb))
+            except Exception:
+                bad_reads += 1
         cur += 1
     cap.release()
 
     if not frames:
-        raise RuntimeError(f"Failed to decode any frames from {video_path}")
+        raise RuntimeError(
+            f"Failed to decode any frames from {video_path} "
+            f"(frame_count={frame_count}, fps={fps:.3f}, start={start_frame}, end={end_frame}, bad_reads={bad_reads})"
+        )
     if len(frames) < num_frames:
         frames.extend([frames[-1]] * (num_frames - len(frames)))
     return frames

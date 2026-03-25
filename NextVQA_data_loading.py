@@ -312,42 +312,57 @@ class NextVQAIntentDataset(Dataset):
         return len(self.records)
 
     def __getitem__(self, index):
-        record = self.records[index]
-        sample_id = str(_get_first(record, [self.args.id_column, "id", "qid", "sample_id", "uid"]) or index)
-        action = _normalize_text(
-            _get_first(
-                record,
-                [self.args.action_column, "action", "action_id", "verb", "lemmatized_verb"],
+        max_retry = min(8, len(self.records))
+        last_err = None
+        for attempt in range(max_retry):
+            idx = (index + attempt) % len(self.records)
+            record = self.records[idx]
+            sample_id = str(_get_first(record, [self.args.id_column, "id", "qid", "sample_id", "uid"]) or idx)
+            action = _normalize_text(
+                _get_first(
+                    record,
+                    [self.args.action_column, "action", "action_id", "verb", "lemmatized_verb"],
+                )
             )
-        )
-        question = _normalize_text(
-            _get_first(record, [self.args.question_column, "question", "prompt", "instruction", "query"])
-        )
-        choices = _parse_choices_from_record(record, self.args.options_column)
-        if not choices:
-            raise RuntimeError(f"Sample {sample_id} has no answer choices.")
-        label, answer_text = _resolve_label_and_answer(record, self.args.answer_column, choices)
-        if label is None:
-            raise RuntimeError(f"Sample {sample_id} has no valid answer index/text.")
+            question = _normalize_text(
+                _get_first(record, [self.args.question_column, "question", "prompt", "instruction", "query"])
+            )
+            choices = _parse_choices_from_record(record, self.args.options_column)
+            if not choices:
+                last_err = RuntimeError(f"Sample {sample_id} has no answer choices.")
+                continue
+            label, answer_text = _resolve_label_and_answer(record, self.args.answer_column, choices)
+            if label is None:
+                last_err = RuntimeError(f"Sample {sample_id} has no valid answer index/text.")
+                continue
 
-        video_path = _resolve_video_path(self.args, record)
-        start_time_sec, end_time_sec = _resolve_clip_window(record)
-        frames = decode_mp4_frames(
-            video_path,
-            self.args.video_frames,
-            start_time_sec=start_time_sec,
-            end_time_sec=end_time_sec,
-        )
+            try:
+                video_path = _resolve_video_path(self.args, record)
+                start_time_sec, end_time_sec = _resolve_clip_window(record)
+                frames = decode_mp4_frames(
+                    video_path,
+                    self.args.video_frames,
+                    start_time_sec=start_time_sec,
+                    end_time_sec=end_time_sec,
+                )
+            except Exception as exc:
+                last_err = exc
+                if attempt == 0:
+                    vid = _get_first(record, [self.args.video_id_column, "video_id", "vid", "video", "gif_name"])
+                    print(f"[NextVQAIntentDataset] decode failed for sample_id={sample_id} vid={vid}: {exc}")
+                continue
 
-        return IntentSample(
-            sample_id=sample_id,
-            action=action,
-            question=question,
-            choices=choices,
-            label=label,
-            answer_text=answer_text,
-            frames=frames,
-        )
+            return IntentSample(
+                sample_id=sample_id,
+                action=action,
+                question=question,
+                choices=choices,
+                label=label,
+                answer_text=answer_text,
+                frames=frames,
+            )
+
+        raise RuntimeError(f"Failed to fetch a valid sample after {max_retry} retries starting at idx={index}: {last_err}")
 
 
 def collate_intent_batch(batch: List[IntentSample]):
