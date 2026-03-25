@@ -3,6 +3,7 @@ VIDEO_ROOT="${VIDEO_ROOT:-/scratch/shahils/hd_epic_dataset/videos/HD-EPIC/Videos
 ANNOTATION_PATH="${ANNOTATION_PATH:-/scratch/shahils/hd_epic_dataset/hd-epic-annotations/vqa-benchmark/}"
 METADATA_ROOT="${METADATA_ROOT:-/scratch/shahils/hd_epic_dataset/HD-EPIC Intermediate Data}"
 VLM_CHECKPOINT="${VLM_CHECKPOINT:-/scratch/shahils/Belief-VLM/checkpoints_belief_hd_epic_ddp_07/ckpt_epoch_99.pt}"
+MAX_TRAIN_STEPS="${MAX_TRAIN_STEPS:-1000}"
 
 CMD=(
   accelerate launch --num_processes 4 train_ppo_vqa.py
@@ -18,6 +19,7 @@ CMD=(
   --mixed_precision bf16
   --allow_tf32
   --epochs 500
+  --max_train_steps "$MAX_TRAIN_STEPS"
   --ppo_epochs 10
   --policy_lr 1e-4
   --vlm_lr 2e-5

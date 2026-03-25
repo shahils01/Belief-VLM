@@ -125,6 +125,7 @@ def parse_args():
     parser.add_argument("--lora_bias", type=str, default="none", choices=["none", "all", "lora_only"])
 
     parser.add_argument("--epochs", type=int, default=3)
+    parser.add_argument("--max_train_steps", type=int, default=0)
     parser.add_argument("--policy_lr", type=float, default=1e-4)
     parser.add_argument("--vlm_lr", type=float, default=2e-5)
     parser.add_argument("--weight_decay", type=float, default=0.01)
@@ -223,6 +224,7 @@ def run_epoch(model, policy, loader, optimizer, accelerator, args, train, global
     total_entropy = 0.0
     total_examples = 0
     step = 0
+    stop_training = False
 
     for batch in loader:
         step += 1
@@ -290,6 +292,8 @@ def run_epoch(model, policy, loader, optimizer, accelerator, args, train, global
         total_policy_loss += policy_loss_value * batch_size
         total_value_loss += value_loss_value * batch_size
         total_entropy += entropy_value * batch_size
+        if train:
+            global_step += 1
 
         if args.log_every > 0 and step % args.log_every == 0:
             avg_reward = total_reward / max(total_examples, 1)
@@ -310,9 +314,13 @@ def run_epoch(model, policy, loader, optimizer, accelerator, args, train, global
                 }
                 if train:
                     metrics["train/lr"] = optimizer.param_groups[0]["lr"]
-                    accelerator.log(metrics, step=global_step + step)
+                    accelerator.log(metrics, step=global_step)
                 else:
                     accelerator.log(metrics, step=global_step)
+
+        if train and args.max_train_steps > 0 and global_step >= args.max_train_steps:
+            stop_training = True
+            break
 
     metrics = {
         "reward": total_reward / max(total_examples, 1),
@@ -320,7 +328,7 @@ def run_epoch(model, policy, loader, optimizer, accelerator, args, train, global
         "value_loss": total_value_loss / max(total_examples, 1),
         "entropy": total_entropy / max(total_examples, 1),
     }
-    return metrics, (global_step + step if train else global_step)
+    return metrics, global_step, stop_training
 
 
 def main():
@@ -448,8 +456,9 @@ def main():
             start_epoch = int(ckpt.get("epoch", -1)) + 1
             global_step = int(ckpt.get("global_step", 0))
 
-    for epoch in range(start_epoch, args.epochs):
-        train_metrics, global_step = run_epoch(
+    epoch = start_epoch
+    while epoch < args.epochs and (args.max_train_steps <= 0 or global_step < args.max_train_steps):
+        train_metrics, global_step, stop_training = run_epoch(
             model=model,
             policy=policy,
             loader=train_loader,
@@ -476,7 +485,7 @@ def main():
 
         if val_loader is not None:
             with torch.no_grad():
-                val_metrics, _ = run_epoch(
+                val_metrics, _, _ = run_epoch(
                     model=model,
                     policy=policy,
                     loader=val_loader,
@@ -519,6 +528,12 @@ def main():
                 ckpt_path,
             )
             accelerator.print(f"saved {ckpt_path}")
+
+        if stop_training:
+            accelerator.print(f"Reached max_train_steps={args.max_train_steps}. Stopping training.")
+            break
+
+        epoch += 1
 
     if args.wandb:
         accelerator.end_training()
