@@ -2,8 +2,8 @@
 set -euo pipefail
 
 DATASET_SOURCE="${DATASET_SOURCE:-hd_epic}"   # hd_epic | nextvqa
-ANNOTATION_PATH="${ANNOTATION_PATH:-/scratch/shahils/hd_epic_dataset/hd-epic-annotations/vqa-benchmark/fine_grained_why_recognition.json}"
-VIDEO_ROOT="${VIDEO_ROOT:-/scratch/shahils/hd_epic_dataset/videos/HD-EPIC/Videos}"
+ANNOTATION_PATH="${ANNOTATION_PATH:-/scratch/anshuln/NExTVQA/NExT-QA/dataset/nextqa/train.csv}"
+VIDEO_ROOT="${VIDEO_ROOT:-/scratch/anshuln/NExTVQA/NExTVideo/}"
 VL_MODEL_PRESET="${VL_MODEL_PRESET:-internvl3_5_2b}"
 
 BATCH_SIZE="${BATCH_SIZE:-2}"
