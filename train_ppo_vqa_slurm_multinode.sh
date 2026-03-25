@@ -6,9 +6,11 @@ VLM_CHECKPOINT="${VLM_CHECKPOINT:-/scratch/shahils/Belief-VLM/checkpoints_belief
 MAX_TRAIN_STEPS="${MAX_TRAIN_STEPS:-1000}"
 SAVE_EVERY_STEPS="${SAVE_EVERY_STEPS:-0}"
 EVAL_EVERY_STEPS="${EVAL_EVERY_STEPS:-0}"
-NUM_PROCESSES_PER_NODE="${NUM_PROCESSES_PER_NODE:-${SLURM_GPUS_ON_NODE:-4}}"
-NUM_MACHINES="${NUM_MACHINES:-${SLURM_NNODES:-1}}"
 MACHINE_RANK="${MACHINE_RANK:-${SLURM_NODEID:-0}}"
+NUM_PROCESSES_PER_NODE="${NUM_PROCESSES_PER_NODE:-2}"
+NUM_MACHINES="${NUM_MACHINES:-${SLURM_NNODES:-1}}"
+TOTAL_PROCESSES="$((NUM_PROCESSES_PER_NODE * NUM_MACHINES))"
+
 
 if [[ -z "${SLURM_JOB_NODELIST:-}" ]]; then
   echo "SLURM_JOB_NODELIST is not set. Run this inside a Slurm allocation." >&2
@@ -26,7 +28,7 @@ fi
 
 CMD=(
   accelerate launch
-  --num_processes "$NUM_PROCESSES_PER_NODE"
+  --num_processes "$TOTAL_PROCESSES"
   --num_machines "$NUM_MACHINES"
   --machine_rank "$MACHINE_RANK"
   --main_process_ip "$MAIN_PROCESS_IP"
@@ -38,8 +40,8 @@ CMD=(
   --annotation_path "$ANNOTATION_PATH"
   --video_extension mp4
   --val_ratio 0.1
-  --batch_size 64
-  --num_workers 4
+  --batch_size 32
+  --num_workers 0
   --video_frames 8
   --mixed_precision bf16
   --allow_tf32
@@ -47,10 +49,12 @@ CMD=(
   --max_train_steps "$MAX_TRAIN_STEPS"
   --save_every_steps "$SAVE_EVERY_STEPS"
   --eval_every_steps "$EVAL_EVERY_STEPS"
-  --ppo_epochs 10
+  --ppo_epochs 2
+  --log_every 1
   --policy_lr 1e-4
   --vlm_lr 2e-5
   --vl_model_preset "$VL_MODEL_PRESET"
+  --vl_model_name /scratch/shahils/hf_models/InternVL3_5-2B-HF
   --gradient_checkpointing
   --save_dir checkpoints_ppo_vqa_fulldataset
   --resume_checkpoint checkpoints_ppo_vqa_01/ckpt_epoch_62.pt
