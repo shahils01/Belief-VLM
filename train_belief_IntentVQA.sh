@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-DATASET_SOURCE="${DATASET_SOURCE:-hd_epic}"   # hd_epic | nextvqa
+DATASET_SOURCE="${DATASET_SOURCE:-nextvqa}"   # hd_epic | nextvqa
 ANNOTATION_PATH="${ANNOTATION_PATH:-/scratch/anshuln/NExTVQA/NExT-QA/dataset/nextqa/train.csv}"
 VIDEO_ROOT="${VIDEO_ROOT:-/scratch/anshuln/NExTVQA/NExTVideo/}"
 VL_MODEL_PRESET="${VL_MODEL_PRESET:-internvl3_5_2b}"

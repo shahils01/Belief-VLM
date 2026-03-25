@@ -180,6 +180,30 @@ def _resolve_label_and_answer(record, answer_column: str, choices: List[str]):
     return None, ""
 
 
+def _get_or_build_video_lookup(args):
+    lookup = getattr(args, "_nextvqa_video_lookup", None)
+    if lookup is not None:
+        return lookup
+
+    ext = (args.video_extension if args.video_extension else "mp4").lstrip(".")
+    pattern = os.path.join(args.video_root, "**", f"*.{ext}")
+    files = sorted(glob(pattern, recursive=True))
+
+    lookup = {}
+    for path in files:
+        base = os.path.splitext(os.path.basename(path))[0]
+        base_with_ext = os.path.basename(path)
+        rel = os.path.relpath(path, args.video_root)
+        rel_norm = rel.replace("\\", "/")
+        rel_no_ext = os.path.splitext(rel_norm)[0]
+        for key in (base, base_with_ext, rel_norm, rel_no_ext):
+            if key and key not in lookup:
+                lookup[key] = path
+
+    setattr(args, "_nextvqa_video_lookup", lookup)
+    return lookup
+
+
 def _resolve_video_path(args, record):
     direct = _get_first(record, [args.video_path_column, "video_path", "path"])
     if direct:
@@ -193,9 +217,8 @@ def _resolve_video_path(args, record):
     vid = _get_first(record, [args.video_id_column, "video_id", "vid", "video", "gif_name"])
     if vid in (None, ""):
         raise RuntimeError("Could not resolve video id/path from record.")
-    vid = str(vid)
-    ext = args.video_extension if args.video_extension else "mp4"
-    ext = ext.lstrip(".")
+    vid = str(vid).strip()
+    ext = (args.video_extension if args.video_extension else "mp4").lstrip(".")
 
     candidates = [
         os.path.join(args.video_root, f"{vid}.{ext}"),
@@ -205,7 +228,20 @@ def _resolve_video_path(args, record):
     for c in candidates:
         if os.path.isfile(c):
             return c
-    raise FileNotFoundError(f"Could not find video for id={vid}. Tried: {candidates}")
+
+    # Recursive fallback for layouts like VIDEO_ROOT/0000/*.mp4
+    lookup = _get_or_build_video_lookup(args)
+    keys = [
+        vid,
+        f"{vid}.{ext}",
+        vid.replace("\\", "/"),
+        vid.replace("\\", "/").lstrip("./"),
+    ]
+    for key in keys:
+        if key in lookup:
+            return lookup[key]
+
+    raise FileNotFoundError(f"Could not find video for id={vid}. Tried direct candidates and recursive lookup under {args.video_root}")
 
 
 def _resolve_clip_window(record):
