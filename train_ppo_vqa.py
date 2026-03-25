@@ -330,6 +330,8 @@ def main():
 
     if args.peft == "qlora" and args.fsdp:
         raise RuntimeError("FSDP + QLoRA is not supported.")
+    if args.train_vlm_with_rl and not args.ddp_find_unused_parameters:
+        args.ddp_find_unused_parameters = True
 
     args.quantization_config = _build_quant_config(args)
 
