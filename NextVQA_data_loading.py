@@ -273,7 +273,40 @@ class NextVQAIntentDataset(Dataset):
                 selected.append(record)
                 if args.max_samples_per_split > 0 and len(selected) >= args.max_samples_per_split:
                     break
-        self.records = selected
+
+        dropped_no_choices = 0
+        dropped_no_label = 0
+        dropped_no_video = 0
+        missing_video_ids = []
+        validated = []
+        for idx, record in enumerate(selected):
+            sample_id = str(_get_first(record, [args.id_column, "id", "qid", "sample_id", "uid"]) or idx)
+            choices = _parse_choices_from_record(record, args.options_column)
+            if not choices:
+                dropped_no_choices += 1
+                continue
+            label, _ = _resolve_label_and_answer(record, args.answer_column, choices)
+            if label is None:
+                dropped_no_label += 1
+                continue
+            try:
+                _resolve_video_path(args, record)
+            except FileNotFoundError:
+                dropped_no_video += 1
+                if len(missing_video_ids) < 5:
+                    vid = _get_first(record, [args.video_id_column, "video_id", "vid", "video", "gif_name"])
+                    missing_video_ids.append(str(vid) if vid is not None else sample_id)
+                continue
+            validated.append(record)
+
+        self.records = validated
+        if dropped_no_choices or dropped_no_label or dropped_no_video:
+            print(
+                f"[NextVQAIntentDataset:{split_name}] dropped {dropped_no_choices} samples with no choices, "
+                f"{dropped_no_label} with no valid label, and {dropped_no_video} with missing videos."
+            )
+            if missing_video_ids:
+                print(f"[NextVQAIntentDataset:{split_name}] example missing video ids: {missing_video_ids}")
 
     def __len__(self):
         return len(self.records)
