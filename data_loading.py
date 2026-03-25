@@ -11,7 +11,8 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from PIL import Image
-from torch.utils.data import DataLoader, IterableDataset, get_worker_info
+from torch.utils.data import DataLoader, Dataset, IterableDataset, Sampler, get_worker_info
+from torch.utils.data.distributed import DistributedSampler
 
 
 DEFAULT_PROMPT = "Describe what is happening in this egocentric video."
@@ -733,7 +734,7 @@ class LocalHD_EPICDataset(IterableDataset):
             }
 
 
-class LocalHD_EPICRLVQADataset(IterableDataset):
+class LocalHD_EPICRLVQADataset(Dataset):
     def __init__(self, records, processor, args, split_name: str, is_train: bool):
         self.processor = processor
         self.args = args
@@ -751,35 +752,13 @@ class LocalHD_EPICRLVQADataset(IterableDataset):
                 break
 
         self.task_to_records = {}
-        for record in self.records:
+        self.task_to_indices = {}
+        for record_idx, record in enumerate(self.records):
             task_name = str(record.get("task_name", "unknown"))
             self.task_to_records.setdefault(task_name, []).append(record)
+            self.task_to_indices.setdefault(task_name, []).append(record_idx)
         self.task_names = sorted(self.task_to_records.keys())
         self.samples_per_epoch = len(self.records)
-
-    def _iter_records(self):
-        indices, worker_id = _build_distributed_worker_indices(len(self.records))
-        rank, _ = _get_distributed_rank_info()
-        base_seed = int(self.args.seed) + 997 * rank + 31 * worker_id
-
-        if self.is_train and getattr(self.args, "train_sampling_mode", "task_uniform") == "task_uniform":
-            if not self.task_names or not indices:
-                return
-            generator = np.random.default_rng(base_seed)
-            num_samples = len(indices)
-            task_names = np.asarray(self.task_names, dtype=object)
-            for _ in range(num_samples):
-                task_name = str(generator.choice(task_names))
-                task_records = self.task_to_records[task_name]
-                record_idx = int(generator.integers(0, len(task_records)))
-                yield task_records[record_idx]
-            return
-
-        if self.is_train and indices:
-            generator = np.random.default_rng(base_seed)
-            generator.shuffle(indices)
-        for idx in indices:
-            yield self.records[idx]
 
     def _keep_sample(self, sample_id: str) -> bool:
         val_ratio = max(0.0, min(0.5, float(self.args.val_ratio)))
@@ -789,38 +768,74 @@ class LocalHD_EPICRLVQADataset(IterableDataset):
         in_val = fold < val_ratio
         return (not in_val) if self.is_train else in_val
 
-    def __iter__(self):
-        sample_count = 0
-        for record in self._iter_records():
-            video_path = _resolve_hd_epic_video_path(self.args, record)
-            prompt, choices, correct_idx = _build_vqa_prompt_choices(self.args, record)
-            start_time_sec, end_time_sec = _resolve_hd_epic_clip_window(record)
-            frames = decode_mp4_frames(
-                video_path,
-                self.args.video_frames,
-                start_time_sec=start_time_sec,
-                end_time_sec=end_time_sec,
-            )
-            packed = build_prompt_only_example(
-                processor=self.processor,
-                frames=frames,
-                prompt=prompt,
-                vl_backend=self.args.vl_backend,
-                max_text_len=self.args.vl_max_text_len,
-            )
+    def __len__(self):
+        return len(self.records)
 
-            sample_count += 1
-            yield {
-                "id": str(
-                    _get_first(record, [self.args.id_column, "id", "sample_id", "uid", "video_id"]) or sample_count
-                ),
-                "task_name": str(record.get("task_name", "unknown")),
-                "prompt": prompt,
-                "choices": choices,
-                "correct_idx": correct_idx,
-                "answer_text": choices[correct_idx],
-                "inputs": {k: v for k, v in packed.items() if k != "prompt_text"},
-            }
+    def __getitem__(self, index):
+        record = self.records[int(index)]
+        video_path = _resolve_hd_epic_video_path(self.args, record)
+        prompt, choices, correct_idx = _build_vqa_prompt_choices(self.args, record)
+        start_time_sec, end_time_sec = _resolve_hd_epic_clip_window(record)
+        frames = decode_mp4_frames(
+            video_path,
+            self.args.video_frames,
+            start_time_sec=start_time_sec,
+            end_time_sec=end_time_sec,
+        )
+        packed = build_prompt_only_example(
+            processor=self.processor,
+            frames=frames,
+            prompt=prompt,
+            vl_backend=self.args.vl_backend,
+            max_text_len=self.args.vl_max_text_len,
+        )
+        return {
+            "id": str(
+                _get_first(record, [self.args.id_column, "id", "sample_id", "uid", "video_id"]) or int(index)
+            ),
+            "task_name": str(record.get("task_name", "unknown")),
+            "prompt": prompt,
+            "choices": choices,
+            "correct_idx": correct_idx,
+            "answer_text": choices[correct_idx],
+            "inputs": {k: v for k, v in packed.items() if k != "prompt_text"},
+        }
+
+
+class TaskUniformDistributedSampler(Sampler):
+    def __init__(self, dataset: LocalHD_EPICRLVQADataset, seed: int, samples_per_epoch: int = 0):
+        self.dataset = dataset
+        self.seed = int(seed)
+        self.epoch = 0
+        if dist.is_available() and dist.is_initialized():
+            self.rank = dist.get_rank()
+            self.num_replicas = dist.get_world_size()
+        else:
+            self.rank = 0
+            self.num_replicas = 1
+        requested = int(samples_per_epoch) if samples_per_epoch and int(samples_per_epoch) > 0 else len(dataset)
+        self.num_samples = int(np.ceil(max(requested, 1) / max(self.num_replicas, 1)))
+        self.total_size = self.num_samples * self.num_replicas
+
+    def __iter__(self):
+        if not self.dataset.task_names:
+            return iter([])
+        generator = np.random.default_rng(self.seed + self.epoch)
+        task_names = np.asarray(self.dataset.task_names, dtype=object)
+        all_indices = []
+        for _ in range(self.total_size):
+            task_name = str(generator.choice(task_names))
+            task_indices = self.dataset.task_to_indices[task_name]
+            choice = int(generator.integers(0, len(task_indices)))
+            all_indices.append(task_indices[choice])
+        rank_indices = all_indices[self.rank:self.total_size:self.num_replicas]
+        return iter(rank_indices)
+
+    def __len__(self):
+        return self.num_samples
+
+    def set_epoch(self, epoch: int):
+        self.epoch = int(epoch)
 
 def _stack_inputs(items):
     output = {}
@@ -901,10 +916,49 @@ def build_rl_vqa_loader(args, split: str, batch_size: int, num_workers: int, is_
         split_name=split,
         is_train=is_train,
     )
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        num_workers=num_workers,
-        collate_fn=collate_rl_vqa_batch,
-        pin_memory=torch.cuda.is_available(),
-    )
+    sampler = None
+    shuffle = False
+    if is_train:
+        samples_per_epoch = getattr(args, "train_samples_per_epoch", 0)
+        if getattr(args, "train_sampling_mode", "task_uniform") == "task_uniform":
+            sampler = TaskUniformDistributedSampler(
+                dataset=dataset,
+                seed=args.seed,
+                samples_per_epoch=samples_per_epoch,
+            )
+        else:
+            rank, world_size = _get_distributed_rank_info()
+            if world_size > 1:
+                sampler = DistributedSampler(
+                    dataset,
+                    num_replicas=world_size,
+                    rank=rank,
+                    shuffle=True,
+                    seed=args.seed,
+                    drop_last=False,
+                )
+            else:
+                shuffle = True
+    else:
+        rank, world_size = _get_distributed_rank_info()
+        if world_size > 1:
+            sampler = DistributedSampler(
+                dataset,
+                num_replicas=world_size,
+                rank=rank,
+                shuffle=False,
+                drop_last=False,
+            )
+    loader_kwargs = {
+        "dataset": dataset,
+        "batch_size": batch_size,
+        "num_workers": num_workers,
+        "collate_fn": collate_rl_vqa_batch,
+        "pin_memory": torch.cuda.is_available(),
+        "sampler": sampler,
+        "shuffle": shuffle,
+    }
+    if num_workers > 0:
+        loader_kwargs["persistent_workers"] = True
+        loader_kwargs["prefetch_factor"] = 2
+    return DataLoader(**loader_kwargs)

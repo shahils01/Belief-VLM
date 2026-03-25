@@ -88,6 +88,7 @@ def parse_args():
     parser.add_argument("--options_column", type=str, default="options")
     parser.add_argument("--max_samples_per_split", type=int, default=0)
     parser.add_argument("--train_sampling_mode", type=str, default="task_uniform", choices=["flat", "task_uniform"])
+    parser.add_argument("--train_samples_per_epoch", type=int, default=0)
 
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--num_workers", type=int, default=0)
@@ -528,6 +529,14 @@ def main():
 
     epoch = start_epoch
     while epoch < args.epochs and (args.max_train_steps <= 0 or global_step < args.max_train_steps):
+        train_sampler = getattr(train_loader, "sampler", None)
+        if hasattr(train_sampler, "set_epoch"):
+            train_sampler.set_epoch(epoch)
+        if val_loader is not None:
+            val_sampler = getattr(val_loader, "sampler", None)
+            if hasattr(val_sampler, "set_epoch"):
+                val_sampler.set_epoch(epoch)
+
         def _on_step_end(step_now):
             if args.eval_every_steps > 0 and step_now > 0 and step_now % args.eval_every_steps == 0:
                 _run_validation(model, policy, val_loader, accelerator, args, step_now, prefix="val_step")

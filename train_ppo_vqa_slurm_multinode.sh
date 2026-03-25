@@ -7,6 +7,7 @@ VLM_CHECKPOINT="${VLM_CHECKPOINT:-/scratch/shahils/Belief-VLM/checkpoints_belief
 MAX_TRAIN_STEPS="${MAX_TRAIN_STEPS:-1000}"
 SAVE_EVERY_STEPS="${SAVE_EVERY_STEPS:-0}"
 EVAL_EVERY_STEPS="${EVAL_EVERY_STEPS:-0}"
+TRAIN_SAMPLES_PER_EPOCH="${TRAIN_SAMPLES_PER_EPOCH:-2048}"
 MACHINE_RANK="${MACHINE_RANK:-${SLURM_NODEID:-0}}"
 NUM_PROCESSES_PER_NODE="${NUM_PROCESSES_PER_NODE:-2}"
 NUM_MACHINES="${NUM_MACHINES:-${SLURM_NNODES:-1}}"
@@ -42,8 +43,9 @@ CMD=(
   --video_extension mp4
   --val_ratio 0.1
   --train_sampling_mode task_uniform
+  --train_samples_per_epoch "$TRAIN_SAMPLES_PER_EPOCH"
   --batch_size 32
-  --num_workers 0
+  --num_workers 8
   --video_frames 8
   --mixed_precision bf16
   --allow_tf32
@@ -72,6 +74,7 @@ echo "MAIN_PROCESS_PORT=$MAIN_PROCESS_PORT"
 echo "NUM_MACHINES=$NUM_MACHINES"
 echo "MACHINE_RANK=$MACHINE_RANK"
 echo "NUM_PROCESSES_PER_NODE=$NUM_PROCESSES_PER_NODE"
+echo "TRAIN_SAMPLES_PER_EPOCH=$TRAIN_SAMPLES_PER_EPOCH"
 echo "VL_MODEL_PRESET=$VL_MODEL_PRESET"
 echo "VL_MODEL_NAME=$VL_MODEL_NAME"
 
