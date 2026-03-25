@@ -4,6 +4,8 @@ ANNOTATION_PATH="${ANNOTATION_PATH:-/scratch/shahils/hd_epic_dataset/hd-epic-ann
 METADATA_ROOT="${METADATA_ROOT:-/scratch/shahils/hd_epic_dataset/HD-EPIC Intermediate Data}"
 VLM_CHECKPOINT="${VLM_CHECKPOINT:-/scratch/shahils/Belief-VLM/checkpoints_belief_hd_epic_ddp_07/ckpt_epoch_99.pt}"
 MAX_TRAIN_STEPS="${MAX_TRAIN_STEPS:-1000}"
+SAVE_EVERY_STEPS="${SAVE_EVERY_STEPS:-0}"
+EVAL_EVERY_STEPS="${EVAL_EVERY_STEPS:-0}"
 
 CMD=(
   accelerate launch --num_processes 4 train_ppo_vqa.py
@@ -20,6 +22,8 @@ CMD=(
   --allow_tf32
   --epochs 500
   --max_train_steps "$MAX_TRAIN_STEPS"
+  --save_every_steps "$SAVE_EVERY_STEPS"
+  --eval_every_steps "$EVAL_EVERY_STEPS"
   --ppo_epochs 10
   --policy_lr 1e-4
   --vlm_lr 2e-5

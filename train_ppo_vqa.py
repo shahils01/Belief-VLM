@@ -2,6 +2,7 @@ import argparse
 import functools
 import inspect
 import os
+import time
 from contextlib import nullcontext
 
 import torch
@@ -126,6 +127,8 @@ def parse_args():
 
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--max_train_steps", type=int, default=0)
+    parser.add_argument("--save_every_steps", type=int, default=0)
+    parser.add_argument("--eval_every_steps", type=int, default=0)
     parser.add_argument("--policy_lr", type=float, default=1e-4)
     parser.add_argument("--vlm_lr", type=float, default=2e-5)
     parser.add_argument("--weight_decay", type=float, default=0.01)
@@ -212,7 +215,7 @@ def _evaluate_policy(model, policy, loader, accelerator, args):
     return accuracy
 
 
-def run_epoch(model, policy, loader, optimizer, accelerator, args, train, global_step):
+def run_epoch(model, policy, loader, optimizer, accelerator, args, train, global_step, on_step_end=None):
     model.train(args.train_vlm_with_rl and train)
     if not args.train_vlm_with_rl:
         model.eval()
@@ -225,6 +228,7 @@ def run_epoch(model, policy, loader, optimizer, accelerator, args, train, global
     total_examples = 0
     step = 0
     stop_training = False
+    epoch_start_time = time.perf_counter()
 
     for batch in loader:
         step += 1
@@ -300,10 +304,14 @@ def run_epoch(model, policy, loader, optimizer, accelerator, args, train, global
             avg_policy_loss = total_policy_loss / max(total_examples, 1)
             avg_value_loss = total_value_loss / max(total_examples, 1)
             avg_entropy = total_entropy / max(total_examples, 1)
+            elapsed = max(time.perf_counter() - epoch_start_time, 1e-6)
+            samples_per_sec = total_examples / elapsed
+            sec_per_step = elapsed / max(step, 1)
             phase = "train" if train else "val"
             accelerator.print(
                 f"{phase} step={step} reward={avg_reward:.4f} policy_loss={avg_policy_loss:.4f} "
-                f"value_loss={avg_value_loss:.4f} entropy={avg_entropy:.4f}"
+                f"value_loss={avg_value_loss:.4f} entropy={avg_entropy:.4f} "
+                f"samples_per_sec={samples_per_sec:.2f} sec_per_step={sec_per_step:.2f}"
             )
             if args.wandb:
                 metrics = {
@@ -311,6 +319,8 @@ def run_epoch(model, policy, loader, optimizer, accelerator, args, train, global
                     f"{phase}/policy_loss": avg_policy_loss,
                     f"{phase}/value_loss": avg_value_loss,
                     f"{phase}/entropy": avg_entropy,
+                    f"{phase}/samples_per_sec": samples_per_sec,
+                    f"{phase}/sec_per_step": sec_per_step,
                 }
                 if train:
                     metrics["train/lr"] = optimizer.param_groups[0]["lr"]
@@ -318,8 +328,15 @@ def run_epoch(model, policy, loader, optimizer, accelerator, args, train, global
                 else:
                     accelerator.log(metrics, step=global_step)
 
+        if train and on_step_end is not None:
+            callback_stop = on_step_end(global_step)
+            stop_training = stop_training or bool(callback_stop)
+
         if train and args.max_train_steps > 0 and global_step >= args.max_train_steps:
             stop_training = True
+            break
+
+        if stop_training:
             break
 
     metrics = {
@@ -329,6 +346,58 @@ def run_epoch(model, policy, loader, optimizer, accelerator, args, train, global
         "entropy": total_entropy / max(total_examples, 1),
     }
     return metrics, global_step, stop_training
+
+
+def _save_checkpoint(model, policy, optimizer, accelerator, args, epoch, global_step, tag):
+    accelerator.wait_for_everyone()
+    if accelerator.is_main_process:
+        unwrapped_model = accelerator.unwrap_model(model)
+        unwrapped_policy = accelerator.unwrap_model(policy)
+        ckpt_path = os.path.join(args.save_dir, f"{tag}.pt")
+        torch.save(
+            {
+                "model": unwrapped_model.state_dict(),
+                "policy": unwrapped_policy.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "epoch": epoch,
+                "global_step": global_step,
+                "args": vars(args),
+            },
+            ckpt_path,
+        )
+        accelerator.print(f"saved {ckpt_path}")
+
+
+def _run_validation(model, policy, val_loader, accelerator, args, global_step, prefix="val"):
+    if val_loader is None:
+        return None
+    with torch.no_grad():
+        val_metrics, _, _ = run_epoch(
+            model=model,
+            policy=policy,
+            loader=val_loader,
+            optimizer=None,
+            accelerator=accelerator,
+            args=args,
+            train=False,
+            global_step=global_step,
+        )
+        val_acc = _evaluate_policy(model, policy, val_loader, accelerator, args)
+    accelerator.print(
+        f"{prefix} step={global_step} reward={val_metrics['reward']:.4f} val_acc={val_acc:.4f}"
+    )
+    if args.wandb:
+        accelerator.log(
+            {
+                f"{prefix}/reward": val_metrics["reward"],
+                f"{prefix}/policy_loss": val_metrics["policy_loss"],
+                f"{prefix}/value_loss": val_metrics["value_loss"],
+                f"{prefix}/entropy": val_metrics["entropy"],
+                f"{prefix}/accuracy": val_acc,
+            },
+            step=global_step,
+        )
+    return {"metrics": val_metrics, "accuracy": val_acc}
 
 
 def main():
@@ -458,6 +527,13 @@ def main():
 
     epoch = start_epoch
     while epoch < args.epochs and (args.max_train_steps <= 0 or global_step < args.max_train_steps):
+        def _on_step_end(step_now):
+            if args.eval_every_steps > 0 and step_now > 0 and step_now % args.eval_every_steps == 0:
+                _run_validation(model, policy, val_loader, accelerator, args, step_now, prefix="val_step")
+            if args.save_every_steps > 0 and step_now > 0 and step_now % args.save_every_steps == 0:
+                _save_checkpoint(model, policy, optimizer, accelerator, args, epoch, step_now, f"ckpt_step_{step_now}")
+            return False
+
         train_metrics, global_step, stop_training = run_epoch(
             model=model,
             policy=policy,
@@ -467,6 +543,7 @@ def main():
             args=args,
             train=True,
             global_step=global_step,
+            on_step_end=_on_step_end,
         )
         accelerator.print(
             f"epoch={epoch} train_reward={train_metrics['reward']:.4f} "
@@ -484,50 +561,20 @@ def main():
             )
 
         if val_loader is not None:
-            with torch.no_grad():
-                val_metrics, _, _ = run_epoch(
-                    model=model,
-                    policy=policy,
-                    loader=val_loader,
-                    optimizer=optimizer,
-                    accelerator=accelerator,
-                    args=args,
-                    train=False,
-                    global_step=global_step,
-                )
-                val_acc = _evaluate_policy(model, policy, val_loader, accelerator, args)
-            accelerator.print(
-                f"epoch={epoch} val_reward={val_metrics['reward']:.4f} val_acc={val_acc:.4f}"
-            )
-            if args.wandb:
+            val_result = _run_validation(model, policy, val_loader, accelerator, args, global_step, prefix="val_epoch")
+            if args.wandb and val_result is not None:
                 accelerator.log(
                     {
-                        "val/epoch_reward": val_metrics["reward"],
-                        "val/epoch_policy_loss": val_metrics["policy_loss"],
-                        "val/epoch_value_loss": val_metrics["value_loss"],
-                        "val/epoch_entropy": val_metrics["entropy"],
-                        "val/accuracy": val_acc,
+                        "val/epoch_reward": val_result["metrics"]["reward"],
+                        "val/epoch_policy_loss": val_result["metrics"]["policy_loss"],
+                        "val/epoch_value_loss": val_result["metrics"]["value_loss"],
+                        "val/epoch_entropy": val_result["metrics"]["entropy"],
+                        "val/accuracy": val_result["accuracy"],
                     },
                     step=global_step,
                 )
 
-        accelerator.wait_for_everyone()
-        if accelerator.is_main_process:
-            unwrapped_model = accelerator.unwrap_model(model)
-            unwrapped_policy = accelerator.unwrap_model(policy)
-            ckpt_path = os.path.join(args.save_dir, f"ckpt_epoch_{epoch}.pt")
-            torch.save(
-                {
-                    "model": unwrapped_model.state_dict(),
-                    "policy": unwrapped_policy.state_dict(),
-                    "optimizer": optimizer.state_dict(),
-                    "epoch": epoch,
-                    "global_step": global_step,
-                    "args": vars(args),
-                },
-                ckpt_path,
-            )
-            accelerator.print(f"saved {ckpt_path}")
+        _save_checkpoint(model, policy, optimizer, accelerator, args, epoch, global_step, f"ckpt_epoch_{epoch}")
 
         if stop_training:
             accelerator.print(f"Reached max_train_steps={args.max_train_steps}. Stopping training.")
