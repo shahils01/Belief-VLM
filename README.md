@@ -79,5 +79,4 @@ The loader is configurable with:
 ## Notes
 
 - HD-EPIC intermediate metadata alone is not benchmark supervision, but it is enough to create a structured text target and train the VLM pipeline end-to-end.
-- The metadata fallback is a bootstrapping mode, not the final belief-modeling objective.
 - InternVL is the default backbone now.

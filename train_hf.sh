@@ -21,4 +21,4 @@ accelerate launch --num_processes 2 train.py \
   --vl_model_preset "$VL_MODEL_PRESET" \
   --peft qlora \
   --gradient_checkpointing \
-  --save_dir checkpoints_belief_hd_epic_hf
+  --save_dir checkpoints_vlm_hd_epic_hf

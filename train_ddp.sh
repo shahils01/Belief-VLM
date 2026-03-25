@@ -8,9 +8,6 @@ VIDEO_ID_COLUMN="${VIDEO_ID_COLUMN:-video_id}"
 PARTICIPANT_COLUMN="${PARTICIPANT_COLUMN:-participant_id}"
 DEBUG_GENERATE="${DEBUG_GENERATE:-0}"
 DEBUG_GENERATE_EVERY="${DEBUG_GENERATE_EVERY:-0}"
-USE_FUTURE_PREDICTOR="${USE_FUTURE_PREDICTOR:-1}"
-FUTURE_PREDICTOR_CHECKPOINT="${FUTURE_PREDICTOR_CHECKPOINT:-/scratch/shahils/Belief-VLM/checkpoints_future_predictor/ckpt_epoch_19.pt}"
-FUTURE_FRAMES="${FUTURE_FRAMES:-8}"
 
 CMD=(
   accelerate launch --num_processes 4 train.py
@@ -34,18 +31,14 @@ CMD=(
   --log_every 1
   --vl_model_preset "$VL_MODEL_PRESET"
   --gradient_checkpointing
-  --save_dir checkpoints_belief_hd_epic_ddp_bundles
-  --resume_checkpoint "/scratch/shahils/Belief-VLM/checkpoints_belief_hd_epic_ddp_bundles/ckpt_epoch_24.pt"
+  --save_dir checkpoints_vlm_hd_epic_ddp
+  --resume_checkpoint "/scratch/shahils/Belief-VLM/checkpoints_vlm_hd_epic_ddp/ckpt_epoch_24.pt"
   --load_model_only
   --wandb
 )
 
 if [[ "$DEBUG_GENERATE" == "1" ]]; then
   CMD+=(--debug_generate --debug_generate_every "$DEBUG_GENERATE_EVERY")
-fi
-
-if [[ "$USE_FUTURE_PREDICTOR" == "1" ]]; then
-  CMD+=(--use_future_predictor --future_predictor_checkpoint "$FUTURE_PREDICTOR_CHECKPOINT" --future_frames "$FUTURE_FRAMES")
 fi
 
 "${CMD[@]}"

@@ -7,4 +7,4 @@ python train.py \
   --video_frames 8 \
   --epochs 1 \
   --vl_model_preset internvl3_5_1b \
-  --save_dir checkpoints_belief_hd_epic_local
+  --save_dir checkpoints_vlm_hd_epic_local

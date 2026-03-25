@@ -22,4 +22,4 @@ accelerate launch --num_processes 4 train.py \
   --peft lora \
   --gradient_checkpointing \
   --fsdp \
-  --save_dir checkpoints_belief_hd_epic_fsdp
+  --save_dir checkpoints_vlm_hd_epic_fsdp

@@ -32,7 +32,7 @@ except Exception:
     size_based_auto_wrap_policy = None
 
 from data_loading import build_train_loader
-from model import ModelConfig, MultimodalBeliefModel
+from model import ModelConfig, MultimodalVLMModel
 
 
 def parse_args():
@@ -97,10 +97,6 @@ def parse_args():
     parser.add_argument("--vl_dtype", type=str, default="bfloat16", choices=["float16", "bfloat16", "float32"])
     parser.add_argument("--vl_max_text_len", type=int, default=256)
     parser.add_argument("--freeze_vl", action="store_true")
-    parser.add_argument("--use_future_predictor", action="store_true")
-    parser.add_argument("--future_predictor_checkpoint", type=str, default="")
-    parser.add_argument("--future_frames", type=int, default=0)
-
     parser.add_argument("--peft", type=str, default="none", choices=["none", "lora", "qlora"])
     parser.add_argument("--lora_r", type=int, default=16)
     parser.add_argument("--lora_alpha", type=int, default=32)
@@ -113,7 +109,7 @@ def parse_args():
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--log_every", type=int, default=20)
-    parser.add_argument("--save_dir", type=str, default="checkpoints_belief_sft")
+    parser.add_argument("--save_dir", type=str, default="checkpoints_vlm_sft")
     parser.add_argument("--resume_checkpoint", type=str, default="")
     parser.add_argument("--load_model_only", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
@@ -122,7 +118,7 @@ def parse_args():
     parser.add_argument("--debug_generate_every", type=int, default=0)
 
     parser.add_argument("--wandb", action="store_true")
-    parser.add_argument("--wandb_project", type=str, default="belief-vlm")
+    parser.add_argument("--wandb_project", type=str, default="vlm")
     parser.add_argument("--wandb_entity", type=str, default="")
     parser.add_argument("--wandb_run_name", type=str, default="")
     parser.add_argument("--wandb_tags", type=str, default="")
@@ -185,12 +181,8 @@ def build_model(args, device):
         freeze_vl=args.freeze_vl,
         quantization_config=getattr(args, "quantization_config", None),
         use_cache=not args.disable_vl_cache,
-        future_predictor_checkpoint=args.future_predictor_checkpoint if args.use_future_predictor else "",
-        future_predictor_bundle=getattr(args, "future_predictor_bundle", None) if args.use_future_predictor else None,
-        future_context_frames=args.video_frames if args.use_future_predictor else 0,
-        future_frames=args.future_frames if args.use_future_predictor else 0,
     )
-    return MultimodalBeliefModel(cfg, device=device)
+    return MultimodalVLMModel(cfg, device=device)
 
 
 def _configure_memory_optimizations(model, args):
@@ -238,21 +230,6 @@ def _load_checkpoint_state(model, ckpt_state, accelerator):
             f"missing_keys={len(getattr(incompatible, 'missing_keys', []))} "
             f"unexpected_keys={len(getattr(incompatible, 'unexpected_keys', []))}"
         )
-
-
-def _restore_bundled_future_predictor_args(args, ckpt):
-    if not isinstance(ckpt, dict):
-        return
-    bundle = ckpt.get("future_predictor")
-    if bundle is None:
-        return
-    args.use_future_predictor = True
-    if not getattr(args, "future_predictor_checkpoint", ""):
-        args.future_predictor_bundle = bundle
-    bundle_args = bundle.get("args", {})
-    if int(getattr(args, "future_frames", 0) or 0) <= 0:
-        args.future_frames = int(bundle_args.get("future_frames", args.future_frames or 0))
-
 
 
 def run_epoch(model, loader, optimizer, accelerator, args, train, global_step):
@@ -314,19 +291,11 @@ def main():
     args = parse_args()
     _resolve_vl_model_preset(args)
     os.makedirs(args.save_dir, exist_ok=True)
-    if args.use_future_predictor:
-        if not args.future_predictor_checkpoint:
-            raise RuntimeError("--use_future_predictor requires --future_predictor_checkpoint.")
-        if args.future_frames <= 0:
-            raise RuntimeError("--use_future_predictor requires --future_frames > 0.")
 
     if args.detect_anomaly:
         torch.autograd.set_detect_anomaly(True)
     if args.peft == "qlora" and args.fsdp:
         raise RuntimeError("FSDP + QLoRA is not supported.")
-    if args.use_future_predictor and not args.ddp_find_unused_parameters:
-        args.ddp_find_unused_parameters = True
-        print("Enabling DDP find_unused_parameters for future-conditioned training.")
 
     if args.peft == "qlora":
         try:
@@ -415,7 +384,6 @@ def main():
     resume_ckpt = None
     if args.resume_checkpoint:
         resume_ckpt = torch.load(args.resume_checkpoint, map_location="cpu")
-        _restore_bundled_future_predictor_args(args, resume_ckpt)
 
     model = build_model(args, device=accelerator.device)
     model = _apply_peft(model, args)
@@ -485,7 +453,6 @@ def main():
                     "epoch": epoch,
                     "global_step": global_step,
                     "args": vars(args),
-                    "future_predictor": unwrapped.export_future_predictor_bundle(),
                 },
                 ckpt_path,
             )

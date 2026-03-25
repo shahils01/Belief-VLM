@@ -10,7 +10,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
-from torch.utils.data import DataLoader, Dataset, IterableDataset, get_worker_info
+from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
 
 DEFAULT_PROMPT = "Describe what is happening in this egocentric video."
@@ -470,21 +470,6 @@ def _resolve_hd_epic_clip_window(record):
     return _parse_timecode_seconds(start_time), _parse_timecode_seconds(end_time)
 
 
-def _resolve_hd_epic_future_window(record, future_offset_sec: float, future_duration_sec: float):
-    start_time_sec, end_time_sec = _resolve_hd_epic_clip_window(record)
-    if end_time_sec is None:
-        raise RuntimeError("Future prediction requires annotation records with clip end times.")
-    current_duration = 0.0
-    if start_time_sec is not None:
-        current_duration = max(0.0, end_time_sec - start_time_sec)
-    duration = future_duration_sec if future_duration_sec > 0 else current_duration
-    if duration <= 0:
-        duration = 1.0
-    future_start = end_time_sec + max(0.0, future_offset_sec)
-    future_end = future_start + duration
-    return future_start, future_end
-
-
 def _build_prompt_answer(args, record):
     prompt = _get_first(record, [args.question_column, "question", "prompt", "instruction", "query"])
     answer = _get_first(record, [args.answer_column, "answer", "response", "label", "caption", "narration"])
@@ -638,69 +623,6 @@ class LocalHD_EPICDataset(IterableDataset):
                 "labels": packed["labels"],
             }
 
-
-class HD_EPICFuturePredictionDataset(Dataset):
-    def __init__(self, records, args, split_name: str, is_train: bool):
-        self.args = args
-        selected = []
-        for idx, record in enumerate(records):
-            sample_id = str(_get_first(record, [args.id_column, "id", "sample_id", "uid", "video_id"]) or idx)
-            val_ratio = max(0.0, min(0.5, float(args.val_ratio)))
-            if val_ratio > 0.0:
-                fold = _stable_fold(sample_id, args.seed)
-                in_val = fold < val_ratio
-                if is_train and in_val:
-                    continue
-                if (not is_train) and (not in_val):
-                    continue
-            selected.append(record)
-            if args.max_samples_per_split > 0 and len(selected) >= args.max_samples_per_split:
-                break
-        self.records = selected
-        self.split_name = split_name
-        self.is_train = is_train
-
-    def __len__(self):
-        return len(self.records)
-
-    def __getitem__(self, index):
-        record = self.records[index]
-        video_path = _resolve_hd_epic_video_path(self.args, record)
-        context_start_sec, context_end_sec = _resolve_hd_epic_clip_window(record)
-        future_start_sec, future_end_sec = _resolve_hd_epic_future_window(
-            record,
-            future_offset_sec=self.args.future_offset_sec,
-            future_duration_sec=self.args.future_duration_sec,
-        )
-        context_frames = decode_mp4_frames(
-            video_path,
-            self.args.video_frames,
-            start_time_sec=context_start_sec,
-            end_time_sec=context_end_sec,
-        )
-        future_frames = decode_mp4_frames(
-            video_path,
-            self.args.future_frames,
-            start_time_sec=future_start_sec,
-            end_time_sec=future_end_sec,
-        )
-        return {
-            "id": str(_get_first(record, [self.args.id_column, "id", "sample_id", "uid", "video_id"]) or index),
-            "task_name": str(record.get("task_name", "unknown")),
-            "video_path": video_path,
-            "context_frames": context_frames,
-            "future_frames": future_frames,
-            "context_window": torch.tensor(
-                [context_start_sec or 0.0, context_end_sec or 0.0],
-                dtype=torch.float32,
-            ),
-            "future_window": torch.tensor(
-                [future_start_sec or 0.0, future_end_sec or 0.0],
-                dtype=torch.float32,
-            ),
-        }
-
-
 def _stack_inputs(items):
     output = {}
     for key in items[0].keys():
@@ -732,20 +654,6 @@ def collate_sft_batch(batch):
         "inputs": _stack_inputs([item["inputs"] for item in batch]),
         "labels": torch.stack(labels, dim=0),
     }
-
-
-def collate_future_batch(batch):
-    return {
-        "ids": [item["id"] for item in batch],
-        "task_names": [item["task_name"] for item in batch],
-        "video_paths": [item["video_path"] for item in batch],
-        "context_frames": [item["context_frames"] for item in batch],
-        "future_frames": [item["future_frames"] for item in batch],
-        "context_window": torch.stack([item["context_window"] for item in batch], dim=0),
-        "future_window": torch.stack([item["future_window"] for item in batch], dim=0),
-    }
-
-
 def build_train_loader(args, split: str, batch_size: int, num_workers: int, is_train: bool):
     processor = build_vlm_processor(args)
 
@@ -765,18 +673,5 @@ def build_train_loader(args, split: str, batch_size: int, num_workers: int, is_t
         batch_size=batch_size,
         num_workers=num_workers,
         collate_fn=collate_sft_batch,
-        pin_memory=torch.cuda.is_available(),
-    )
-
-
-def build_future_prediction_loader(args, split: str, batch_size: int, num_workers: int, is_train: bool):
-    records = _load_records(args)
-    dataset = HD_EPICFuturePredictionDataset(records=records, args=args, split_name=split, is_train=is_train)
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        num_workers=num_workers,
-        shuffle=is_train,
-        collate_fn=collate_future_batch,
         pin_memory=torch.cuda.is_available(),
     )
