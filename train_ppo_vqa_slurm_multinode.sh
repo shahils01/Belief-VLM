@@ -1,4 +1,5 @@
-VL_MODEL_PRESET="${VL_MODEL_PRESET:-internvl3_5_2b}"
+VL_MODEL_PRESET="${VL_MODEL_PRESET:-custom}"
+VL_MODEL_NAME="${VL_MODEL_NAME:-/scratch/shahils/hf_models/InternVL3_5-2B-HF}"
 VIDEO_ROOT="${VIDEO_ROOT:-/scratch/shahils/hd_epic_dataset/videos/HD-EPIC/Videos}"
 ANNOTATION_PATH="${ANNOTATION_PATH:-/scratch/shahils/hd_epic_dataset/hd-epic-annotations/vqa-benchmark/}"
 METADATA_ROOT="${METADATA_ROOT:-/scratch/shahils/hd_epic_dataset/HD-EPIC Intermediate Data}"
@@ -54,7 +55,7 @@ CMD=(
   --policy_lr 1e-4
   --vlm_lr 2e-5
   --vl_model_preset "$VL_MODEL_PRESET"
-  --vl_model_name /scratch/shahils/hf_models/InternVL3_5-2B-HF
+  --vl_model_name "$VL_MODEL_NAME"
   --gradient_checkpointing
   --save_dir checkpoints_ppo_vqa_fulldataset
   --resume_checkpoint checkpoints_ppo_vqa_01/ckpt_epoch_62.pt
@@ -70,5 +71,7 @@ echo "MAIN_PROCESS_PORT=$MAIN_PROCESS_PORT"
 echo "NUM_MACHINES=$NUM_MACHINES"
 echo "MACHINE_RANK=$MACHINE_RANK"
 echo "NUM_PROCESSES_PER_NODE=$NUM_PROCESSES_PER_NODE"
+echo "VL_MODEL_PRESET=$VL_MODEL_PRESET"
+echo "VL_MODEL_NAME=$VL_MODEL_NAME"
 
 "${CMD[@]}"
