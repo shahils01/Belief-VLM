@@ -41,6 +41,7 @@ CMD=(
   --annotation_path "$ANNOTATION_PATH"
   --video_extension mp4
   --val_ratio 0.1
+  --train_sampling_mode task_uniform
   --batch_size 32
   --num_workers 0
   --video_frames 8

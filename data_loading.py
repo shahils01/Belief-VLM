@@ -735,16 +735,48 @@ class LocalHD_EPICDataset(IterableDataset):
 
 class LocalHD_EPICRLVQADataset(IterableDataset):
     def __init__(self, records, processor, args, split_name: str, is_train: bool):
-        self.records = records
         self.processor = processor
         self.args = args
         self.split_name = split_name
         self.is_train = is_train
+        self.records = []
+        for idx, record in enumerate(records):
+            sample_id = str(
+                _get_first(record, [args.id_column, "id", "sample_id", "uid", "video_id"]) or idx
+            )
+            if not self._keep_sample(sample_id):
+                continue
+            self.records.append(record)
+            if args.max_samples_per_split > 0 and len(self.records) >= args.max_samples_per_split:
+                break
+
+        self.task_to_records = {}
+        for record in self.records:
+            task_name = str(record.get("task_name", "unknown"))
+            self.task_to_records.setdefault(task_name, []).append(record)
+        self.task_names = sorted(self.task_to_records.keys())
+        self.samples_per_epoch = len(self.records)
 
     def _iter_records(self):
         indices, worker_id = _build_distributed_worker_indices(len(self.records))
+        rank, _ = _get_distributed_rank_info()
+        base_seed = int(self.args.seed) + 997 * rank + 31 * worker_id
+
+        if self.is_train and getattr(self.args, "train_sampling_mode", "task_uniform") == "task_uniform":
+            if not self.task_names or not indices:
+                return
+            generator = np.random.default_rng(base_seed)
+            num_samples = len(indices)
+            task_names = np.asarray(self.task_names, dtype=object)
+            for _ in range(num_samples):
+                task_name = str(generator.choice(task_names))
+                task_records = self.task_to_records[task_name]
+                record_idx = int(generator.integers(0, len(task_records)))
+                yield task_records[record_idx]
+            return
+
         if self.is_train and indices:
-            generator = np.random.default_rng(self.args.seed + worker_id)
+            generator = np.random.default_rng(base_seed)
             generator.shuffle(indices)
         for idx in indices:
             yield self.records[idx]
@@ -760,14 +792,6 @@ class LocalHD_EPICRLVQADataset(IterableDataset):
     def __iter__(self):
         sample_count = 0
         for record in self._iter_records():
-            sample_id = str(
-                _get_first(record, [self.args.id_column, "id", "sample_id", "uid", "video_id"]) or sample_count
-            )
-            if not self._keep_sample(sample_id):
-                continue
-            if self.args.max_samples_per_split > 0 and sample_count >= self.args.max_samples_per_split:
-                break
-
             video_path = _resolve_hd_epic_video_path(self.args, record)
             prompt, choices, correct_idx = _build_vqa_prompt_choices(self.args, record)
             start_time_sec, end_time_sec = _resolve_hd_epic_clip_window(record)
@@ -787,7 +811,9 @@ class LocalHD_EPICRLVQADataset(IterableDataset):
 
             sample_count += 1
             yield {
-                "id": sample_id,
+                "id": str(
+                    _get_first(record, [self.args.id_column, "id", "sample_id", "uid", "video_id"]) or sample_count
+                ),
                 "task_name": str(record.get("task_name", "unknown")),
                 "prompt": prompt,
                 "choices": choices,
