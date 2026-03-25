@@ -1,12 +1,12 @@
-CHECKPOINT="${CHECKPOINT:-/scratch/shahils/Belief-VLM/checkpoints_ppo_vqa/ckpt_epoch_0.pt}"
+CHECKPOINT="${CHECKPOINT:-/scratch/shahils/Belief-VLM/checkpoints_ppo_vqa_01/ckpt_epoch_59.pt}"
 EVAL_MODE="${EVAL_MODE:-ppo}"
-ANNOTATION_PATH="${ANNOTATION_PATH:-/scratch/shahils/hd_epic_dataset/hd-epic-annotations/vqa-benchmark/fine_grained_why_recognition.json}"
+ANNOTATION_PATH="${ANNOTATION_PATH:-/scratch/shahils/hd_epic_dataset/hd-epic-annotations/vqa-benchmark/fine_grained_how_recognition.json}"
 VIDEO_ROOT="${VIDEO_ROOT:-/scratch/shahils/hd_epic_dataset/videos/HD-EPIC/Videos}"
 MAX_SAMPLES="${MAX_SAMPLES:-0}"
 PRINT_SAMPLES="${PRINT_SAMPLES:-10}"
 PROGRESS_EVERY="${PROGRESS_EVERY:-50}"
 SAVE_PREDICTIONS="${SAVE_PREDICTIONS:-}"
-VAL_RATIO="${VAL_RATIO:-}"
+VAL_RATIO="${VAL_RATIO:-0.1}"
 
 CMD=(
   python eval_ppo_vqa.py
