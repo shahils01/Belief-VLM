@@ -240,6 +240,71 @@ def build_sft_example(processor, frames, prompt, answer, vl_backend, max_text_le
     return packed
 
 
+def build_prompt_only_example(processor, frames, prompt, vl_backend, max_text_len):
+    tokenizer = getattr(processor, "tokenizer", None)
+    if tokenizer is None:
+        raise RuntimeError("The selected processor does not expose a tokenizer.")
+
+    prompt_text = f"User: {prompt}\nAssistant:"
+
+    def _add_media_token(text: str) -> str:
+        vocab = tokenizer.get_vocab()
+        if any(token in text for token in ("<video>", "<image>", "<img>")):
+            return text
+        if vl_backend == "internvl":
+            for token in ("<video>", "<image>", "<img>"):
+                if token in vocab:
+                    return f"{token}\n{text}"
+        if "<video>" in vocab:
+            return f"<video>\n{text}"
+        if "<image>" in vocab:
+            return f"<image>\n{text}"
+        return text
+
+    if vl_backend == "internvl" and hasattr(processor, "apply_chat_template"):
+        user_message = {
+            "role": "user",
+            "content": [
+                {"type": "video"},
+                {"type": "text", "text": prompt},
+            ],
+        }
+        prompt_with_media = processor.apply_chat_template(
+            [user_message],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+    else:
+        prompt_with_media = _add_media_token(prompt_text)
+
+    try:
+        processor_kwargs = {
+            "text": [prompt_with_media],
+            "videos": [frames],
+            "return_tensors": "pt",
+            "padding": "longest",
+            "truncation": False,
+        }
+        inputs = processor(**processor_kwargs)
+    except TypeError:
+        processor_kwargs = {
+            "text": [prompt_with_media],
+            "images": [frames],
+            "return_tensors": "pt",
+            "padding": "longest",
+            "truncation": False,
+        }
+        inputs = processor(**processor_kwargs)
+
+    packed = {}
+    for key, value in dict(inputs).items():
+        if torch.is_tensor(value) and value.dim() > 0 and value.shape[0] == 1:
+            value = value.squeeze(0)
+        packed[key] = value
+    packed["prompt_text"] = prompt_text
+    return packed
+
+
 def _stable_fold(value: str, seed: int) -> float:
     digest = hashlib.md5(f"{seed}:{value}".encode("utf-8")).hexdigest()
     return int(digest[:8], 16) / 0xFFFFFFFF
@@ -501,6 +566,28 @@ def _build_prompt_answer(args, record):
     return prompt, answer
 
 
+def _build_vqa_prompt_choices(args, record):
+    prompt = _get_first(record, [args.question_column, "question", "prompt", "instruction", "query"])
+    prompt = _normalize_text(prompt) or DEFAULT_PROMPT
+    choices = _get_first(record, [args.options_column, "options", "choices", "answer_options"])
+    if not isinstance(choices, (list, tuple)) or not choices:
+        raise RuntimeError("RL VQA training expects multiple-choice records with a choices/options field.")
+    choices = [_normalize_text(choice) for choice in choices]
+    options_text = _normalize_text(choices)
+    if options_text:
+        prompt = f"{prompt}\nOptions:\n{options_text}"
+
+    correct_idx = _get_first(record, ["correct_idx", "answer_idx", "label_idx"])
+    if correct_idx in (None, ""):
+        raise RuntimeError("RL VQA training expects records with correct_idx/answer_idx/label_idx.")
+    correct_idx = int(correct_idx)
+    if 1 <= correct_idx <= len(choices):
+        correct_idx -= 1
+    if correct_idx < 0 or correct_idx >= len(choices):
+        raise RuntimeError(f"Choice index {correct_idx} is out of range for {len(choices)} choices.")
+    return prompt, choices, correct_idx
+
+
 def _round_list(values, ndigits=3):
     return [round(float(v), ndigits) for v in values]
 
@@ -623,6 +710,73 @@ class LocalHD_EPICDataset(IterableDataset):
                 "labels": packed["labels"],
             }
 
+
+class LocalHD_EPICRLVQADataset(IterableDataset):
+    def __init__(self, records, processor, args, split_name: str, is_train: bool):
+        self.records = records
+        self.processor = processor
+        self.args = args
+        self.split_name = split_name
+        self.is_train = is_train
+
+    def _iter_records(self):
+        worker = get_worker_info()
+        worker_id = worker.id if worker is not None else 0
+        num_workers = worker.num_workers if worker is not None else 1
+        indices = list(range(worker_id, len(self.records), num_workers))
+        if self.is_train and indices:
+            generator = np.random.default_rng(self.args.seed + worker_id)
+            generator.shuffle(indices)
+        for idx in indices:
+            yield self.records[idx]
+
+    def _keep_sample(self, sample_id: str) -> bool:
+        val_ratio = max(0.0, min(0.5, float(self.args.val_ratio)))
+        if val_ratio == 0.0:
+            return self.is_train or self.split_name != self.args.val_split
+        fold = _stable_fold(sample_id, self.args.seed)
+        in_val = fold < val_ratio
+        return (not in_val) if self.is_train else in_val
+
+    def __iter__(self):
+        sample_count = 0
+        for record in self._iter_records():
+            sample_id = str(
+                _get_first(record, [self.args.id_column, "id", "sample_id", "uid", "video_id"]) or sample_count
+            )
+            if not self._keep_sample(sample_id):
+                continue
+            if self.args.max_samples_per_split > 0 and sample_count >= self.args.max_samples_per_split:
+                break
+
+            video_path = _resolve_hd_epic_video_path(self.args, record)
+            prompt, choices, correct_idx = _build_vqa_prompt_choices(self.args, record)
+            start_time_sec, end_time_sec = _resolve_hd_epic_clip_window(record)
+            frames = decode_mp4_frames(
+                video_path,
+                self.args.video_frames,
+                start_time_sec=start_time_sec,
+                end_time_sec=end_time_sec,
+            )
+            packed = build_prompt_only_example(
+                processor=self.processor,
+                frames=frames,
+                prompt=prompt,
+                vl_backend=self.args.vl_backend,
+                max_text_len=self.args.vl_max_text_len,
+            )
+
+            sample_count += 1
+            yield {
+                "id": sample_id,
+                "task_name": str(record.get("task_name", "unknown")),
+                "prompt": prompt,
+                "choices": choices,
+                "correct_idx": correct_idx,
+                "answer_text": choices[correct_idx],
+                "inputs": {k: v for k, v in packed.items() if k != "prompt_text"},
+            }
+
 def _stack_inputs(items):
     output = {}
     for key in items[0].keys():
@@ -654,6 +808,21 @@ def collate_sft_batch(batch):
         "inputs": _stack_inputs([item["inputs"] for item in batch]),
         "labels": torch.stack(labels, dim=0),
     }
+
+
+def collate_rl_vqa_batch(batch):
+    return {
+        "ids": [item["id"] for item in batch],
+        "task_names": [item["task_name"] for item in batch],
+        "prompts": [item["prompt"] for item in batch],
+        "choices": [item["choices"] for item in batch],
+        "correct_idx": torch.tensor([item["correct_idx"] for item in batch], dtype=torch.long),
+        "answer_text": [item["answer_text"] for item in batch],
+        "num_choices": torch.tensor([len(item["choices"]) for item in batch], dtype=torch.long),
+        "inputs": _stack_inputs([item["inputs"] for item in batch]),
+    }
+
+
 def build_train_loader(args, split: str, batch_size: int, num_workers: int, is_train: bool):
     processor = build_vlm_processor(args)
 
@@ -673,5 +842,24 @@ def build_train_loader(args, split: str, batch_size: int, num_workers: int, is_t
         batch_size=batch_size,
         num_workers=num_workers,
         collate_fn=collate_sft_batch,
+        pin_memory=torch.cuda.is_available(),
+    )
+
+
+def build_rl_vqa_loader(args, split: str, batch_size: int, num_workers: int, is_train: bool):
+    processor = build_vlm_processor(args)
+    records = _load_records(args)
+    dataset = LocalHD_EPICRLVQADataset(
+        records=records,
+        processor=processor,
+        args=args,
+        split_name=split,
+        is_train=is_train,
+    )
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        collate_fn=collate_rl_vqa_batch,
         pin_memory=torch.cuda.is_available(),
     )

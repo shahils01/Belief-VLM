@@ -170,6 +170,33 @@ class MultimodalVLMModel(nn.Module):
         self.cfg = cfg
         self.backbone = InternVLBackbone(cfg, device=device)
 
+    def encode_inputs(self, inputs, pooling: str = "last"):
+        model_inputs = self.backbone._move_inputs_to_device(inputs)
+        outputs = self.backbone.model(
+            **model_inputs,
+            return_dict=True,
+            output_hidden_states=True,
+            use_cache=False,
+        )
+        hidden_states = getattr(outputs, "hidden_states", None)
+        if not hidden_states:
+            raise RuntimeError("The selected VLM backend did not return hidden states.")
+        sequence_hidden = hidden_states[-1]
+        attention_mask = model_inputs.get("attention_mask")
+        if attention_mask is None:
+            pooled = sequence_hidden[:, -1, :]
+        elif pooling == "mean":
+            weights = attention_mask.to(sequence_hidden.device, dtype=sequence_hidden.dtype).unsqueeze(-1)
+            pooled = (sequence_hidden * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1.0)
+        else:
+            last_indices = attention_mask.sum(dim=1).long().clamp_min(1) - 1
+            pooled = sequence_hidden[torch.arange(sequence_hidden.size(0), device=sequence_hidden.device), last_indices]
+        return {
+            "pooled_state": pooled,
+            "sequence_hidden": sequence_hidden,
+            "attention_mask": attention_mask,
+        }
+
     def forward(self, inputs, labels=None):
         model_inputs = self.backbone._move_inputs_to_device(inputs)
         forward_kwargs = {"return_dict": True}
