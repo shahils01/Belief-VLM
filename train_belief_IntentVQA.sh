@@ -41,5 +41,6 @@ accelerate launch --num_processes 1 train_belief_IntentVQA.py \
   --mixed_precision bf16 \
   --allow_tf32 \
   --gradient_checkpointing \
-  --save_dir "$SAVE_DIR"
+  --save_dir "$SAVE_DIR" \
+  --wandb
 
