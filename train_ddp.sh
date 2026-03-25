@@ -12,7 +12,7 @@ USE_BELIEF_MODEL="${USE_BELIEF_MODEL:-1}"
 BELIEF_NUM_TOKENS="${BELIEF_NUM_TOKENS:-4}"
 
 CMD=(
-  accelerate launch --num_processes 6 train.py
+  accelerate launch --num_processes 1 train.py
   --dataset_type hd_epic_local
   --video_root "$VIDEO_ROOT"
   --metadata_root "$METADATA_ROOT"
@@ -22,9 +22,10 @@ CMD=(
   --answer_column "$ANSWER_COLUMN"
   --video_id_column "$VIDEO_ID_COLUMN"
   --participant_column "$PARTICIPANT_COLUMN"
-  --val_ratio 0.1
-  --batch_size 2
-  --num_workers 4
+  --val_ratio 0.01
+  --lr 1e-4
+  --batch_size 1
+  --num_workers 0
   --video_frames 8
   --grad_accum_steps 32
   --mixed_precision bf16
@@ -40,12 +41,9 @@ CMD=(
   --belief_aux_loss_weight 0.25
   --choice_micro_batch_size 2
   --lr_scheduler cosine
+  --peft qlora
   --warmup_ratio 0.03
   --save_best_metric val_mc_acc
-  --peft qlora
-  --lora_r 16
-  --lora_alpha 32
-  --lora_dropout 0.05
   --vl_model_preset "$VL_MODEL_PRESET"
   --gradient_checkpointing
   --save_dir checkpoints_belief_hd_epic_ddp_ca_belief
