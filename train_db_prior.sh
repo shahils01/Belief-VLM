@@ -19,8 +19,8 @@ CMD=(
   --max_val_samples_per_split "$MAX_VAL_SAMPLES"
   --train_sampling_mode task_uniform
   --train_samples_per_epoch "$TRAIN_SAMPLES_PER_EPOCH"
-  --batch_size 16
-  --num_workers 4
+  --batch_size 4
+  --num_workers 2
   --video_frames 5
   --mixed_precision bf16
   --allow_tf32
@@ -29,14 +29,18 @@ CMD=(
   --policy_lr 1e-4
   --selector_lr 1e-4
   --vlm_lr 2e-5
-  --use_rl_prior_selector
+  --use_rl_answer_head
   --prior_top_k 4
+  --retrieval_embedder_model sentence-transformers/all-MiniLM-L6-v2
   --vl_model_preset "$VL_MODEL_PRESET"
   --vl_model_name "$VL_MODEL_NAME"
+  --train_vlm_with_rl
+  --peft lora
   --gradient_checkpointing
-  --save_dir checkpoints_db_prior_noAnsPi
+  --grad_accum_steps 64
+  --save_dir checkpoints_db_prior_rlPi_lora
   --wandb
-  --wandb_run_name vdb_rl
+  --wandb_run_name vdb_rlPi_lora
 )
 
 if [[ -n "$VLM_CHECKPOINT" ]]; then
