@@ -1193,8 +1193,9 @@ def collate_rl_vqa_batch(batch):
     }
 
 
-def build_train_loader(args, split: str, batch_size: int, num_workers: int, is_train: bool):
-    processor = build_vlm_processor(args)
+def build_train_loader(args, split: str, batch_size: int, num_workers: int, is_train: bool, processor=None):
+    if processor is None:
+        processor = build_vlm_processor(args)
     if args.dataset_type not in {"hd_epic_local", "nextqa_local"}:
         raise RuntimeError(
             f"Unsupported dataset_type={args.dataset_type}. "
@@ -1214,8 +1215,9 @@ def build_train_loader(args, split: str, batch_size: int, num_workers: int, is_t
     )
 
 
-def build_rl_vqa_loader(args, split: str, batch_size: int, num_workers: int, is_train: bool):
-    processor = build_vlm_processor(args)
+def build_rl_vqa_loader(args, split: str, batch_size: int, num_workers: int, is_train: bool, processor=None):
+    if processor is None:
+        processor = build_vlm_processor(args)
     if args.dataset_type not in {"hd_epic_local", "nextqa_local"}:
         raise RuntimeError(
             f"Unsupported dataset_type={args.dataset_type}. "

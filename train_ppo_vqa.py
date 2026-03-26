@@ -36,7 +36,7 @@ except Exception:
     CPUOffload = None
     size_based_auto_wrap_policy = None
 
-from data_loading import build_rl_vqa_loader
+from data_loading import build_rl_vqa_loader, build_vlm_processor
 from train import (
     _apply_peft,
     _configure_memory_optimizations,
@@ -451,32 +451,66 @@ def main():
         log_with="wandb" if args.wandb else None,
     )
 
-    if args.wandb:
-        init_kwargs = {"wandb": {}}
-        if args.wandb_entity:
-            init_kwargs["wandb"]["entity"] = args.wandb_entity
-        if args.wandb_run_name:
-            init_kwargs["wandb"]["name"] = args.wandb_run_name
-        if args.wandb_tags:
-            init_kwargs["wandb"]["tags"] = [item.strip() for item in args.wandb_tags.split(",") if item.strip()]
-        accelerator.init_trackers(project_name=args.wandb_project, init_kwargs=init_kwargs)
+    accelerator.print(
+        f"startup: dataset_type={args.dataset_type} model={args.vl_model_name} "
+        f"train_split={args.train_split} val_split={args.val_split}"
+    )
 
-    train_loader = build_rl_vqa_loader(args, args.train_split, args.batch_size, args.num_workers, is_train=True)
+    accelerator.print("initializing processor...")
+    processor = build_vlm_processor(args)
+    accelerator.print("processor ready.")
+
+    accelerator.print("building dataloaders...")
+    train_loader = build_rl_vqa_loader(
+        args,
+        args.train_split,
+        args.batch_size,
+        args.num_workers,
+        is_train=True,
+        processor=processor,
+    )
     val_loader = (
-        build_rl_vqa_loader(args, args.val_split, args.batch_size, args.num_workers, is_train=False)
+        build_rl_vqa_loader(
+            args,
+            args.val_split,
+            args.batch_size,
+            args.num_workers,
+            is_train=False,
+            processor=processor,
+        )
         if args.val_ratio > 0
         else None
     )
+    accelerator.print(
+        f"dataloaders ready: train_samples={len(train_loader.dataset)} "
+        f"val_samples={(len(val_loader.dataset) if val_loader is not None else 0)}"
+    )
 
+    if args.vlm_checkpoint and not os.path.isfile(args.vlm_checkpoint):
+        raise FileNotFoundError(f"--vlm_checkpoint not found: {args.vlm_checkpoint}")
+    if args.resume_checkpoint and not os.path.isfile(args.resume_checkpoint):
+        raise FileNotFoundError(f"--resume_checkpoint not found: {args.resume_checkpoint}")
+
+    accelerator.print("building model...")
     model = build_model(args, device=accelerator.device)
     model = _apply_peft(model, args)
     _configure_memory_optimizations(model, args)
     if args.vlm_checkpoint:
+        accelerator.print(f"loading VLM checkpoint: {args.vlm_checkpoint}")
         vlm_ckpt = torch.load(args.vlm_checkpoint, map_location="cpu")
         state_dict = vlm_ckpt["model"] if isinstance(vlm_ckpt, dict) and "model" in vlm_ckpt else vlm_ckpt
         _load_checkpoint_state(model, state_dict, accelerator)
+    accelerator.print("model ready.")
 
-    probe_loader = build_rl_vqa_loader(args, args.train_split, batch_size=1, num_workers=0, is_train=True)
+    accelerator.print("probing one sample to infer policy state dimension...")
+    probe_loader = build_rl_vqa_loader(
+        args,
+        args.train_split,
+        batch_size=1,
+        num_workers=0,
+        is_train=True,
+        processor=processor,
+    )
     try:
         probe_batch = next(iter(probe_loader))
     except StopIteration as exc:
@@ -491,6 +525,7 @@ def main():
         action_dim=args.max_choice_options,
         dropout=args.policy_dropout,
     )
+    accelerator.print("policy head initialized.")
 
     if not args.train_vlm_with_rl:
         model.eval()
@@ -517,6 +552,7 @@ def main():
     start_epoch = 0
     global_step = 0
     if args.resume_checkpoint:
+        accelerator.print(f"loading PPO checkpoint: {args.resume_checkpoint}")
         ckpt = torch.load(args.resume_checkpoint, map_location="cpu")
         _load_checkpoint_state(model, ckpt["model"], accelerator)
         accelerator.unwrap_model(policy).load_state_dict(ckpt["policy"])
@@ -524,7 +560,20 @@ def main():
             optimizer.load_state_dict(ckpt["optimizer"])
             start_epoch = int(ckpt.get("epoch", -1)) + 1
             global_step = int(ckpt.get("global_step", 0))
+        accelerator.print(f"resume complete: start_epoch={start_epoch} global_step={global_step}")
 
+    if args.wandb:
+        init_kwargs = {"wandb": {}}
+        if args.wandb_entity:
+            init_kwargs["wandb"]["entity"] = args.wandb_entity
+        if args.wandb_run_name:
+            init_kwargs["wandb"]["name"] = args.wandb_run_name
+        if args.wandb_tags:
+            init_kwargs["wandb"]["tags"] = [item.strip() for item in args.wandb_tags.split(",") if item.strip()]
+        accelerator.print("initializing Weights & Biases tracker...")
+        accelerator.init_trackers(project_name=args.wandb_project, init_kwargs=init_kwargs)
+
+    accelerator.print("starting PPO training loop...")
     for epoch in range(start_epoch, args.epochs):
         train_sampler = getattr(train_loader, "sampler", None)
         if hasattr(train_sampler, "set_epoch"):
