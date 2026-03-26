@@ -1,6 +1,7 @@
 import hashlib
 import math
 import re
+import warnings
 from dataclasses import dataclass
 from typing import List, Sequence
 
@@ -45,8 +46,20 @@ class TextEmbedder:
                 from sentence_transformers import SentenceTransformer
 
                 self._st_model = SentenceTransformer(self.model_name)
-            except Exception:
+            except Exception as exc:
                 self._st_model = None
+                warnings.warn(
+                    f"Could not load sentence-transformers model '{self.model_name}'. "
+                    f"Falling back to hashing-based text embeddings. Original error: {exc}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+        else:
+            warnings.warn(
+                "No retrieval_embedder_model was provided. Falling back to hashing-based text embeddings.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         self._fallback = _HashingTextEmbedder(dim=self.hashing_dim)
 
     @property
