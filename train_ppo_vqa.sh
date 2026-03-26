@@ -1,14 +1,20 @@
 VL_MODEL_PRESET="${VL_MODEL_PRESET:-internvl3_5_2b}"
-VIDEO_ROOT="${VIDEO_ROOT:-/scratch/shahils/hd_epic_dataset/videos/HD-EPIC/Videos}"
-ANNOTATION_PATH="${ANNOTATION_PATH:-/scratch/shahils/hd_epic_dataset/hd-epic-annotations/vqa-benchmark/}"
+DATASET_TYPE="${DATASET_TYPE:-hd_epic_local}"   # hd_epic_local | nextqa_local
+VIDEO_ROOT="${VIDEO_ROOT:-/scratch/anshuln/hd_epic_dataset/videos/HD-EPIC/Videos}"
+ANNOTATION_PATH="${ANNOTATION_PATH:-/scratch/anshuln/hd_epic_dataset/hd-epic-annotations/vqa-benchmark/}"
 METADATA_ROOT="${METADATA_ROOT:-/scratch/shahils/hd_epic_dataset/HD-EPIC Intermediate Data}"
 VLM_CHECKPOINT="${VLM_CHECKPOINT:-/scratch/shahils/Belief-VLM/checkpoints_belief_hd_epic_ddp_07/ckpt_epoch_99.pt}"
 TRAIN_SAMPLES_PER_EPOCH="${TRAIN_SAMPLES_PER_EPOCH:-2048}"
 MAX_VAL_SAMPLES="${MAX_VAL_SAMPLES:-0}"
+USE_WANDB="${USE_WANDB:-0}"
+WANDB_PROJECT="${WANDB_PROJECT:-vlm-ppo-vqa}"
+WANDB_ENTITY="${WANDB_ENTITY:-}"
+WANDB_RUN_NAME="${WANDB_RUN_NAME:-}"
+WANDB_TAGS="${WANDB_TAGS:-}"
 
 CMD=(
   accelerate launch --num_processes 4 train_ppo_vqa.py
-  --dataset_type hd_epic_local
+  --dataset_type "$DATASET_TYPE"
   --video_root "$VIDEO_ROOT"
   --metadata_root "$METADATA_ROOT"
   --annotation_path "$ANNOTATION_PATH"
@@ -34,6 +40,19 @@ CMD=(
 
 if [[ -n "$VLM_CHECKPOINT" ]]; then
   CMD+=(--vlm_checkpoint "$VLM_CHECKPOINT")
+fi
+
+if [[ "$USE_WANDB" == "1" ]]; then
+  CMD+=(--wandb --wandb_project "$WANDB_PROJECT")
+  if [[ -n "$WANDB_ENTITY" ]]; then
+    CMD+=(--wandb_entity "$WANDB_ENTITY")
+  fi
+  if [[ -n "$WANDB_RUN_NAME" ]]; then
+    CMD+=(--wandb_run_name "$WANDB_RUN_NAME")
+  fi
+  if [[ -n "$WANDB_TAGS" ]]; then
+    CMD+=(--wandb_tags "$WANDB_TAGS")
+  fi
 fi
 
 "${CMD[@]}"

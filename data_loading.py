@@ -133,8 +133,16 @@ def decode_mp4_frames(video_path: str, num_frames: int, start_time_sec=None, end
         ok, frame = cap.read()
         if not ok:
             continue
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        frames.append(Image.fromarray(frame))
+        try:
+            if frame is None or getattr(frame, "size", 0) == 0:
+                continue
+            if frame.ndim == 2:
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
+            else:
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frames.append(Image.fromarray(frame_rgb))
+        except Exception:
+            continue
 
     # Some codecs/containers seek imprecisely with OpenCV. Fall back to a
     # linear scan only if random access failed to recover enough frames.
@@ -148,10 +156,37 @@ def decode_mp4_frames(video_path: str, num_frames: int, start_time_sec=None, end
             if not ok or cur > end_frame:
                 break
             if cur in wanted:
-                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                frames.append(Image.fromarray(frame))
+                try:
+                    if frame is None or getattr(frame, "size", 0) == 0:
+                        cur += 1
+                        continue
+                    if frame.ndim == 2:
+                        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
+                    else:
+                        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    frames.append(Image.fromarray(frame_rgb))
+                except Exception:
+                    pass
             cur += 1
     cap.release()
+
+    # Fallback for occasional ffmpeg/opencv decode failures on specific mp4 files.
+    if not frames:
+        try:
+            import imageio.v3 as iio
+
+            wanted = set(target_indices)
+            decoded = []
+            for idx, frame in enumerate(iio.imiter(video_path)):
+                if idx < start_frame:
+                    continue
+                if idx > end_frame:
+                    break
+                if idx in wanted:
+                    decoded.append(_frame_to_pil(frame))
+            frames = decoded
+        except Exception:
+            pass
 
     if not frames:
         raise RuntimeError(f"Failed to decode any frames from {video_path}")
@@ -437,6 +472,62 @@ def _load_records(args):
     return records
 
 
+def _resolve_split_annotation_path(path_spec: str, split: str):
+    if os.path.isfile(path_spec):
+        return path_spec
+    if not os.path.isdir(path_spec):
+        return None
+
+    aliases = [split]
+    if split == "validation":
+        aliases.extend(["val", "dev"])
+    if split == "train":
+        aliases.append("training")
+    if split == "test":
+        aliases.append("testing")
+
+    for alias in aliases:
+        for ext in ("csv", "json", "jsonl"):
+            candidate = os.path.join(path_spec, f"{alias}.{ext}")
+            if os.path.isfile(candidate):
+                return candidate
+    return None
+
+
+def _load_records_for_split(args, split: str, is_train: bool):
+    dataset_type = getattr(args, "dataset_type", "hd_epic_local")
+    if dataset_type != "nextqa_local":
+        return _load_records(args) if args.annotation_path else _discover_hd_epic_records(args)
+
+    # For nextqa_local: if annotation_path is a directory, prefer explicit split files.
+    split_path = _resolve_split_annotation_path(args.annotation_path, split)
+    if split_path is not None:
+        task_name = os.path.splitext(os.path.basename(split_path))[0]
+        rows = []
+        for rec in _load_single_records(split_path):
+            if isinstance(rec, dict):
+                rec = dict(rec)
+                rec.setdefault("task_name", task_name)
+            rows.append(rec)
+        return rows
+
+    # fallback to global records + hash split
+    all_records = _load_records(args)
+    selected = []
+    for idx, record in enumerate(all_records):
+        sample_id = str(_get_first(record, [args.id_column, "id", "sample_id", "uid", "video_id", "qid"]) or idx)
+        val_ratio = max(0.0, min(0.5, float(args.val_ratio)))
+        if val_ratio > 0.0:
+            fold = _stable_fold(sample_id, args.seed)
+            in_val = fold < val_ratio
+            if is_train and in_val:
+                continue
+            if (not is_train) and (not in_val):
+                continue
+        selected.append(record)
+    return selected
+
+
 def _discover_hd_epic_records(args):
     if not args.video_root or not args.metadata_root:
         raise RuntimeError(
@@ -575,13 +666,118 @@ def _resolve_hd_epic_clip_window(record):
     return _parse_timecode_seconds(start_time), _parse_timecode_seconds(end_time)
 
 
+def _resolve_nextqa_video_path(args, record):
+    direct = _get_first(record, [args.video_path_column, "video_path", "path", "video"])
+    if direct:
+        direct = str(direct)
+        if os.path.isfile(direct):
+            return direct
+        candidate = os.path.join(args.video_root, direct)
+        if os.path.isfile(candidate):
+            return candidate
+
+    video_id = _get_first(record, [args.video_id_column, "video_id", "vid", "gif_name", "video"])
+    if video_id in (None, ""):
+        raise RuntimeError(
+            f"Could not resolve a video path for NextQA record. Keys: {sorted(record.keys())}"
+        )
+    video_id = str(video_id)
+    ext = str(getattr(args, "video_extension", "mp4")).lstrip(".")
+    candidates = [
+        os.path.join(args.video_root, f"{video_id}.{ext}"),
+        os.path.join(args.video_root, video_id),
+        os.path.join(args.video_root, video_id, f"{video_id}.{ext}"),
+    ]
+    for one in candidates:
+        if os.path.isfile(one):
+            return one
+
+    # fallback recursive lookup by basename
+    pattern = os.path.join(args.video_root, "**", f"{video_id}.{ext}")
+    matches = glob(pattern, recursive=True)
+    if matches:
+        return matches[0]
+    raise FileNotFoundError(
+        f"Could not find NextQA video for video_id={video_id}. Tried {candidates} and recursive pattern={pattern}."
+    )
+
+
+def _resolve_nextqa_clip_window(record):
+    start_time = _get_first(record, ["start_time", "clip_start_time", "video_start_time", "start"])
+    end_time = _get_first(record, ["end_time", "clip_end_time", "video_end_time", "end"])
+    return _parse_timecode_seconds(start_time), _parse_timecode_seconds(end_time)
+
+
+def _resolve_video_path_by_dataset(args, record):
+    if getattr(args, "dataset_type", "hd_epic_local") == "nextqa_local":
+        return _resolve_nextqa_video_path(args, record)
+    return _resolve_hd_epic_video_path(args, record)
+
+
+def _resolve_clip_window_by_dataset(args, record):
+    if getattr(args, "dataset_type", "hd_epic_local") == "nextqa_local":
+        return _resolve_nextqa_clip_window(record)
+    return _resolve_hd_epic_clip_window(record)
+
+
+def _extract_choices(record, args):
+    choices = _get_first(record, [args.options_column, "options", "choices", "answer_options"])
+    if isinstance(choices, (list, tuple)):
+        parsed = [_normalize_text(choice) for choice in choices if _normalize_text(choice)]
+        if parsed:
+            return parsed
+    if isinstance(choices, str):
+        text = choices.strip()
+        if text:
+            if text.startswith("[") and text.endswith("]"):
+                try:
+                    parsed = json.loads(text)
+                    if isinstance(parsed, list):
+                        parsed = [_normalize_text(choice) for choice in parsed if _normalize_text(choice)]
+                        if parsed:
+                            return parsed
+                except Exception:
+                    pass
+            if "|" in text:
+                parsed = [_normalize_text(choice) for choice in text.split("|") if _normalize_text(choice)]
+                if parsed:
+                    return parsed
+            if "\n" in text:
+                parsed = [_normalize_text(choice) for choice in text.split("\n") if _normalize_text(choice)]
+                if parsed:
+                    return parsed
+
+    # NextQA / IntentQA style columns
+    dense = []
+    idx = 0
+    while True:
+        key = f"a{idx}"
+        if key not in record:
+            break
+        one = _normalize_text(record.get(key))
+        if one:
+            dense.append(one)
+        idx += 1
+    return dense
+
+
 def _build_prompt_answer(args, record):
     prompt = _get_first(record, [args.question_column, "question", "prompt", "instruction", "query"])
     answer = _get_first(record, [args.answer_column, "answer", "response", "label", "caption", "narration"])
-    choices = _get_first(record, [args.options_column, "options", "choices", "answer_options"])
+    choices = _extract_choices(record, args)
     correct_idx = _get_first(record, ["correct_idx", "answer_idx", "label_idx"])
     prompt = _normalize_text(prompt) or DEFAULT_PROMPT
     answer = _normalize_text(answer)
+    # NextQA often stores answer as option index in `answer`.
+    if answer and choices:
+        try:
+            idx_ans = int(answer)
+            if 0 <= idx_ans < len(choices):
+                answer = _normalize_text(choices[idx_ans])
+            elif 1 <= idx_ans <= len(choices):
+                answer = _normalize_text(choices[idx_ans - 1])
+        except Exception:
+            pass
     if not answer and choices and correct_idx not in (None, ""):
         normalized_choices = list(choices) if isinstance(choices, (list, tuple)) else [choices]
         try:
@@ -609,15 +805,15 @@ def _build_prompt_answer(args, record):
 def _build_vqa_prompt_choices(args, record):
     prompt = _get_first(record, [args.question_column, "question", "prompt", "instruction", "query"])
     prompt = _normalize_text(prompt) or DEFAULT_PROMPT
-    choices = _get_first(record, [args.options_column, "options", "choices", "answer_options"])
-    if not isinstance(choices, (list, tuple)) or not choices:
+    choices = _extract_choices(record, args)
+    if not choices:
         raise RuntimeError("RL VQA training expects multiple-choice records with a choices/options field.")
     choices = [_normalize_text(choice) for choice in choices]
     options_text = _normalize_text(choices)
     if options_text:
         prompt = f"{prompt}\nOptions:\n{options_text}"
 
-    correct_idx = _get_first(record, ["correct_idx", "answer_idx", "label_idx"])
+    correct_idx = _get_first(record, ["correct_idx", "answer_idx", "label_idx", args.answer_column, "answer"])
     if correct_idx in (None, ""):
         raise RuntimeError("RL VQA training expects records with correct_idx/answer_idx/label_idx.")
     correct_idx = int(correct_idx)
@@ -720,12 +916,12 @@ class LocalHD_EPICDataset(IterableDataset):
             if self.args.max_samples_per_split > 0 and sample_count >= self.args.max_samples_per_split:
                 break
 
-            video_path = _resolve_hd_epic_video_path(self.args, record)
+            video_path = _resolve_video_path_by_dataset(self.args, record)
             if self.args.annotation_path:
                 prompt, answer = _build_prompt_answer(self.args, record)
             else:
                 prompt, answer = _build_prompt_answer_from_metadata(record)
-            start_time_sec, end_time_sec = _resolve_hd_epic_clip_window(record)
+            start_time_sec, end_time_sec = _resolve_clip_window_by_dataset(self.args, record)
             frames = decode_mp4_frames(
                 video_path,
                 self.args.video_frames,
@@ -790,9 +986,9 @@ class LocalHD_EPICRLVQADataset(Dataset):
 
     def __getitem__(self, index):
         record = self.records[int(index)]
-        video_path = _resolve_hd_epic_video_path(self.args, record)
+        video_path = _resolve_video_path_by_dataset(self.args, record)
         prompt, choices, correct_idx = _build_vqa_prompt_choices(self.args, record)
-        start_time_sec, end_time_sec = _resolve_hd_epic_clip_window(record)
+        start_time_sec, end_time_sec = _resolve_clip_window_by_dataset(self.args, record)
         frames = decode_mp4_frames(
             video_path,
             self.args.video_frames,
@@ -902,17 +1098,15 @@ def collate_rl_vqa_batch(batch):
 
 def build_train_loader(args, split: str, batch_size: int, num_workers: int, is_train: bool):
     processor = build_vlm_processor(args)
-
-    if args.dataset_type == "hd_epic_local":
-        records = _load_records(args) if args.annotation_path else _discover_hd_epic_records(args)
-        dataset = LocalHD_EPICDataset(
-            records=records, processor=processor, args=args, split_name=split, is_train=is_train
-        )
-    else:
+    if args.dataset_type not in {"hd_epic_local", "nextqa_local"}:
         raise RuntimeError(
             f"Unsupported dataset_type={args.dataset_type}. "
-            "HD-EPIC integration uses --dataset_type hd_epic_local."
+            "Supported: hd_epic_local, nextqa_local."
         )
+    records = _load_records_for_split(args, split=split, is_train=is_train)
+    dataset = LocalHD_EPICDataset(
+        records=records, processor=processor, args=args, split_name=split, is_train=is_train
+    )
 
     return DataLoader(
         dataset,
@@ -925,7 +1119,12 @@ def build_train_loader(args, split: str, batch_size: int, num_workers: int, is_t
 
 def build_rl_vqa_loader(args, split: str, batch_size: int, num_workers: int, is_train: bool):
     processor = build_vlm_processor(args)
-    records = _load_records(args)
+    if args.dataset_type not in {"hd_epic_local", "nextqa_local"}:
+        raise RuntimeError(
+            f"Unsupported dataset_type={args.dataset_type}. "
+            "Supported: hd_epic_local, nextqa_local."
+        )
+    records = _load_records_for_split(args, split=split, is_train=is_train)
     dataset = LocalHD_EPICRLVQADataset(
         records=records,
         processor=processor,

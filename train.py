@@ -38,7 +38,7 @@ from model import ModelConfig, MultimodalVLMModel
 def parse_args():
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--dataset_type", type=str, default="hd_epic_local", choices=["hd_epic_local"])
+    parser.add_argument("--dataset_type", type=str, default="hd_epic_local", choices=["hd_epic_local", "nextqa_local"])
     parser.add_argument("--dataset_name", type=str, default="hd_epic_local")
     parser.add_argument("--dataset_config", type=str, default="")
     parser.add_argument("--dataset_revision", type=str, default="main")

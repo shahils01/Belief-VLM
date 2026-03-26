@@ -70,7 +70,7 @@ class PPOAnswerPolicy(nn.Module):
 def parse_args():
     parser = argparse.ArgumentParser(description="Train a PPO policy over VLM embeddings for multiple-choice VQA.")
 
-    parser.add_argument("--dataset_type", type=str, default="hd_epic_local", choices=["hd_epic_local"])
+    parser.add_argument("--dataset_type", type=str, default="hd_epic_local", choices=["hd_epic_local", "nextqa_local"])
     parser.add_argument("--dataset_name", type=str, default="hd_epic_local")
     parser.add_argument("--train_split", type=str, default="train")
     parser.add_argument("--val_split", type=str, default="validation")
