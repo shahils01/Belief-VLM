@@ -58,6 +58,8 @@ fi
 
 if [[ "$DROP_MISSING_VIDEOS" == "1" ]]; then
   CMD+=(--drop_missing_videos)
+else
+  CMD+=(--no_drop_missing_videos)
 fi
 
 if [[ "$USE_WANDB" == "1" ]]; then

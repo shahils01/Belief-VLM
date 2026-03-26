@@ -510,9 +510,10 @@ def _load_records_for_split(args, split: str, is_train: bool):
                 rec.setdefault("task_name", task_name)
             rows.append(rec)
         records = rows
-        drop_missing_default = dataset_type == "nextqa_local"
+        # Missing-video prefilter can be very expensive on large NextQA roots.
+        # Keep it opt-in via --drop_missing_videos.
         drop_missing_arg = getattr(args, "drop_missing_videos", None)
-        drop_missing = drop_missing_default if drop_missing_arg is None else bool(drop_missing_arg)
+        drop_missing = bool(drop_missing_arg) if drop_missing_arg is not None else False
         if drop_missing:
             records = _filter_records_with_existing_videos(args, records)
         return records
@@ -532,9 +533,8 @@ def _load_records_for_split(args, split: str, is_train: bool):
                 continue
         selected.append(record)
     records = selected
-    drop_missing_default = dataset_type == "nextqa_local"
     drop_missing_arg = getattr(args, "drop_missing_videos", None)
-    drop_missing = drop_missing_default if drop_missing_arg is None else bool(drop_missing_arg)
+    drop_missing = bool(drop_missing_arg) if drop_missing_arg is not None else False
     if drop_missing:
         records = _filter_records_with_existing_videos(args, records)
     return records
@@ -1202,6 +1202,7 @@ def build_train_loader(args, split: str, batch_size: int, num_workers: int, is_t
             "Supported: hd_epic_local, nextqa_local."
         )
     records = _load_records_for_split(args, split=split, is_train=is_train)
+    print(f"[data_loading] split={split} is_train={is_train} records={len(records)}")
     dataset = LocalHD_EPICDataset(
         records=records, processor=processor, args=args, split_name=split, is_train=is_train
     )
@@ -1224,6 +1225,7 @@ def build_rl_vqa_loader(args, split: str, batch_size: int, num_workers: int, is_
             "Supported: hd_epic_local, nextqa_local."
         )
     records = _load_records_for_split(args, split=split, is_train=is_train)
+    print(f"[data_loading] split={split} is_train={is_train} records={len(records)}")
     dataset = LocalHD_EPICRLVQADataset(
         records=records,
         processor=processor,
