@@ -147,9 +147,9 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42)
 
     parser.add_argument("--wandb", action="store_true")
-    parser.add_argument("--wandb_project", type=str, default="vlm-ppo-vqa")
-    parser.add_argument("--wandb_entity", type=str, default="")
-    parser.add_argument("--wandb_run_name", type=str, default="")
+    parser.add_argument("--wandb_project", type=str, default="Belief_VLM")
+    parser.add_argument("--wandb_entity", type=str, default="i2rLAB")
+    parser.add_argument("--wandb_run_name", type=str, default="RL_Top-k")
     parser.add_argument("--wandb_tags", type=str, default="")
     return parser.parse_args()
 
