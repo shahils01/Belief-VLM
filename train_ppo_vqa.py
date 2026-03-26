@@ -360,7 +360,7 @@ def _run_validation(model, policy, val_loader, accelerator, args, global_step, p
     if val_loader is None:
         return None
     with torch.no_grad():
-        val_metrics, _, _ = run_epoch(
+        val_metrics, _ = run_epoch(
             model=model,
             policy=policy,
             loader=val_loader,
