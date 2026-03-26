@@ -316,6 +316,7 @@ def _score_answers_with_vlm(model, processor, batch_inputs, prior_prompts, choic
             with torch.no_grad():
                 outputs = model(model_inputs, labels=labels)
             logits = outputs["logits"][:, : labels.shape[1], :]
+            labels = labels.to(logits.device)
             shift_logits = logits[:, :-1, :].float().contiguous()
             shift_labels = labels[:, 1:].contiguous()
             token_losses = F.cross_entropy(
