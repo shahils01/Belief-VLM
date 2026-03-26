@@ -3,13 +3,13 @@ VL_MODEL_NAME="${VL_MODEL_NAME:-/scratch/shahils/hf_models/InternVL3_5-2B-HF}"
 VIDEO_ROOT="${VIDEO_ROOT:-/scratch/shahils/hd_epic_dataset/videos/HD-EPIC/Videos}"
 ANNOTATION_PATH="${ANNOTATION_PATH:-/scratch/shahils/hd_epic_dataset/hd-epic-annotations/vqa-benchmark/}"
 METADATA_ROOT="${METADATA_ROOT:-/scratch/shahils/hd_epic_dataset/HD-EPIC Intermediate Data}"
-VLM_CHECKPOINT="${VLM_CHECKPOINT:-/scratch/shahils/Belief-VLM/checkpoints_vlm_hd_epic_ddp/ckpt_epoch_24.pt}"
-ANSWER_HEAD_CHECKPOINT="${ANSWER_HEAD_CHECKPOINT:-}"
-TRAIN_SAMPLES_PER_EPOCH="${TRAIN_SAMPLES_PER_EPOCH:-2048}"
+VLM_CHECKPOINT="${VLM_CHECKPOINT:-/scratch/shahils/Belief-VLM/checkpoints_belief_hd_epic_ddp_07/ckpt_epoch_99.pt}"
+ANSWER_HEAD_CHECKPOINT="${ANSWER_HEAD_CHECKPOINT:-checkpoints_ppo_vqa_fulldataset_01/ckpt_epoch_241.pt}"
+TRAIN_SAMPLES_PER_EPOCH="${TRAIN_SAMPLES_PER_EPOCH:-5000}"
 MAX_VAL_SAMPLES="${MAX_VAL_SAMPLES:-128}"
 
 CMD=(
-  accelerate launch --num_processes 4 train_db_prior.py
+  accelerate launch --num_processes 2 train_db_prior.py
   --dataset_type hd_epic_local
   --video_root "$VIDEO_ROOT"
   --metadata_root "$METADATA_ROOT"
@@ -21,11 +21,11 @@ CMD=(
   --train_samples_per_epoch "$TRAIN_SAMPLES_PER_EPOCH"
   --batch_size 16
   --num_workers 4
-  --video_frames 8
+  --video_frames 5
   --mixed_precision bf16
   --allow_tf32
-  --epochs 50
-  --ppo_epochs 2
+  --epochs 50000
+  --ppo_epochs 4
   --policy_lr 1e-4
   --selector_lr 1e-4
   --vlm_lr 2e-5
