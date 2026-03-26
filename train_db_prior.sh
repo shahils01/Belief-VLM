@@ -7,6 +7,8 @@ VLM_CHECKPOINT="${VLM_CHECKPOINT:-/scratch/shahils/Belief-VLM/checkpoints_belief
 ANSWER_HEAD_CHECKPOINT="${ANSWER_HEAD_CHECKPOINT:-checkpoints_ppo_vqa_fulldataset_01/ckpt_epoch_241.pt}"
 TRAIN_SAMPLES_PER_EPOCH="${TRAIN_SAMPLES_PER_EPOCH:-5000}"
 MAX_VAL_SAMPLES="${MAX_VAL_SAMPLES:-128}"
+USE_VLM_CE_LOSS="${USE_VLM_CE_LOSS:-0}"
+VLM_CE_WEIGHT="${VLM_CE_WEIGHT:-1.0}"
 
 CMD=(
   accelerate launch --num_processes 2 train_db_prior.py
@@ -49,6 +51,10 @@ fi
 
 if [[ -n "$ANSWER_HEAD_CHECKPOINT" ]]; then
   CMD+=(--answer_head_checkpoint "$ANSWER_HEAD_CHECKPOINT")
+fi
+
+if [[ "$USE_VLM_CE_LOSS" == "1" ]]; then
+  CMD+=(--use_vlm_ce_loss --vlm_ce_weight "$VLM_CE_WEIGHT")
 fi
 
 "${CMD[@]}"

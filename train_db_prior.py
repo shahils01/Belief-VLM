@@ -37,7 +37,7 @@ except Exception:
 
 from belief_db import BeliefVectorDB
 from data_loading import _frame_to_pil
-from data_loading import _load_records, build_rl_vqa_loader
+from data_loading import _load_records, build_rl_vqa_loader, build_sft_example, collate_sft_batch
 from train import (
     _apply_peft,
     _configure_memory_optimizations,
@@ -153,6 +153,8 @@ def parse_args():
 
     parser.add_argument("--use_rl_answer_head", action="store_true")
     parser.add_argument("--use_rl_prior_selector", action="store_true")
+    parser.add_argument("--use_vlm_ce_loss", action="store_true")
+    parser.add_argument("--vlm_ce_weight", type=float, default=1.0)
     parser.add_argument("--prior_top_k", type=int, default=4)
     parser.add_argument("--prior_prompt_prefix", type=str, default="Belief prior:")
     parser.add_argument("--retrieval_embedder_model", type=str, default="")
@@ -261,6 +263,28 @@ def _build_prompt_only_inputs_from_frames(processor, frames, prompt, args):
             value = value.squeeze(0)
         packed[key] = value
     return packed
+
+
+def _build_supervised_batch_from_frames(processor, batch_inputs, prior_prompts, answer_texts, args):
+    batch_size = len(prior_prompts)
+    examples = []
+    for row in range(batch_size):
+        frames = _extract_frames_from_batch(batch_inputs, row, batch_size, args.video_frames)
+        packed = build_sft_example(
+            processor=processor,
+            frames=frames,
+            prompt=prior_prompts[row],
+            answer=answer_texts[row],
+            vl_backend=args.vl_backend,
+            max_text_len=args.vl_max_text_len,
+        )
+        examples.append(
+            {
+                "inputs": {k: v for k, v in packed.items() if k not in {"labels", "prompt_text", "answer_text"}},
+                "labels": packed["labels"],
+            }
+        )
+    return collate_sft_batch(examples)
 
 
 def _score_answers_with_vlm(model, processor, batch_inputs, prior_prompts, choices_batch, args):
@@ -375,6 +399,7 @@ def run_epoch(model, processor, belief_db, selector_policy, answer_policy, loade
     total_examples = 0
     total_selector_loss = 0.0
     total_answer_loss = 0.0
+    total_vlm_ce_loss = 0.0
     step = 0
     epoch_start_time = time.perf_counter()
 
@@ -450,6 +475,17 @@ def run_epoch(model, processor, belief_db, selector_policy, answer_policy, loade
             answer_actions = _score_answers_with_vlm(model, processor, prior_inputs, prior_prompts, batch["choices"], args)
             rewards = (answer_actions == correct_idx).float() * float(args.reward_scale)
 
+        ce_loss_value = 0.0
+        ce_batch = None
+        if args.use_vlm_ce_loss:
+            ce_batch = _build_supervised_batch_from_frames(
+                processor=processor,
+                batch_inputs=base_inputs,
+                prior_prompts=prior_prompts,
+                answer_texts=batch["answer_text"],
+                args=args,
+            )
+
         selector_returns = rewards
         selector_adv = selector_returns - selector_values.detach()
         answer_returns = rewards
@@ -492,6 +528,17 @@ def run_epoch(model, processor, belief_db, selector_policy, answer_policy, loade
                         total_loss = total_loss + answer_policy_loss + args.value_coef * answer_value_loss - args.entropy_coef * answer_entropy
                         answer_loss_value = float(answer_policy_loss.detach().item())
 
+                    if args.use_vlm_ce_loss:
+                        ce_inputs = {
+                            key: value.to(accelerator.device) if torch.is_tensor(value) else value
+                            for key, value in ce_batch["inputs"].items()
+                        }
+                        ce_labels = ce_batch["labels"].to(accelerator.device)
+                        ce_outputs = model(ce_inputs, labels=ce_labels)
+                        vlm_ce_loss = ce_outputs["loss"]
+                        total_loss = total_loss + float(args.vlm_ce_weight) * vlm_ce_loss
+                        ce_loss_value = float(vlm_ce_loss.detach().item())
+
                     optimizer.zero_grad(set_to_none=True)
                     accelerator.backward(total_loss)
                     if args.max_grad_norm > 0:
@@ -506,6 +553,7 @@ def run_epoch(model, processor, belief_db, selector_policy, answer_policy, loade
         total_reward += float(rewards.sum().item())
         total_selector_loss += selector_loss_value * batch_size
         total_answer_loss += answer_loss_value * batch_size
+        total_vlm_ce_loss += ce_loss_value * batch_size
         if train:
             global_step += 1
 
@@ -516,6 +564,7 @@ def run_epoch(model, processor, belief_db, selector_policy, answer_policy, loade
                 f"{phase} step={step} reward={total_reward / max(total_examples,1):.4f} "
                 f"selector_loss={total_selector_loss / max(total_examples,1):.4f} "
                 f"answer_loss={total_answer_loss / max(total_examples,1):.4f} "
+                f"vlm_ce_loss={total_vlm_ce_loss / max(total_examples,1):.4f} "
                 f"samples_per_sec={total_examples / elapsed:.2f} sec_per_step={elapsed / max(step,1):.2f}"
             )
 
@@ -523,6 +572,7 @@ def run_epoch(model, processor, belief_db, selector_policy, answer_policy, loade
         "reward": total_reward / max(total_examples, 1),
         "selector_loss": total_selector_loss / max(total_examples, 1),
         "answer_loss": total_answer_loss / max(total_examples, 1),
+        "vlm_ce_loss": total_vlm_ce_loss / max(total_examples, 1),
     }
     return metrics, global_step
 
@@ -550,6 +600,10 @@ def main():
     args = parse_args()
     if not args.use_rl_answer_head and not args.use_rl_prior_selector:
         raise RuntimeError("Enable at least one of --use_rl_answer_head or --use_rl_prior_selector.")
+    if args.train_vlm_with_rl:
+        args.use_vlm_ce_loss = True
+    if args.use_vlm_ce_loss and not args.train_vlm_with_rl:
+        raise RuntimeError("--use_vlm_ce_loss requires --train_vlm_with_rl so the VLM actually receives gradients.")
     _resolve_vl_model_preset(args)
     os.makedirs(args.save_dir, exist_ok=True)
 
