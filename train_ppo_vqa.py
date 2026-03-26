@@ -129,9 +129,6 @@ def parse_args():
     parser.add_argument("--lora_bias", type=str, default="none", choices=["none", "all", "lora_only"])
 
     parser.add_argument("--epochs", type=int, default=3)
-    parser.add_argument("--max_train_steps", type=int, default=0)
-    parser.add_argument("--save_every_steps", type=int, default=0)
-    parser.add_argument("--eval_every_steps", type=int, default=0)
     parser.add_argument("--policy_lr", type=float, default=1e-4)
     parser.add_argument("--vlm_lr", type=float, default=2e-5)
     parser.add_argument("--weight_decay", type=float, default=0.01)
@@ -218,7 +215,7 @@ def _evaluate_policy(model, policy, loader, accelerator, args):
     return accuracy
 
 
-def run_epoch(model, policy, loader, optimizer, accelerator, args, train, global_step, on_step_end=None):
+def run_epoch(model, policy, loader, optimizer, accelerator, args, train, global_step):
     model.train(args.train_vlm_with_rl and train)
     if not args.train_vlm_with_rl:
         model.eval()
@@ -230,7 +227,6 @@ def run_epoch(model, policy, loader, optimizer, accelerator, args, train, global
     total_entropy = 0.0
     total_examples = 0
     step = 0
-    stop_training = False
     epoch_start_time = time.perf_counter()
 
     for batch in loader:
@@ -331,24 +327,13 @@ def run_epoch(model, policy, loader, optimizer, accelerator, args, train, global
                 else:
                     accelerator.log(metrics, step=global_step)
 
-        if train and on_step_end is not None:
-            callback_stop = on_step_end(global_step)
-            stop_training = stop_training or bool(callback_stop)
-
-        if train and args.max_train_steps > 0 and global_step >= args.max_train_steps:
-            stop_training = True
-            break
-
-        if stop_training:
-            break
-
     metrics = {
         "reward": total_reward / max(total_examples, 1),
         "policy_loss": total_policy_loss / max(total_examples, 1),
         "value_loss": total_value_loss / max(total_examples, 1),
         "entropy": total_entropy / max(total_examples, 1),
     }
-    return metrics, global_step, stop_training
+    return metrics, global_step
 
 
 def _save_checkpoint(model, policy, optimizer, accelerator, args, epoch, global_step, tag):
@@ -528,8 +513,7 @@ def main():
             start_epoch = int(ckpt.get("epoch", -1)) + 1
             global_step = int(ckpt.get("global_step", 0))
 
-    epoch = start_epoch
-    while epoch < args.epochs and (args.max_train_steps <= 0 or global_step < args.max_train_steps):
+    for epoch in range(start_epoch, args.epochs):
         train_sampler = getattr(train_loader, "sampler", None)
         if hasattr(train_sampler, "set_epoch"):
             train_sampler.set_epoch(epoch)
@@ -538,14 +522,7 @@ def main():
             if hasattr(val_sampler, "set_epoch"):
                 val_sampler.set_epoch(epoch)
 
-        def _on_step_end(step_now):
-            if args.eval_every_steps > 0 and step_now > 0 and step_now % args.eval_every_steps == 0:
-                _run_validation(model, policy, val_loader, accelerator, args, step_now, prefix="val_step")
-            if args.save_every_steps > 0 and step_now > 0 and step_now % args.save_every_steps == 0:
-                _save_checkpoint(model, policy, optimizer, accelerator, args, epoch, step_now, f"ckpt_step_{step_now}")
-            return False
-
-        train_metrics, global_step, stop_training = run_epoch(
+        train_metrics, global_step = run_epoch(
             model=model,
             policy=policy,
             loader=train_loader,
@@ -554,7 +531,6 @@ def main():
             args=args,
             train=True,
             global_step=global_step,
-            on_step_end=_on_step_end,
         )
         accelerator.print(
             f"epoch={epoch} train_reward={train_metrics['reward']:.4f} "
@@ -586,12 +562,6 @@ def main():
                 )
 
         _save_checkpoint(model, policy, optimizer, accelerator, args, epoch, global_step, f"ckpt_epoch_{epoch}")
-
-        if stop_training:
-            accelerator.print(f"Reached max_train_steps={args.max_train_steps}. Stopping training.")
-            break
-
-        epoch += 1
 
     if args.wandb:
         accelerator.end_training()
