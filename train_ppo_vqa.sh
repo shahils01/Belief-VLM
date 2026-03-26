@@ -11,6 +11,7 @@ WANDB_PROJECT="${WANDB_PROJECT:-Belief_VLM}"
 WANDB_ENTITY="${WANDB_ENTITY:-i2rLAB}"
 WANDB_RUN_NAME="${WANDB_RUN_NAME:-RL_Top-k}"
 WANDB_TAGS="${WANDB_TAGS:-}"
+DROP_MISSING_VIDEOS="${DROP_MISSING_VIDEOS:-1}"
 
 CMD=(
   accelerate launch --num_processes 2 train_ppo_vqa.py
@@ -36,11 +37,14 @@ CMD=(
   --gradient_checkpointing
   --save_dir checkpoints_ppo_vqa_fulldataset
   --resume_checkpoint checkpoints_ppo_vqa_01/ckpt_epoch_62.pt
-  --wandb
 )
 
 if [[ -n "$VLM_CHECKPOINT" ]]; then
   CMD+=(--vlm_checkpoint "$VLM_CHECKPOINT")
+fi
+
+if [[ "$DROP_MISSING_VIDEOS" == "1" ]]; then
+  CMD+=(--drop_missing_videos)
 fi
 
 if [[ "$USE_WANDB" == "1" ]]; then

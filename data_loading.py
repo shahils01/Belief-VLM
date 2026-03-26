@@ -509,7 +509,13 @@ def _load_records_for_split(args, split: str, is_train: bool):
                 rec = dict(rec)
                 rec.setdefault("task_name", task_name)
             rows.append(rec)
-        return rows
+        records = rows
+        drop_missing_default = dataset_type == "nextqa_local"
+        drop_missing_arg = getattr(args, "drop_missing_videos", None)
+        drop_missing = drop_missing_default if drop_missing_arg is None else bool(drop_missing_arg)
+        if drop_missing:
+            records = _filter_records_with_existing_videos(args, records)
+        return records
 
     # fallback to global records + hash split
     all_records = _load_records(args)
@@ -525,7 +531,54 @@ def _load_records_for_split(args, split: str, is_train: bool):
             if (not is_train) and (not in_val):
                 continue
         selected.append(record)
-    return selected
+    records = selected
+    drop_missing_default = dataset_type == "nextqa_local"
+    drop_missing_arg = getattr(args, "drop_missing_videos", None)
+    drop_missing = drop_missing_default if drop_missing_arg is None else bool(drop_missing_arg)
+    if drop_missing:
+        records = _filter_records_with_existing_videos(args, records)
+    return records
+
+
+def _filter_records_with_existing_videos(args, records):
+    if not records:
+        return records
+    kept = []
+    dropped = 0
+    resolve_cache = {}
+    for idx, record in enumerate(records):
+        key = _get_first(
+            record,
+            [
+                args.video_path_column,
+                "video_path",
+                "path",
+                args.video_id_column,
+                "video_id",
+                "vid",
+                "gif_name",
+                "video",
+            ],
+        )
+        cache_key = str(key) if key is not None else f"idx_{idx}"
+        resolved = resolve_cache.get(cache_key)
+        if resolved is None:
+            try:
+                resolved = _resolve_video_path_by_dataset(args, record)
+            except Exception:
+                resolved = False
+            resolve_cache[cache_key] = resolved
+        if resolved and isinstance(resolved, str) and os.path.isfile(resolved):
+            record["_resolved_video_path"] = resolved
+            kept.append(record)
+        else:
+            dropped += 1
+    if dropped > 0:
+        print(
+            f"[data_loading] filtered missing videos: kept={len(kept)} dropped={dropped} "
+            f"(dataset_type={getattr(args, 'dataset_type', 'unknown')})"
+        )
+    return kept
 
 
 def _discover_hd_epic_records(args):
@@ -681,7 +734,13 @@ def _resolve_nextqa_video_path(args, record):
         raise RuntimeError(
             f"Could not resolve a video path for NextQA record. Keys: {sorted(record.keys())}"
         )
-    video_id = str(video_id)
+    video_id = str(video_id).strip()
+    # normalize cases like "6709738709.0"
+    if video_id.endswith(".0"):
+        try:
+            video_id = str(int(float(video_id)))
+        except Exception:
+            pass
     ext = str(getattr(args, "video_extension", "mp4")).lstrip(".")
     candidates = [
         os.path.join(args.video_root, f"{video_id}.{ext}"),
@@ -692,13 +751,25 @@ def _resolve_nextqa_video_path(args, record):
         if os.path.isfile(one):
             return one
 
-    # fallback recursive lookup by basename
-    pattern = os.path.join(args.video_root, "**", f"{video_id}.{ext}")
-    matches = glob(pattern, recursive=True)
+    # fallback recursive lookup by basename and extension variants
+    ext_variants = {ext.lower(), ext.upper(), "mp4", "MP4", "mkv", "MKV", "avi", "AVI", "webm", "WEBM"}
+    matches = []
+    for one_ext in ext_variants:
+        pattern = os.path.join(args.video_root, "**", f"{video_id}.{one_ext}")
+        matches.extend(glob(pattern, recursive=True))
     if matches:
-        return matches[0]
+        return sorted(matches)[0]
+
+    # final fallback: any file whose stem equals or endswith video_id (handles prefixes/suffixes)
+    generic = []
+    for one_ext in ext_variants:
+        generic.extend(glob(os.path.join(args.video_root, "**", f"*.{one_ext}"), recursive=True))
+    for path in generic:
+        stem = os.path.splitext(os.path.basename(path))[0]
+        if stem == video_id or stem.endswith(video_id) or video_id.endswith(stem):
+            return path
     raise FileNotFoundError(
-        f"Could not find NextQA video for video_id={video_id}. Tried {candidates} and recursive pattern={pattern}."
+        f"Could not find NextQA video for video_id={video_id}. Tried {candidates} and recursive search under {args.video_root}."
     )
 
 
@@ -709,9 +780,16 @@ def _resolve_nextqa_clip_window(record):
 
 
 def _resolve_video_path_by_dataset(args, record):
+    cached = record.get("_resolved_video_path") if isinstance(record, dict) else None
+    if cached and os.path.isfile(cached):
+        return cached
     if getattr(args, "dataset_type", "hd_epic_local") == "nextqa_local":
-        return _resolve_nextqa_video_path(args, record)
-    return _resolve_hd_epic_video_path(args, record)
+        path = _resolve_nextqa_video_path(args, record)
+    else:
+        path = _resolve_hd_epic_video_path(args, record)
+    if isinstance(record, dict):
+        record["_resolved_video_path"] = path
+    return path
 
 
 def _resolve_clip_window_by_dataset(args, record):
@@ -916,26 +994,31 @@ class LocalHD_EPICDataset(IterableDataset):
             if self.args.max_samples_per_split > 0 and sample_count >= self.args.max_samples_per_split:
                 break
 
-            video_path = _resolve_video_path_by_dataset(self.args, record)
-            if self.args.annotation_path:
-                prompt, answer = _build_prompt_answer(self.args, record)
-            else:
-                prompt, answer = _build_prompt_answer_from_metadata(record)
-            start_time_sec, end_time_sec = _resolve_clip_window_by_dataset(self.args, record)
-            frames = decode_mp4_frames(
-                video_path,
-                self.args.video_frames,
-                start_time_sec=start_time_sec,
-                end_time_sec=end_time_sec,
-            )
-            packed = build_sft_example(
-                processor=self.processor,
-                frames=frames,
-                prompt=prompt,
-                answer=answer,
-                vl_backend=self.args.vl_backend,
-                max_text_len=self.args.vl_max_text_len,
-            )
+            try:
+                video_path = _resolve_video_path_by_dataset(self.args, record)
+                if self.args.annotation_path:
+                    prompt, answer = _build_prompt_answer(self.args, record)
+                else:
+                    prompt, answer = _build_prompt_answer_from_metadata(record)
+                start_time_sec, end_time_sec = _resolve_clip_window_by_dataset(self.args, record)
+                frames = decode_mp4_frames(
+                    video_path,
+                    self.args.video_frames,
+                    start_time_sec=start_time_sec,
+                    end_time_sec=end_time_sec,
+                )
+                packed = build_sft_example(
+                    processor=self.processor,
+                    frames=frames,
+                    prompt=prompt,
+                    answer=answer,
+                    vl_backend=self.args.vl_backend,
+                    max_text_len=self.args.vl_max_text_len,
+                )
+            except Exception as exc:
+                sample_id = str(_get_first(record, [self.args.id_column, "id", "sample_id", "uid", "video_id"]) or "?")
+                print(f"[LocalHD_EPICDataset] skip sample_id={sample_id} due to: {exc}")
+                continue
 
             sample_count += 1
             yield {
@@ -985,34 +1068,48 @@ class LocalHD_EPICRLVQADataset(Dataset):
         return len(self.records)
 
     def __getitem__(self, index):
-        record = self.records[int(index)]
-        video_path = _resolve_video_path_by_dataset(self.args, record)
-        prompt, choices, correct_idx = _build_vqa_prompt_choices(self.args, record)
-        start_time_sec, end_time_sec = _resolve_clip_window_by_dataset(self.args, record)
-        frames = decode_mp4_frames(
-            video_path,
-            self.args.video_frames,
-            start_time_sec=start_time_sec,
-            end_time_sec=end_time_sec,
-        )
-        packed = build_prompt_only_example(
-            processor=self.processor,
-            frames=frames,
-            prompt=prompt,
-            vl_backend=self.args.vl_backend,
-            max_text_len=self.args.vl_max_text_len,
-        )
-        return {
-            "id": str(
-                _get_first(record, [self.args.id_column, "id", "sample_id", "uid", "video_id"]) or int(index)
-            ),
-            "task_name": str(record.get("task_name", "unknown")),
-            "prompt": prompt,
-            "choices": choices,
-            "correct_idx": correct_idx,
-            "answer_text": choices[correct_idx],
-            "inputs": {k: v for k, v in packed.items() if k != "prompt_text"},
-        }
+        max_retry = min(len(self.records), 8)
+        last_err = None
+        base = int(index)
+        for attempt in range(max_retry):
+            idx = (base + attempt) % len(self.records)
+            record = self.records[idx]
+            try:
+                video_path = _resolve_video_path_by_dataset(self.args, record)
+                prompt, choices, correct_idx = _build_vqa_prompt_choices(self.args, record)
+                start_time_sec, end_time_sec = _resolve_clip_window_by_dataset(self.args, record)
+                frames = decode_mp4_frames(
+                    video_path,
+                    self.args.video_frames,
+                    start_time_sec=start_time_sec,
+                    end_time_sec=end_time_sec,
+                )
+                packed = build_prompt_only_example(
+                    processor=self.processor,
+                    frames=frames,
+                    prompt=prompt,
+                    vl_backend=self.args.vl_backend,
+                    max_text_len=self.args.vl_max_text_len,
+                )
+                return {
+                    "id": str(
+                        _get_first(record, [self.args.id_column, "id", "sample_id", "uid", "video_id", "qid"]) or idx
+                    ),
+                    "task_name": str(record.get("task_name", "unknown")),
+                    "prompt": prompt,
+                    "choices": choices,
+                    "correct_idx": correct_idx,
+                    "answer_text": choices[correct_idx],
+                    "inputs": {k: v for k, v in packed.items() if k != "prompt_text"},
+                }
+            except Exception as exc:
+                last_err = exc
+                if attempt == 0:
+                    sid = _get_first(record, [self.args.id_column, "id", "sample_id", "uid", "video_id", "qid"])
+                    vid = _get_first(record, [self.args.video_id_column, "video_id", "vid", "video"])
+                    print(f"[LocalHD_EPICRLVQADataset] decode failed sample_id={sid} video_id={vid}: {exc}")
+                continue
+        raise RuntimeError(f"Failed to fetch valid RL-VQA sample after {max_retry} retries: {last_err}")
 
 
 class TaskUniformDistributedSampler(Sampler):

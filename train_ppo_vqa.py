@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from accelerate import Accelerator
+from torch.distributed.elastic.multiprocessing.errors import record
 
 try:
     from accelerate import DataLoaderConfiguration
@@ -90,6 +91,9 @@ def parse_args():
     parser.add_argument("--max_val_samples_per_split", type=int, default=0)
     parser.add_argument("--train_sampling_mode", type=str, default="task_uniform", choices=["flat", "task_uniform"])
     parser.add_argument("--train_samples_per_epoch", type=int, default=0)
+    parser.add_argument("--drop_missing_videos", action="store_true")
+    parser.add_argument("--no_drop_missing_videos", dest="drop_missing_videos", action="store_false")
+    parser.set_defaults(drop_missing_videos=None)
 
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--num_workers", type=int, default=0)
@@ -388,6 +392,7 @@ def _run_validation(model, policy, val_loader, accelerator, args, global_step, p
     return {"metrics": val_metrics, "accuracy": val_acc}
 
 
+@record
 def main():
     args = parse_args()
     _resolve_vl_model_preset(args)
@@ -471,7 +476,14 @@ def main():
         state_dict = vlm_ckpt["model"] if isinstance(vlm_ckpt, dict) and "model" in vlm_ckpt else vlm_ckpt
         _load_checkpoint_state(model, state_dict, accelerator)
 
-    probe_batch = next(iter(build_rl_vqa_loader(args, args.train_split, batch_size=1, num_workers=0, is_train=True)))
+    probe_loader = build_rl_vqa_loader(args, args.train_split, batch_size=1, num_workers=0, is_train=True)
+    try:
+        probe_batch = next(iter(probe_loader))
+    except StopIteration as exc:
+        raise RuntimeError(
+            "No valid training samples available after filtering/decoding. "
+            "Check annotation_path/video_root or disable strict filtering."
+        ) from exc
     with torch.no_grad():
         probe_state = model(probe_batch["inputs"], return_hidden_states=True, pooling=args.state_pooling)["pooled_state"]
     policy = PPOAnswerPolicy(
