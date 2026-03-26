@@ -36,6 +36,7 @@ except Exception:
     size_based_auto_wrap_policy = None
 
 from belief_db import BeliefVectorDB
+from data_loading import _frame_to_pil
 from data_loading import _load_records, build_rl_vqa_loader
 from train import (
     _apply_peft,
@@ -215,51 +216,51 @@ def _text_with_media_full(processor, prompt: str, answer: str, vl_backend: str):
     return _add_media_token(prompt_text), _add_media_token(full_text)
 
 
-def _tokenize_prompt_batch(processor, prompts, vl_backend):
-    tokenizer = getattr(processor, "tokenizer", None)
-    texts = [_text_with_media_prompt(processor, prompt, vl_backend) for prompt in prompts]
-    tokenized = tokenizer(
-        texts,
-        return_tensors="pt",
-        padding=True,
-        truncation=False,
-        add_special_tokens=True,
-    )
-    return {
-        "input_ids": tokenized["input_ids"],
-        "attention_mask": tokenized["attention_mask"],
-    }
+def _extract_frames_from_batch(batch_inputs, idx: int, batch_size: int, video_frames: int):
+    frame_tensor = None
+    for key in ("pixel_values", "pixel_values_videos", "video_values", "video", "videos"):
+        value = batch_inputs.get(key)
+        if torch.is_tensor(value):
+            frame_tensor = value
+            break
+    if frame_tensor is None:
+        raise RuntimeError("Could not locate video tensor in batch inputs.")
+
+    if frame_tensor.dim() == 4:
+        start = idx * video_frames
+        end = start + video_frames
+        clip = frame_tensor[start:end]
+    elif frame_tensor.dim() == 5:
+        clip = frame_tensor[idx]
+    else:
+        raise RuntimeError(f"Unsupported video tensor shape: {tuple(frame_tensor.shape)}")
+    return [_frame_to_pil(frame) for frame in clip]
 
 
-def _combine_inputs_with_prompts(batch_inputs, prompts, processor, args):
-    text_inputs = _tokenize_prompt_batch(processor, prompts, args.vl_backend)
-    combined = {}
-    for key, value in batch_inputs.items():
-        if key in {"input_ids", "attention_mask"}:
-            continue
-        combined[key] = value
-    combined.update(text_inputs)
-    return combined
-
-
-def _slice_single_inputs(batch_inputs, idx: int, batch_size: int, video_frames: int):
-    single = {}
-    frame_like = {"pixel_values", "pixel_values_videos", "video_values", "video", "videos"}
-    for key, value in batch_inputs.items():
-        if not torch.is_tensor(value):
-            single[key] = value
-            continue
-        if key in {"input_ids", "attention_mask"} and value.dim() >= 2:
-            single[key] = value[idx : idx + 1]
-        elif key in frame_like and value.dim() == 4:
-            start = idx * video_frames
-            end = start + video_frames
-            single[key] = value[start:end]
-        elif value.dim() > 0 and value.shape[0] == batch_size:
-            single[key] = value[idx : idx + 1]
-        else:
-            single[key] = value
-    return single
+def _build_prompt_only_inputs_from_frames(processor, frames, prompt, args):
+    prompt_with_media = _text_with_media_prompt(processor, prompt, args.vl_backend)
+    try:
+        inputs = processor(
+            text=[prompt_with_media],
+            videos=[frames],
+            return_tensors="pt",
+            padding="longest",
+            truncation=False,
+        )
+    except TypeError:
+        inputs = processor(
+            text=[prompt_with_media],
+            images=[frames],
+            return_tensors="pt",
+            padding="longest",
+            truncation=False,
+        )
+    packed = {}
+    for key, value in dict(inputs).items():
+        if torch.is_tensor(value) and value.dim() > 0 and value.shape[0] == 1:
+            value = value.squeeze(0)
+        packed[key] = value
+    return packed
 
 
 def _score_answers_with_vlm(model, processor, batch_inputs, prior_prompts, choices_batch, args):
@@ -270,17 +271,10 @@ def _score_answers_with_vlm(model, processor, batch_inputs, prior_prompts, choic
         raise RuntimeError("Processor does not expose a tokenizer.")
 
     for idx in range(batch_size):
-        single_inputs = _slice_single_inputs(batch_inputs, idx, batch_size, args.video_frames)
+        frames = _extract_frames_from_batch(batch_inputs, idx, batch_size, args.video_frames)
         choice_losses = []
         for answer in choices_batch[idx]:
             prompt_text, full_text = _text_with_media_full(processor, prior_prompts[idx], answer, args.vl_backend)
-            tokenized_full = tokenizer(
-                full_text,
-                return_tensors="pt",
-                padding=False,
-                truncation=False,
-                add_special_tokens=True,
-            )
             prompt_ids = tokenizer(
                 prompt_text,
                 return_tensors="pt",
@@ -288,15 +282,35 @@ def _score_answers_with_vlm(model, processor, batch_inputs, prior_prompts, choic
                 truncation=False,
                 add_special_tokens=True,
             )["input_ids"][0]
-            input_ids = tokenized_full["input_ids"]
-            attention_mask = tokenized_full["attention_mask"]
+            try:
+                proc_out = processor(
+                    text=[full_text],
+                    videos=[frames],
+                    return_tensors="pt",
+                    padding="longest",
+                    truncation=False,
+                )
+            except TypeError:
+                proc_out = processor(
+                    text=[full_text],
+                    images=[frames],
+                    return_tensors="pt",
+                    padding="longest",
+                    truncation=False,
+                )
+            input_ids = proc_out["input_ids"]
+            attention_mask = proc_out["attention_mask"]
             labels = input_ids.clone()
             pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
             labels[labels == pad_token_id] = -100
             prompt_len = min(int(prompt_ids.numel()), int(labels.shape[1]))
             labels[:, :prompt_len] = -100
 
-            model_inputs = dict(single_inputs)
+            model_inputs = {}
+            for key, value in dict(proc_out).items():
+                if torch.is_tensor(value) and value.dim() > 0 and value.shape[0] == 1:
+                    value = value.squeeze(0)
+                model_inputs[key] = value
             model_inputs["input_ids"] = input_ids
             model_inputs["attention_mask"] = attention_mask
             with torch.no_grad():
@@ -400,7 +414,27 @@ def run_epoch(model, processor, belief_db, selector_policy, answer_policy, loade
             for prompt, prior in zip(batch["prompts"], chosen_priors)
         ]
 
-        prior_inputs = _combine_inputs_with_prompts(base_inputs, prior_prompts, processor, args)
+        prior_input_items = []
+        batch_size = len(prior_prompts)
+        for row in range(batch_size):
+            frames = _extract_frames_from_batch(base_inputs, row, batch_size, args.video_frames)
+            prior_input_items.append(_build_prompt_only_inputs_from_frames(processor, frames, prior_prompts[row], args))
+        prior_inputs = {}
+        for key in prior_input_items[0].keys():
+            values = [item[key] for item in prior_input_items]
+            if torch.is_tensor(values[0]):
+                if key == "pixel_values" and values[0].dim() == 4:
+                    prior_inputs[key] = torch.cat(values, dim=0)
+                elif key in {"input_ids", "attention_mask"}:
+                    max_len = max(int(v.shape[0]) for v in values)
+                    prior_inputs[key] = torch.stack(
+                        [F.pad(v, (0, max_len - int(v.shape[0])), value=0) for v in values],
+                        dim=0,
+                    )
+                else:
+                    prior_inputs[key] = torch.stack(values, dim=0)
+            else:
+                prior_inputs[key] = values
         prior_state = _extract_state(model, prior_inputs, args)
 
         if answer_policy is not None:
