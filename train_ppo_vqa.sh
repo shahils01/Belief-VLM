@@ -2,8 +2,8 @@ VL_MODEL_PRESET="${VL_MODEL_PRESET:-internvl3_5_2b}"
 DATASET_TYPE="${DATASET_TYPE:-nextqa_local}"   # hd_epic_local | nextqa_local
 VIDEO_ROOT="${VIDEO_ROOT:-/scratch/anshuln/NExTVQA/NExTVideo}"
 ANNOTATION_PATH="${ANNOTATION_PATH:-/scratch/anshuln/NExTVQA/NExT-QA/dataset/nextqa/train.csv}"
-METADATA_ROOT="${}"
-VLM_CHECKPOINT="${VLM_CHECKPOINT:-/scratch/anshuln/Belief-VLM/checkpoints_belief_hd_epic_ddp_07/ckpt_epoch_99.pt}"
+METADATA_ROOT="${METADATA_ROOT:-}"
+VLM_CHECKPOINT="${VLM_CHECKPOINT:-}"
 TRAIN_SAMPLES_PER_EPOCH="${TRAIN_SAMPLES_PER_EPOCH:-2048}"
 MAX_VAL_SAMPLES="${MAX_VAL_SAMPLES:-0}"
 USE_WANDB="${USE_WANDB:-1}"
@@ -13,7 +13,7 @@ WANDB_RUN_NAME="${WANDB_RUN_NAME:-RL_Top-k}"
 WANDB_TAGS="${WANDB_TAGS:-}"
 
 CMD=(
-  accelerate launch --num_processes 4 train_ppo_vqa.py
+  accelerate launch --num_processes 2 train_ppo_vqa.py
   --dataset_type "$DATASET_TYPE"
   --video_root "$VIDEO_ROOT"
   --metadata_root "$METADATA_ROOT"
@@ -23,7 +23,7 @@ CMD=(
   --max_val_samples_per_split "$MAX_VAL_SAMPLES"
   --train_sampling_mode task_uniform
   --train_samples_per_epoch "$TRAIN_SAMPLES_PER_EPOCH"
-  --batch_size 16
+  --batch_size 4
   --num_workers 4
   --video_frames 8
   --mixed_precision bf16
