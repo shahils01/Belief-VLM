@@ -754,6 +754,9 @@ class LocalHD_EPICRLVQADataset(Dataset):
         self.args = args
         self.split_name = split_name
         self.is_train = is_train
+        max_samples = int(args.max_samples_per_split)
+        if not is_train and getattr(args, "max_val_samples_per_split", 0) > 0:
+            max_samples = int(args.max_val_samples_per_split)
         self.records = []
         for idx, record in enumerate(records):
             sample_id = str(
@@ -762,7 +765,7 @@ class LocalHD_EPICRLVQADataset(Dataset):
             if not self._keep_sample(sample_id):
                 continue
             self.records.append(record)
-            if args.max_samples_per_split > 0 and len(self.records) >= args.max_samples_per_split:
+            if max_samples > 0 and len(self.records) >= max_samples:
                 break
 
         self.task_to_records = {}

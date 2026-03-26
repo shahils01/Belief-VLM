@@ -87,6 +87,7 @@ def parse_args():
     parser.add_argument("--answer_column", type=str, default="answer")
     parser.add_argument("--options_column", type=str, default="options")
     parser.add_argument("--max_samples_per_split", type=int, default=0)
+    parser.add_argument("--max_val_samples_per_split", type=int, default=0)
     parser.add_argument("--train_sampling_mode", type=str, default="task_uniform", choices=["flat", "task_uniform"])
     parser.add_argument("--train_samples_per_epoch", type=int, default=0)
 

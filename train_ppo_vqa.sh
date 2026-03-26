@@ -7,6 +7,7 @@ MAX_TRAIN_STEPS="${MAX_TRAIN_STEPS:-1000}"
 SAVE_EVERY_STEPS="${SAVE_EVERY_STEPS:-0}"
 EVAL_EVERY_STEPS="${EVAL_EVERY_STEPS:-0}"
 TRAIN_SAMPLES_PER_EPOCH="${TRAIN_SAMPLES_PER_EPOCH:-2048}"
+MAX_VAL_SAMPLES="${MAX_VAL_SAMPLES:-0}"
 
 CMD=(
   accelerate launch --num_processes 4 train_ppo_vqa.py
@@ -16,6 +17,7 @@ CMD=(
   --annotation_path "$ANNOTATION_PATH"
   --video_extension mp4
   --val_ratio 0.1
+  --max_val_samples_per_split "$MAX_VAL_SAMPLES"
   --train_sampling_mode task_uniform
   --train_samples_per_epoch "$TRAIN_SAMPLES_PER_EPOCH"
   --batch_size 64
