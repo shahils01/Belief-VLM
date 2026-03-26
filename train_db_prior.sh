@@ -30,12 +30,13 @@ CMD=(
   --selector_lr 1e-4
   --vlm_lr 2e-5
   --use_rl_prior_selector
-  --use_rl_answer_head
   --prior_top_k 4
   --vl_model_preset "$VL_MODEL_PRESET"
   --vl_model_name "$VL_MODEL_NAME"
   --gradient_checkpointing
-  --save_dir checkpoints_db_prior
+  --save_dir checkpoints_db_prior_noAnsPi
+  --wandb
+  --wandb_run_name vdb_rl
 )
 
 if [[ -n "$VLM_CHECKPOINT" ]]; then
@@ -47,3 +48,10 @@ if [[ -n "$ANSWER_HEAD_CHECKPOINT" ]]; then
 fi
 
 "${CMD[@]}"
+
+
+# Notes:
+# 1) wandb_run_name: vdb_rl2 :: 2 Rl policies (one for topK and one for answer head)
+# 2) wandb_run_name: vdb_rl :: RL policy for topK
+# 3) wandb_run_name: vdb_rlPi :: RL policy as answer head
+# 4) wandb_run_name: vdb :: No RL policies
