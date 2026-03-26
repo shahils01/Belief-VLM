@@ -4,6 +4,7 @@ VIDEO_ROOT="${VIDEO_ROOT:-/scratch/shahils/hd_epic_dataset/videos/HD-EPIC/Videos
 ANNOTATION_PATH="${ANNOTATION_PATH:-/scratch/shahils/hd_epic_dataset/hd-epic-annotations/vqa-benchmark/}"
 METADATA_ROOT="${METADATA_ROOT:-/scratch/shahils/hd_epic_dataset/HD-EPIC Intermediate Data}"
 VLM_CHECKPOINT="${VLM_CHECKPOINT:-/scratch/shahils/Belief-VLM/checkpoints_vlm_hd_epic_ddp/ckpt_epoch_24.pt}"
+ANSWER_HEAD_CHECKPOINT="${ANSWER_HEAD_CHECKPOINT:-}"
 TRAIN_SAMPLES_PER_EPOCH="${TRAIN_SAMPLES_PER_EPOCH:-2048}"
 MAX_VAL_SAMPLES="${MAX_VAL_SAMPLES:-128}"
 
@@ -39,6 +40,10 @@ CMD=(
 
 if [[ -n "$VLM_CHECKPOINT" ]]; then
   CMD+=(--vlm_checkpoint "$VLM_CHECKPOINT")
+fi
+
+if [[ -n "$ANSWER_HEAD_CHECKPOINT" ]]; then
+  CMD+=(--answer_head_checkpoint "$ANSWER_HEAD_CHECKPOINT")
 fi
 
 "${CMD[@]}"

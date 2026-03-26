@@ -146,6 +146,7 @@ def parse_args():
     parser.add_argument("--log_every", type=int, default=20)
     parser.add_argument("--save_dir", type=str, default="checkpoints_db_prior")
     parser.add_argument("--resume_checkpoint", type=str, default="")
+    parser.add_argument("--answer_head_checkpoint", type=str, default="")
     parser.add_argument("--load_model_only", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
 
@@ -694,6 +695,14 @@ def main():
             optimizer.load_state_dict(ckpt["optimizer"])
             start_epoch = int(ckpt.get("epoch", -1)) + 1
             global_step = int(ckpt.get("global_step", 0))
+    elif args.answer_head_checkpoint and answer_policy is not None:
+        answer_ckpt = torch.load(args.answer_head_checkpoint, map_location="cpu")
+        policy_state = answer_ckpt.get("policy")
+        if policy_state is None:
+            raise RuntimeError(
+                f"Checkpoint {args.answer_head_checkpoint} does not contain a 'policy' state for the RL answer head."
+            )
+        accelerator.unwrap_model(answer_policy).load_state_dict(policy_state, strict=False)
 
     for epoch in range(start_epoch, args.epochs):
         train_sampler = getattr(train_loader, "sampler", None)
