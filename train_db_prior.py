@@ -185,15 +185,9 @@ def _text_with_media_prompt(processor, prompt: str, vl_backend: str):
         return text
 
     prompt_text = f"User: {prompt}\nAssistant:"
-    if vl_backend == "internvl" and hasattr(processor, "apply_chat_template"):
-        user_message = {
-            "role": "user",
-            "content": [
-                {"type": "video"},
-                {"type": "text", "text": prompt},
-            ],
-        }
-        return processor.apply_chat_template([user_message], tokenize=False, add_generation_prompt=True)
+    # Use explicit media tokens here. Re-tokenizing chat-template output without
+    # re-running the full processor can drop InternVL's expected video token
+    # alignment, which leads to image feature/token count mismatches.
     return _add_media_token(prompt_text)
 
 
@@ -218,22 +212,6 @@ def _text_with_media_full(processor, prompt: str, answer: str, vl_backend: str):
 
     prompt_text = f"User: {prompt}\nAssistant:"
     full_text = f"{prompt_text} {answer}".strip()
-    if vl_backend == "internvl" and hasattr(processor, "apply_chat_template"):
-        user_message = {
-            "role": "user",
-            "content": [
-                {"type": "video"},
-                {"type": "text", "text": prompt},
-            ],
-        }
-        return (
-            processor.apply_chat_template([user_message], tokenize=False, add_generation_prompt=True),
-            processor.apply_chat_template(
-                [user_message, {"role": "assistant", "content": [{"type": "text", "text": answer}]}],
-                tokenize=False,
-                add_generation_prompt=False,
-            ),
-        )
     return _add_media_token(prompt_text), _add_media_token(full_text)
 
 
