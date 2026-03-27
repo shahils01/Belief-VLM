@@ -1,4 +1,4 @@
-CHECKPOINT="${CHECKPOINT:-/scratch/shahils/Belief-VLM/checkpoints_ppo_vqa_01/ckpt_epoch_59.pt}"
+CHECKPOINT="${CHECKPOINT:-/scratch/shahils/Belief-VLM/checkpoints_ppo_vqa_fulldataset_01/ckpt_epoch_394.pt}"
 EVAL_MODE="${EVAL_MODE:-ppo}"
 ANNOTATION_PATH="${ANNOTATION_PATH:-/scratch/shahils/hd_epic_dataset/hd-epic-annotations/vqa-benchmark/fine_grained_how_recognition.json}"
 VIDEO_ROOT="${VIDEO_ROOT:-/scratch/shahils/hd_epic_dataset/videos/HD-EPIC/Videos}"
