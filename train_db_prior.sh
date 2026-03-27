@@ -7,7 +7,7 @@ VLM_CHECKPOINT="${VLM_CHECKPOINT:-/scratch/shahils/Belief-VLM/checkpoints_belief
 ANSWER_HEAD_CHECKPOINT="${ANSWER_HEAD_CHECKPOINT:-checkpoints_ppo_vqa_fulldataset_01/ckpt_epoch_241.pt}"
 TRAIN_SAMPLES_PER_EPOCH="${TRAIN_SAMPLES_PER_EPOCH:-5000}"
 MAX_VAL_SAMPLES="${MAX_VAL_SAMPLES:-128}"
-USE_VLM_CE_LOSS="${USE_VLM_CE_LOSS:-0}"
+USE_VLM_CE_LOSS="${USE_VLM_CE_LOSS:-1}"
 VLM_CE_WEIGHT="${VLM_CE_WEIGHT:-1.0}"
 
 CMD=(
@@ -21,7 +21,7 @@ CMD=(
   --max_val_samples_per_split "$MAX_VAL_SAMPLES"
   --train_sampling_mode task_uniform
   --train_samples_per_epoch "$TRAIN_SAMPLES_PER_EPOCH"
-  --batch_size 4
+  --batch_size 2
   --num_workers 2
   --video_frames 5
   --mixed_precision bf16
@@ -37,12 +37,11 @@ CMD=(
   --vl_model_preset "$VL_MODEL_PRESET"
   --vl_model_name "$VL_MODEL_NAME"
   --train_vlm_with_rl
-  --peft lora
   --gradient_checkpointing
   --grad_accum_steps 64
-  --save_dir checkpoints_db_prior_rlPi_lora
+  --save_dir checkpoints_db_prior_rl2
   --wandb
-  --wandb_run_name vdb_rlPi_lora
+  --wandb_run_name vdb_rl2
 )
 
 if [[ -n "$VLM_CHECKPOINT" ]]; then
