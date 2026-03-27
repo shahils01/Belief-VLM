@@ -1,8 +1,8 @@
 VL_MODEL_PRESET="${VL_MODEL_PRESET:-custom}"
 VL_MODEL_NAME="${VL_MODEL_NAME:-/scratch/shahils/hf_models/InternVL3_5-2B-HF}"
-CHECKPOINT="${CHECKPOINT:-/scratch/shahils/Belief-VLM/checkpoints_ppo_vqa_fulldataset_01/ckpt_epoch_220.pt}"
+CHECKPOINT="${CHECKPOINT:-/scratch/shahils/Belief-VLM/checkpoints_ppo_vqa_fulldataset/ckpt_epoch_3.pt}"
 EVAL_MODE="${EVAL_MODE:-ppo}"
-ANNOTATION_PATH="${ANNOTATION_PATH:-/scratch/shahils/hd_epic_dataset/hd-epic-annotations/vqa-benchmark/fine_grained_how_recognition.json}"
+ANNOTATION_PATH="${ANNOTATION_PATH:-/scratch/shahils/hd_epic_dataset/hd-epic-annotations/vqa-benchmark/}"
 VIDEO_ROOT="${VIDEO_ROOT:-/scratch/shahils/hd_epic_dataset/videos/HD-EPIC/Videos}"
 MAX_SAMPLES="${MAX_SAMPLES:-0}"
 PRINT_SAMPLES="${PRINT_SAMPLES:-10}"
@@ -19,6 +19,7 @@ CMD=(
   --max_samples "$MAX_SAMPLES"
   --print_samples "$PRINT_SAMPLES"
   --progress_every "$PROGRESS_EVERY"
+  --video_frames 8
 )
 
 if [[ -n "$SAVE_PREDICTIONS" ]]; then
