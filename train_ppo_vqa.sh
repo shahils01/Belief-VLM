@@ -1,9 +1,10 @@
-VL_MODEL_PRESET="${VL_MODEL_PRESET:-internvl3_5_2b}"
+VL_MODEL_PRESET="${VL_MODEL_PRESET:-custom}"
+VL_MODEL_NAME="${VL_MODEL_NAME:-/scratch/shahils/hf_models/InternVL3_5-2B-HF}"
 VIDEO_ROOT="${VIDEO_ROOT:-/scratch/shahils/hd_epic_dataset/videos/HD-EPIC/Videos}"
 ANNOTATION_PATH="${ANNOTATION_PATH:-/scratch/shahils/hd_epic_dataset/hd-epic-annotations/vqa-benchmark/}"
 METADATA_ROOT="${METADATA_ROOT:-/scratch/shahils/hd_epic_dataset/HD-EPIC Intermediate Data}"
 VLM_CHECKPOINT="${VLM_CHECKPOINT:-/scratch/shahils/Belief-VLM/checkpoints_belief_hd_epic_ddp_07/ckpt_epoch_99.pt}"
-TRAIN_SAMPLES_PER_EPOCH="${TRAIN_SAMPLES_PER_EPOCH:-2048}"
+TRAIN_SAMPLES_PER_EPOCH="${TRAIN_SAMPLES_PER_EPOCH:-20000}"
 MAX_VAL_SAMPLES="${MAX_VAL_SAMPLES:-0}"
 
 CMD=(
@@ -22,14 +23,13 @@ CMD=(
   --video_frames 8
   --mixed_precision bf16
   --allow_tf32
-  --epochs 500
+  --epochs 5000
   --ppo_epochs 10
   --policy_lr 1e-4
   --vlm_lr 2e-5
   --vl_model_preset "$VL_MODEL_PRESET"
   --gradient_checkpointing
   --save_dir checkpoints_ppo_vqa_fulldataset
-  --resume_checkpoint checkpoints_ppo_vqa_01/ckpt_epoch_62.pt
 )
 
 if [[ -n "$VLM_CHECKPOINT" ]]; then
