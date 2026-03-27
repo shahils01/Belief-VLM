@@ -11,8 +11,9 @@ from train_db_prior import (
     PPOAnswerPolicy,
     PriorSelectorPolicy,
     _build_quant_config,
-    _combine_inputs_with_prompts,
+    _build_prompt_only_inputs_from_frames,
     _compose_prior_prompt,
+    _extract_frames_from_batch,
     _extract_state,
     _prior_selector_forward,
     _score_answers_with_vlm,
@@ -32,6 +33,8 @@ def parse_args():
     parser.add_argument("--max_samples_per_split", type=int, default=0)
     parser.add_argument("--val_ratio", type=float, default=None)
     parser.add_argument("--print_samples", type=int, default=10)
+    parser.add_argument("--use_rl_prior_selector", action="store_true")
+    parser.add_argument("--use_rl_answer_head", action="store_true")
     return parser.parse_args()
 
 
@@ -50,6 +53,10 @@ def _merge_args(cli_args, ckpt_args):
     )
     if cli_args.val_ratio is not None:
         merged["val_ratio"] = cli_args.val_ratio
+    if cli_args.use_rl_prior_selector:
+        merged["use_rl_prior_selector"] = True
+    if cli_args.use_rl_answer_head:
+        merged["use_rl_answer_head"] = True
     merged.setdefault("dataset_type", "hd_epic_local")
     merged.setdefault("train_split", "train")
     merged.setdefault("val_split", "validation")
@@ -138,7 +145,29 @@ def main():
             _compose_prior_prompt(prompt, prior, merged_args.prior_prompt_prefix)
             for prompt, prior in zip(batch["prompts"], chosen_priors)
         ]
-        prior_inputs = _combine_inputs_with_prompts(batch["inputs"], prior_prompts, processor, merged_args)
+        prior_input_items = []
+        batch_size = len(prior_prompts)
+        for row in range(batch_size):
+            frames = _extract_frames_from_batch(batch["inputs"], row, batch_size, merged_args.video_frames)
+            prior_input_items.append(
+                _build_prompt_only_inputs_from_frames(processor, frames, prior_prompts[row], merged_args)
+            )
+        prior_inputs = {}
+        for key in prior_input_items[0].keys():
+            values = [item[key] for item in prior_input_items]
+            if torch.is_tensor(values[0]):
+                if key == "pixel_values" and values[0].dim() == 4:
+                    prior_inputs[key] = torch.cat(values, dim=0)
+                elif key in {"input_ids", "attention_mask"}:
+                    max_len = max(int(v.shape[0]) for v in values)
+                    prior_inputs[key] = torch.stack(
+                        [torch.nn.functional.pad(v, (0, max_len - int(v.shape[0])), value=0) for v in values],
+                        dim=0,
+                    )
+                else:
+                    prior_inputs[key] = torch.stack(values, dim=0)
+            else:
+                prior_inputs[key] = values
         if answer_policy is not None:
             with torch.no_grad():
                 prior_state = _extract_state(model, prior_inputs, merged_args)
