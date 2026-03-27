@@ -33,6 +33,7 @@ def parse_args():
     parser.add_argument("--max_samples_per_split", type=int, default=0)
     parser.add_argument("--val_ratio", type=float, default=None)
     parser.add_argument("--print_samples", type=int, default=10)
+    parser.add_argument("--print_debug_logits", action="store_true")
     parser.add_argument("--use_rl_prior_selector", action="store_true")
     parser.add_argument("--use_rl_answer_head", action="store_true")
     return parser.parse_args()
@@ -111,6 +112,12 @@ def main():
         selector_policy = PriorSelectorPolicy(hidden_dim, belief_db.embedder.dim, merged_args.policy_dropout)
         selector_policy.load_state_dict(ckpt["selector_policy"])
         selector_policy.to(device).eval()
+        print("loaded selector_policy=True")
+    else:
+        print(
+            f"loaded selector_policy=False requested={bool(merged_args.use_rl_prior_selector)} "
+            f"present_in_ckpt={bool('selector_policy' in ckpt)}"
+        )
 
     answer_policy = None
     if merged_args.use_rl_answer_head and "answer_policy" in ckpt:
@@ -119,6 +126,15 @@ def main():
         answer_policy = PPOAnswerPolicy(hidden_dim, action_dim, merged_args.policy_dropout)
         answer_policy.load_state_dict(ckpt["answer_policy"])
         answer_policy.to(device).eval()
+        print(
+            f"loaded answer_policy=True action_dim={action_dim} "
+            f"requested={bool(merged_args.use_rl_answer_head)}"
+        )
+    else:
+        print(
+            f"loaded answer_policy=False requested={bool(merged_args.use_rl_answer_head)} "
+            f"present_in_ckpt={bool('answer_policy' in ckpt)}"
+        )
 
     total = 0
     correct = 0
@@ -172,6 +188,9 @@ def main():
             with torch.no_grad():
                 prior_state = _extract_state(model, prior_inputs, merged_args)
                 answer_dist, _ = _answer_forward(answer_policy, prior_state, batch["num_choices"].to(device))
+                if args.print_debug_logits and total == 0:
+                    print("debug answer logits[0]=", answer_dist.logits[0].detach().cpu().tolist())
+                    print("debug num_choices[0]=", int(batch["num_choices"][0].item()))
                 pred_idx = torch.argmax(answer_dist.logits, dim=-1)
         else:
             pred_idx = _score_answers_with_vlm(model, processor, prior_inputs, prior_prompts, batch["choices"], merged_args)
