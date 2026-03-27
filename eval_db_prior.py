@@ -30,10 +30,13 @@ def parse_args():
     parser.add_argument("--metadata_root", type=str, default="")
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--num_workers", type=int, default=0)
+    parser.add_argument("--video_frames", type=int, default=None)
     parser.add_argument("--max_samples_per_split", type=int, default=0)
     parser.add_argument("--val_ratio", type=float, default=None)
     parser.add_argument("--print_samples", type=int, default=10)
     parser.add_argument("--print_debug_logits", action="store_true")
+    parser.add_argument("--prior_top_k", type=int, default=None)
+    parser.add_argument("--retrieval_embedder_model", type=str, default="")
     parser.add_argument("--use_rl_prior_selector", action="store_true")
     parser.add_argument("--use_rl_answer_head", action="store_true")
     return parser.parse_args()
@@ -52,8 +55,14 @@ def _merge_args(cli_args, ckpt_args):
             "max_samples_per_split": cli_args.max_samples_per_split,
         }
     )
+    if cli_args.video_frames is not None:
+        merged["video_frames"] = cli_args.video_frames
     if cli_args.val_ratio is not None:
         merged["val_ratio"] = cli_args.val_ratio
+    if cli_args.prior_top_k is not None:
+        merged["prior_top_k"] = cli_args.prior_top_k
+    if cli_args.retrieval_embedder_model:
+        merged["retrieval_embedder_model"] = cli_args.retrieval_embedder_model
     if cli_args.use_rl_prior_selector:
         merged["use_rl_prior_selector"] = True
     if cli_args.use_rl_answer_head:
@@ -62,6 +71,7 @@ def _merge_args(cli_args, ckpt_args):
     merged.setdefault("train_split", "train")
     merged.setdefault("val_split", "validation")
     merged.setdefault("val_ratio", 0.1)
+    merged.setdefault("video_frames", 8)
     merged.setdefault("use_rl_prior_selector", False)
     merged.setdefault("use_rl_answer_head", False)
     merged.setdefault("prior_top_k", 4)
