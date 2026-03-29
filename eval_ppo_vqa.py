@@ -56,6 +56,7 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--max_samples_per_split", type=int, default=0)
+    parser.add_argument("--max_val_samples_per_split", type=int, default=None)
     parser.add_argument("--val_ratio", type=float, default=None)
     parser.add_argument("--max_samples", type=int, default=0)
     parser.add_argument("--print_samples", type=int, default=10)
@@ -93,6 +94,8 @@ def _merge_args(cli_args, ckpt_args):
             "max_samples_per_split": cli_args.max_samples_per_split,
         }
     )
+    if cli_args.max_val_samples_per_split is not None:
+        merged["max_val_samples_per_split"] = cli_args.max_val_samples_per_split
 
     optional_overrides = (
         "video_frames",
@@ -136,6 +139,7 @@ def _merge_args(cli_args, ckpt_args):
     merged.setdefault("train_split", "train")
     merged.setdefault("val_split", "validation")
     merged.setdefault("val_ratio", 0.0)
+    merged.setdefault("max_val_samples_per_split", 0)
     merged.setdefault("vl_backend", "internvl")
     merged.setdefault("vl_model_preset", "internvl3_5_1b")
     merged.setdefault("vl_model_name", "OpenGVLab/InternVL3_5-1B-HF")

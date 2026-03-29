@@ -6,6 +6,7 @@ ANNOTATION_PATH="$(printf "%s," /scratch/shahils/hd_epic_dataset/hd-epic-annotat
 # ANNOTATION_PATH="${ANNOTATION_PATH:-/scratch/shahils/hd_epic_dataset/hd-epic-annotations/vqa-benchmark/}"
 VIDEO_ROOT="${VIDEO_ROOT:-/scratch/shahils/hd_epic_dataset/videos/HD-EPIC/Videos}"
 MAX_SAMPLES="${MAX_SAMPLES:-0}"
+MAX_VAL_SAMPLES="${MAX_VAL_SAMPLES:-0}"
 PRINT_SAMPLES="${PRINT_SAMPLES:-10}"
 PROGRESS_EVERY="${PROGRESS_EVERY:-50}"
 SAVE_PREDICTIONS="${SAVE_PREDICTIONS:-}"
@@ -26,6 +27,7 @@ CMD=(
   --annotation_path "$ANNOTATION_PATH"
   --video_root "$VIDEO_ROOT"
   --max_samples "$MAX_SAMPLES"
+  --max_val_samples_per_split "$MAX_VAL_SAMPLES"
   --print_samples "$PRINT_SAMPLES"
   --progress_every "$PROGRESS_EVERY"
   --video_frames 8
