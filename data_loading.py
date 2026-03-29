@@ -2,6 +2,7 @@ import csv
 import hashlib
 import json
 import os
+import warnings
 from glob import glob
 from typing import Iterable
 
@@ -14,6 +15,7 @@ from PIL import Image
 from torch.utils.data import DataLoader, Dataset, IterableDataset, Sampler, get_worker_info
 from torch.utils.data.distributed import DistributedSampler
 
+from belief_db import BeliefVectorDB
 
 DEFAULT_PROMPT = "Describe what is happening in this egocentric video."
 
@@ -324,6 +326,28 @@ def build_prompt_only_example(processor, frames, prompt, vl_backend, max_text_le
 def _stable_fold(value: str, seed: int) -> float:
     digest = hashlib.md5(f"{seed}:{value}".encode("utf-8")).hexdigest()
     return int(digest[:8], 16) / 0xFFFFFFFF
+
+
+def _record_sample_id(record, args, default):
+    return str(_get_first(record, [args.id_column, "id", "sample_id", "uid", "video_id"]) or default)
+
+
+def _is_in_validation_fold(record, args, default):
+    val_ratio = max(0.0, min(0.5, float(args.val_ratio)))
+    if val_ratio == 0.0:
+        return False
+    sample_id = _record_sample_id(record, args, default)
+    return _stable_fold(sample_id, args.seed) < val_ratio
+
+
+def _build_belief_db(records, args):
+    if not getattr(args, "use_db_prior", False):
+        return None
+    if not getattr(args, "annotation_path", ""):
+        warnings.warn("use_db_prior is enabled but annotation_path is empty; skipping belief DB.", RuntimeWarning)
+        return None
+    memory_records = [record for idx, record in enumerate(records) if not _is_in_validation_fold(record, args, idx)]
+    return BeliefVectorDB.from_records(memory_records, args)
 
 
 def _get_distributed_rank_info():
@@ -686,12 +710,13 @@ def _build_prompt_answer_from_metadata(record):
 
 
 class LocalHD_EPICDataset(IterableDataset):
-    def __init__(self, records, processor, args, split_name: str, is_train: bool):
+    def __init__(self, records, processor, args, split_name: str, is_train: bool, belief_db=None):
         self.records = records
         self.processor = processor
         self.args = args
         self.split_name = split_name
         self.is_train = is_train
+        self.belief_db = belief_db
 
     def _iter_records(self):
         indices, worker_id = _build_distributed_worker_indices(len(self.records))
@@ -725,6 +750,13 @@ class LocalHD_EPICDataset(IterableDataset):
                 prompt, answer = _build_prompt_answer(self.args, record)
             else:
                 prompt, answer = _build_prompt_answer_from_metadata(record)
+            if self.belief_db is not None:
+                prompt = self.belief_db.augment_prompt(
+                    record=record,
+                    prompt=prompt,
+                    sample_id=sample_id,
+                    top_k=getattr(self.args, "db_top_k", 1),
+                )
             start_time_sec, end_time_sec = _resolve_hd_epic_clip_window(record)
             frames = decode_mp4_frames(
                 video_path,
@@ -905,8 +937,9 @@ def build_train_loader(args, split: str, batch_size: int, num_workers: int, is_t
 
     if args.dataset_type == "hd_epic_local":
         records = _load_records(args) if args.annotation_path else _discover_hd_epic_records(args)
+        belief_db = _build_belief_db(records, args)
         dataset = LocalHD_EPICDataset(
-            records=records, processor=processor, args=args, split_name=split, is_train=is_train
+            records=records, processor=processor, args=args, split_name=split, is_train=is_train, belief_db=belief_db
         )
     else:
         raise RuntimeError(

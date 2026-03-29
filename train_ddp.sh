@@ -8,6 +8,10 @@ VIDEO_ID_COLUMN="${VIDEO_ID_COLUMN:-video_id}"
 PARTICIPANT_COLUMN="${PARTICIPANT_COLUMN:-participant_id}"
 DEBUG_GENERATE="${DEBUG_GENERATE:-0}"
 DEBUG_GENERATE_EVERY="${DEBUG_GENERATE_EVERY:-0}"
+USE_DB_PRIOR="${USE_DB_PRIOR:-0}"
+DB_TOP_K="${DB_TOP_K:-1}"
+DB_PRIOR_PREFIX="${DB_PRIOR_PREFIX:-Belief prior:}"
+RETRIEVAL_EMBEDDER_MODEL="${RETRIEVAL_EMBEDDER_MODEL:-}"
 
 CMD=(
   accelerate launch --num_processes 4 train.py
@@ -39,6 +43,13 @@ CMD=(
 
 if [[ "$DEBUG_GENERATE" == "1" ]]; then
   CMD+=(--debug_generate --debug_generate_every "$DEBUG_GENERATE_EVERY")
+fi
+
+if [[ "$USE_DB_PRIOR" == "1" ]]; then
+  CMD+=(--use_db_prior --db_top_k "$DB_TOP_K" --db_prior_prefix "$DB_PRIOR_PREFIX")
+  if [[ -n "$RETRIEVAL_EMBEDDER_MODEL" ]]; then
+    CMD+=(--retrieval_embedder_model "$RETRIEVAL_EMBEDDER_MODEL")
+  fi
 fi
 
 "${CMD[@]}"

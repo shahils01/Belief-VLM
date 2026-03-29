@@ -116,6 +116,11 @@ def parse_args():
     parser.add_argument("--eval_max_new_tokens", type=int, default=64)
     parser.add_argument("--debug_generate", action="store_true")
     parser.add_argument("--debug_generate_every", type=int, default=0)
+    parser.add_argument("--use_db_prior", action="store_true")
+    parser.add_argument("--db_top_k", type=int, default=1)
+    parser.add_argument("--db_prior_prefix", type=str, default="Belief prior:")
+    parser.add_argument("--retrieval_embedder_model", type=str, default="")
+    parser.add_argument("--retrieval_hash_dim", type=int, default=512)
 
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--wandb_project", type=str, default="vlm")
