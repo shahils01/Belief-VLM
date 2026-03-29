@@ -10,6 +10,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from accelerate import Accelerator
 
+from multimodal_belief_db import MultimodalBeliefDB, build_prior_inputs_from_batch
+
 try:
     from accelerate import DataLoaderConfiguration
 except Exception:
@@ -146,10 +148,14 @@ def parse_args():
     parser.add_argument("--load_model_only", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--use_db_prior", action="store_true")
+    parser.add_argument("--db_modality", type=str, default="text", choices=["text", "multimodal"])
     parser.add_argument("--db_top_k", type=int, default=1)
     parser.add_argument("--db_prior_prefix", type=str, default="Belief prior:")
+    parser.add_argument("--db_memory_annotation_path", type=str, default="")
     parser.add_argument("--retrieval_embedder_model", type=str, default="")
     parser.add_argument("--retrieval_hash_dim", type=int, default=512)
+    parser.add_argument("--db_index_backend", type=str, default="auto", choices=["auto", "faiss", "numpy"])
+    parser.add_argument("--db_build_batch_size", type=int, default=4)
 
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--wandb_project", type=str, default="vlm-ppo-vqa")
@@ -203,16 +209,35 @@ def _policy_forward(model, policy, batch_inputs, num_choices, args):
     return dist, values
 
 
-def _evaluate_policy(model, policy, loader, accelerator, args):
+def _maybe_apply_multimodal_prior(model, processor, batch, db_index, args):
+    if db_index is None:
+        return batch["inputs"]
+    with torch.no_grad():
+        encoded = model(batch["inputs"], return_hidden_states=True, pooling=args.state_pooling)
+        query_state = encoded["pooled_state"].float()
+    retrieved_texts = db_index.retrieve(query_state, batch["ids"], top_k=args.db_top_k)
+    prior_prompts = db_index.augment_prompts(batch["prompts"], retrieved_texts)
+    return build_prior_inputs_from_batch(processor, batch["inputs"], prior_prompts, args)
+
+
+def _evaluate_policy(model, policy, loader, accelerator, args, db_index=None):
     model.eval()
     policy.eval()
     total = 0
     correct = 0
+    processor = accelerator.unwrap_model(model).backbone.processor
     for batch in loader:
         num_choices = batch["num_choices"].to(accelerator.device)
         correct_idx = batch["correct_idx"].to(accelerator.device)
+        batch_inputs = _maybe_apply_multimodal_prior(
+            accelerator.unwrap_model(model),
+            processor,
+            batch,
+            db_index if getattr(args, "db_modality", "text") == "multimodal" else None,
+            args,
+        )
         with torch.no_grad():
-            dist, _ = _policy_forward(model, policy, batch["inputs"], num_choices, args)
+            dist, _ = _policy_forward(model, policy, batch_inputs, num_choices, args)
             actions = torch.argmax(dist.logits, dim=-1)
         correct += int((actions == correct_idx).sum().item())
         total += int(correct_idx.numel())
@@ -220,7 +245,7 @@ def _evaluate_policy(model, policy, loader, accelerator, args):
     return accuracy
 
 
-def run_epoch(model, policy, loader, optimizer, accelerator, args, train, global_step):
+def run_epoch(model, policy, loader, optimizer, accelerator, args, train, global_step, db_index=None):
     model.train(args.train_vlm_with_rl and train)
     if not args.train_vlm_with_rl:
         model.eval()
@@ -233,6 +258,7 @@ def run_epoch(model, policy, loader, optimizer, accelerator, args, train, global
     total_examples = 0
     step = 0
     epoch_start_time = time.perf_counter()
+    processor = accelerator.unwrap_model(model).backbone.processor
 
     for batch in loader:
         step += 1
@@ -243,9 +269,16 @@ def run_epoch(model, policy, loader, optimizer, accelerator, args, train, global
                 f"{args.max_choice_options}. Increase --max_choice_options."
             )
         correct_idx = batch["correct_idx"].to(accelerator.device)
+        batch_inputs = _maybe_apply_multimodal_prior(
+            accelerator.unwrap_model(model),
+            processor,
+            batch,
+            db_index if getattr(args, "db_modality", "text") == "multimodal" else None,
+            args,
+        )
 
         with torch.no_grad():
-            rollout_dist, rollout_values = _policy_forward(model, policy, batch["inputs"], num_choices, args)
+            rollout_dist, rollout_values = _policy_forward(model, policy, batch_inputs, num_choices, args)
             if train:
                 actions = rollout_dist.sample()
             else:
@@ -262,7 +295,7 @@ def run_epoch(model, policy, loader, optimizer, accelerator, args, train, global
         if train:
             with accelerator.accumulate(policy):
                 for _ in range(args.ppo_epochs):
-                    dist, values = _policy_forward(model, policy, batch["inputs"], num_choices, args)
+                    dist, values = _policy_forward(model, policy, batch_inputs, num_choices, args)
                     log_probs = dist.log_prob(actions)
                     ratio = torch.exp(log_probs - old_log_probs)
                     unclipped = ratio * advantages
@@ -361,7 +394,7 @@ def _save_checkpoint(model, policy, optimizer, accelerator, args, epoch, global_
         accelerator.print(f"saved {ckpt_path}")
 
 
-def _run_validation(model, policy, val_loader, accelerator, args, global_step, prefix="val"):
+def _run_validation(model, policy, val_loader, accelerator, args, global_step, prefix="val", db_index=None):
     if val_loader is None:
         return None
     with torch.no_grad():
@@ -374,8 +407,9 @@ def _run_validation(model, policy, val_loader, accelerator, args, global_step, p
             args=args,
             train=False,
             global_step=global_step,
+            db_index=db_index,
         )
-        val_acc = _evaluate_policy(model, policy, val_loader, accelerator, args)
+        val_acc = _evaluate_policy(model, policy, val_loader, accelerator, args, db_index=db_index)
     accelerator.print(
         f"{prefix} step={global_step} reward={val_metrics['reward']:.4f} val_acc={val_acc:.4f}"
     )
@@ -518,6 +552,26 @@ def main():
             start_epoch = int(ckpt.get("epoch", -1)) + 1
             global_step = int(ckpt.get("global_step", 0))
 
+    db_index = None
+    if args.use_db_prior and args.db_modality == "multimodal":
+        from data_loading import _load_records
+
+        memory_args = argparse.Namespace(**vars(args))
+        if args.db_memory_annotation_path:
+            memory_args.annotation_path = args.db_memory_annotation_path
+        memory_records = _load_records(memory_args)
+        accelerator.print(f"building multimodal belief DB from {len(memory_records)} records")
+        db_index = MultimodalBeliefDB.from_records(
+            records=memory_records,
+            model=accelerator.unwrap_model(model),
+            processor=accelerator.unwrap_model(model).backbone.processor,
+            args=args,
+            device=accelerator.device,
+        )
+        accelerator.print(
+            f"multimodal belief DB ready entries={len(db_index.entries)} backend={db_index.backend}"
+        )
+
     for epoch in range(start_epoch, args.epochs):
         train_sampler = getattr(train_loader, "sampler", None)
         if hasattr(train_sampler, "set_epoch"):
@@ -536,6 +590,7 @@ def main():
             args=args,
             train=True,
             global_step=global_step,
+            db_index=db_index,
         )
         accelerator.print(
             f"epoch={epoch} train_reward={train_metrics['reward']:.4f} "
@@ -553,7 +608,9 @@ def main():
             )
 
         if val_loader is not None:
-            val_result = _run_validation(model, policy, val_loader, accelerator, args, global_step, prefix="val_epoch")
+            val_result = _run_validation(
+                model, policy, val_loader, accelerator, args, global_step, prefix="val_epoch", db_index=db_index
+            )
             if args.wandb and val_result is not None:
                 accelerator.log(
                     {

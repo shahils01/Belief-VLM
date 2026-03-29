@@ -11,10 +11,13 @@ PROGRESS_EVERY="${PROGRESS_EVERY:-50}"
 SAVE_PREDICTIONS="${SAVE_PREDICTIONS:-}"
 VAL_RATIO="${VAL_RATIO:-}"
 USE_DB_PRIOR="${USE_DB_PRIOR:-0}"
+DB_MODALITY="${DB_MODALITY:-text}"
 DB_TOP_K="${DB_TOP_K:-1}"
 DB_PRIOR_PREFIX="${DB_PRIOR_PREFIX:-Belief prior:}"
 DB_MEMORY_ANNOTATION_PATH="${DB_MEMORY_ANNOTATION_PATH:-}"
 RETRIEVAL_EMBEDDER_MODEL="${RETRIEVAL_EMBEDDER_MODEL:-}"
+DB_INDEX_BACKEND="${DB_INDEX_BACKEND:-auto}"
+DB_BUILD_BATCH_SIZE="${DB_BUILD_BATCH_SIZE:-4}"
 
 CMD=(
   python eval_ppo_vqa.py
@@ -37,7 +40,7 @@ if [[ -n "$VAL_RATIO" ]]; then
 fi
 
 if [[ "$USE_DB_PRIOR" == "1" ]]; then
-  CMD+=(--use_db_prior --db_top_k "$DB_TOP_K" --db_prior_prefix "$DB_PRIOR_PREFIX")
+  CMD+=(--use_db_prior --db_modality "$DB_MODALITY" --db_top_k "$DB_TOP_K" --db_prior_prefix "$DB_PRIOR_PREFIX" --db_index_backend "$DB_INDEX_BACKEND" --db_build_batch_size "$DB_BUILD_BATCH_SIZE")
   if [[ -n "$DB_MEMORY_ANNOTATION_PATH" ]]; then
     CMD+=(--db_memory_annotation_path "$DB_MEMORY_ANNOTATION_PATH")
   fi

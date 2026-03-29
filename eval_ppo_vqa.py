@@ -7,6 +7,7 @@ import torch
 import torch.nn.functional as F
 
 from belief_db import BeliefVectorDB
+from multimodal_belief_db import MultimodalBeliefDB, build_prior_inputs_from_batch
 from data_loading import (
     _get_first,
     _load_records,
@@ -61,11 +62,14 @@ def parse_args():
     parser.add_argument("--progress_every", type=int, default=50)
     parser.add_argument("--save_predictions", type=str, default="")
     parser.add_argument("--use_db_prior", action="store_true")
+    parser.add_argument("--db_modality", type=str, default="text", choices=["text", "multimodal"])
     parser.add_argument("--db_top_k", type=int, default=1)
     parser.add_argument("--db_prior_prefix", type=str, default="Belief prior:")
     parser.add_argument("--db_memory_annotation_path", type=str, default="")
     parser.add_argument("--retrieval_embedder_model", type=str, default="")
     parser.add_argument("--retrieval_hash_dim", type=int, default=512)
+    parser.add_argument("--db_index_backend", type=str, default="auto", choices=["auto", "faiss", "numpy"])
+    parser.add_argument("--db_build_batch_size", type=int, default=4)
     return parser.parse_args()
 
 
@@ -103,10 +107,13 @@ def _merge_args(cli_args, ckpt_args):
         "max_choice_options",
         "val_ratio",
         "db_top_k",
+        "db_modality",
         "db_prior_prefix",
         "db_memory_annotation_path",
         "retrieval_embedder_model",
         "retrieval_hash_dim",
+        "db_index_backend",
+        "db_build_batch_size",
     )
     for key in optional_overrides:
         value = getattr(cli_args, key)
@@ -262,6 +269,21 @@ def _sequence_nll(logits, labels):
 
 def _evaluate_ppo(args, merged_args, device):
     model, policy, _ = _load_model_and_policy(args.checkpoint, merged_args, device=device)
+    db_index = None
+    if merged_args.use_db_prior and merged_args.db_modality == "multimodal":
+        if merged_args.db_memory_annotation_path:
+            memory_args = SimpleNamespace(**vars(merged_args))
+            memory_args.annotation_path = merged_args.db_memory_annotation_path
+            memory_records = _load_records(memory_args)
+        else:
+            memory_records = _load_records(merged_args)
+        db_index = MultimodalBeliefDB.from_records(
+            records=memory_records,
+            model=model,
+            processor=model.backbone.processor,
+            args=merged_args,
+            device=device,
+        )
 
     loader = build_rl_vqa_loader(
         merged_args,
@@ -286,6 +308,16 @@ def _evaluate_ppo(args, merged_args, device):
             key: value.to(device) if torch.is_tensor(value) else value
             for key, value in batch["inputs"].items()
         }
+        if db_index is not None:
+            with torch.no_grad():
+                encoded = model(inputs, return_hidden_states=True, pooling=merged_args.state_pooling)
+                query_state = encoded["pooled_state"].float()
+            retrieved_texts = db_index.retrieve(query_state, batch["ids"], top_k=merged_args.db_top_k)
+            prior_prompts = db_index.augment_prompts(batch["prompts"], retrieved_texts)
+            inputs = {
+                key: value.to(device) if torch.is_tensor(value) else value
+                for key, value in build_prior_inputs_from_batch(model.backbone.processor, batch["inputs"], prior_prompts, merged_args).items()
+            }
 
         with torch.no_grad():
             encoded = model(inputs, return_hidden_states=True, pooling=merged_args.state_pooling)

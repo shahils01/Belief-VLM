@@ -7,10 +7,13 @@ VLM_CHECKPOINT="${VLM_CHECKPOINT:-/scratch/shahils/Belief-VLM/checkpoints_belief
 TRAIN_SAMPLES_PER_EPOCH="${TRAIN_SAMPLES_PER_EPOCH:-200000}"
 MAX_VAL_SAMPLES="${MAX_VAL_SAMPLES:-50}"
 USE_DB_PRIOR="${USE_DB_PRIOR:-0}"
+DB_MODALITY="${DB_MODALITY:-text}"
 DB_TOP_K="${DB_TOP_K:-1}"
 DB_PRIOR_PREFIX="${DB_PRIOR_PREFIX:-Belief prior:}"
 DB_MEMORY_ANNOTATION_PATH="${DB_MEMORY_ANNOTATION_PATH:-}"
 RETRIEVAL_EMBEDDER_MODEL="${RETRIEVAL_EMBEDDER_MODEL:-}"
+DB_INDEX_BACKEND="${DB_INDEX_BACKEND:-auto}"
+DB_BUILD_BATCH_SIZE="${DB_BUILD_BATCH_SIZE:-4}"
 
 CMD=(
   accelerate launch --num_processes 8 train_ppo_vqa.py
@@ -45,7 +48,7 @@ if [[ -n "$VLM_CHECKPOINT" ]]; then
 fi
 
 if [[ "$USE_DB_PRIOR" == "1" ]]; then
-  CMD+=(--use_db_prior --db_top_k "$DB_TOP_K" --db_prior_prefix "$DB_PRIOR_PREFIX")
+  CMD+=(--use_db_prior --db_modality "$DB_MODALITY" --db_top_k "$DB_TOP_K" --db_prior_prefix "$DB_PRIOR_PREFIX" --db_index_backend "$DB_INDEX_BACKEND" --db_build_batch_size "$DB_BUILD_BATCH_SIZE")
   if [[ -n "$DB_MEMORY_ANNOTATION_PATH" ]]; then
     CMD+=(--db_memory_annotation_path "$DB_MEMORY_ANNOTATION_PATH")
   fi

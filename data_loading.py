@@ -343,6 +343,8 @@ def _is_in_validation_fold(record, args, default):
 def _build_belief_db(records, args):
     if not getattr(args, "use_db_prior", False):
         return None
+    if getattr(args, "db_modality", "text") != "text":
+        return None
     memory_path = getattr(args, "db_memory_annotation_path", "") or getattr(args, "annotation_path", "")
     if not memory_path:
         warnings.warn("use_db_prior is enabled but annotation_path is empty; skipping belief DB.", RuntimeWarning)
