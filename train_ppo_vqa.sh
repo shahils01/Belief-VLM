@@ -4,7 +4,7 @@ VIDEO_ROOT="${VIDEO_ROOT:-/scratch/shahils/hd_epic_dataset/videos/HD-EPIC/Videos
 ANNOTATION_PATH="${ANNOTATION_PATH:-/scratch/shahils/hd_epic_dataset/hd-epic-annotations/vqa-benchmark/}"
 METADATA_ROOT="${METADATA_ROOT:-/scratch/shahils/hd_epic_dataset/HD-EPIC Intermediate Data}"
 VLM_CHECKPOINT="${VLM_CHECKPOINT:-/scratch/shahils/Belief-VLM/checkpoints_belief_hd_epic_ddp_07/ckpt_epoch_99.pt}"
-TRAIN_SAMPLES_PER_EPOCH="${TRAIN_SAMPLES_PER_EPOCH:-20000}"
+TRAIN_SAMPLES_PER_EPOCH="${TRAIN_SAMPLES_PER_EPOCH:-200000}"
 MAX_VAL_SAMPLES="${MAX_VAL_SAMPLES:-50}"
 
 CMD=(
@@ -18,9 +18,9 @@ CMD=(
   --max_val_samples_per_split "$MAX_VAL_SAMPLES"
   --train_sampling_mode task_uniform
   --train_samples_per_epoch "$TRAIN_SAMPLES_PER_EPOCH"
-  --batch_size 8
+  --batch_size 16
   --grad_accum_steps 8
-  --num_workers 4
+  --num_workers 1
   --video_frames 8
   --mixed_precision bf16
   --allow_tf32
@@ -30,7 +30,7 @@ CMD=(
   --vlm_lr 2e-5
   --vl_model_preset "$VL_MODEL_PRESET"
   --vl_model_name "$VL_MODEL_NAME"
-  --resume_checkpoint checkpoints_ppo_vqa_fulldataset_4b/ckpt_epoch_24.pt
+  --resume_checkpoint checkpoints_ppo_vqa_fulldataset/ckpt_epoch_27.pt
   --gradient_checkpointing
   --save_dir checkpoints_ppo_vqa_fulldataset
 )
