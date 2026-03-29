@@ -343,10 +343,22 @@ def _is_in_validation_fold(record, args, default):
 def _build_belief_db(records, args):
     if not getattr(args, "use_db_prior", False):
         return None
-    if not getattr(args, "annotation_path", ""):
+    memory_path = getattr(args, "db_memory_annotation_path", "") or getattr(args, "annotation_path", "")
+    if not memory_path:
         warnings.warn("use_db_prior is enabled but annotation_path is empty; skipping belief DB.", RuntimeWarning)
         return None
-    memory_records = [record for idx, record in enumerate(records) if not _is_in_validation_fold(record, args, idx)]
+    if getattr(args, "db_memory_annotation_path", ""):
+        class _MemoryArgs:
+            pass
+
+        memory_args = _MemoryArgs()
+        for key, value in vars(args).items():
+            setattr(memory_args, key, value)
+        memory_args.annotation_path = memory_path
+        base_records = _load_records(memory_args)
+    else:
+        base_records = records
+    memory_records = [record for idx, record in enumerate(base_records) if not _is_in_validation_fold(record, args, idx)]
     return BeliefVectorDB.from_records(memory_records, args)
 
 
@@ -781,11 +793,12 @@ class LocalHD_EPICDataset(IterableDataset):
 
 
 class LocalHD_EPICRLVQADataset(Dataset):
-    def __init__(self, records, processor, args, split_name: str, is_train: bool):
+    def __init__(self, records, processor, args, split_name: str, is_train: bool, belief_db=None):
         self.processor = processor
         self.args = args
         self.split_name = split_name
         self.is_train = is_train
+        self.belief_db = belief_db
         max_samples = int(args.max_samples_per_split)
         if not is_train and getattr(args, "max_val_samples_per_split", 0) > 0:
             max_samples = int(args.max_val_samples_per_split)
@@ -822,8 +835,18 @@ class LocalHD_EPICRLVQADataset(Dataset):
 
     def __getitem__(self, index):
         record = self.records[int(index)]
+        sample_id = str(
+            _get_first(record, [self.args.id_column, "id", "sample_id", "uid", "video_id"]) or int(index)
+        )
         video_path = _resolve_hd_epic_video_path(self.args, record)
         prompt, choices, correct_idx = _build_vqa_prompt_choices(self.args, record)
+        if self.belief_db is not None:
+            prompt = self.belief_db.augment_prompt(
+                record=record,
+                prompt=prompt,
+                sample_id=sample_id,
+                top_k=getattr(self.args, "db_top_k", 1),
+            )
         start_time_sec, end_time_sec = _resolve_hd_epic_clip_window(record)
         frames = decode_mp4_frames(
             video_path,
@@ -839,9 +862,7 @@ class LocalHD_EPICRLVQADataset(Dataset):
             max_text_len=self.args.vl_max_text_len,
         )
         return {
-            "id": str(
-                _get_first(record, [self.args.id_column, "id", "sample_id", "uid", "video_id"]) or int(index)
-            ),
+            "id": sample_id,
             "task_name": str(record.get("task_name", "unknown")),
             "prompt": prompt,
             "choices": choices,
@@ -959,12 +980,14 @@ def build_train_loader(args, split: str, batch_size: int, num_workers: int, is_t
 def build_rl_vqa_loader(args, split: str, batch_size: int, num_workers: int, is_train: bool):
     processor = build_vlm_processor(args)
     records = _load_records(args)
+    belief_db = _build_belief_db(records, args)
     dataset = LocalHD_EPICRLVQADataset(
         records=records,
         processor=processor,
         args=args,
         split_name=split,
         is_train=is_train,
+        belief_db=belief_db,
     )
     sampler = None
     shuffle = False

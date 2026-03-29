@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import torch
 import torch.nn.functional as F
 
+from belief_db import BeliefVectorDB
 from data_loading import (
     _get_first,
     _load_records,
@@ -59,6 +60,12 @@ def parse_args():
     parser.add_argument("--print_samples", type=int, default=10)
     parser.add_argument("--progress_every", type=int, default=50)
     parser.add_argument("--save_predictions", type=str, default="")
+    parser.add_argument("--use_db_prior", action="store_true")
+    parser.add_argument("--db_top_k", type=int, default=1)
+    parser.add_argument("--db_prior_prefix", type=str, default="Belief prior:")
+    parser.add_argument("--db_memory_annotation_path", type=str, default="")
+    parser.add_argument("--retrieval_embedder_model", type=str, default="")
+    parser.add_argument("--retrieval_hash_dim", type=int, default=512)
     return parser.parse_args()
 
 
@@ -95,6 +102,11 @@ def _merge_args(cli_args, ckpt_args):
         "state_pooling",
         "max_choice_options",
         "val_ratio",
+        "db_top_k",
+        "db_prior_prefix",
+        "db_memory_annotation_path",
+        "retrieval_embedder_model",
+        "retrieval_hash_dim",
     )
     for key in optional_overrides:
         value = getattr(cli_args, key)
@@ -109,6 +121,8 @@ def _merge_args(cli_args, ckpt_args):
         merged["disable_vl_cache"] = True
     if cli_args.allow_tf32:
         merged["allow_tf32"] = True
+    if cli_args.use_db_prior:
+        merged["use_db_prior"] = True
 
     merged.setdefault("dataset_type", "hd_epic_local")
     merged.setdefault("dataset_name", "hd_epic_local")
@@ -136,6 +150,12 @@ def _merge_args(cli_args, ckpt_args):
     merged.setdefault("max_choice_options", 8)
     merged.setdefault("train_vlm_with_rl", False)
     merged.setdefault("seed", 42)
+    merged.setdefault("use_db_prior", False)
+    merged.setdefault("db_top_k", 1)
+    merged.setdefault("db_prior_prefix", "Belief prior:")
+    merged.setdefault("db_memory_annotation_path", "")
+    merged.setdefault("retrieval_embedder_model", "")
+    merged.setdefault("retrieval_hash_dim", 512)
     return SimpleNamespace(**merged)
 
 
@@ -324,6 +344,15 @@ def _evaluate_ppo(args, merged_args, device):
 def _evaluate_vlm(args, merged_args, device):
     model, _ = _load_vlm_model(args.checkpoint, merged_args, device=device)
     processor = model.backbone.processor
+    belief_db = None
+    if merged_args.use_db_prior:
+        if merged_args.db_memory_annotation_path:
+            memory_args = SimpleNamespace(**vars(merged_args))
+            memory_args.annotation_path = merged_args.db_memory_annotation_path
+            memory_records = _load_records(memory_args)
+        else:
+            memory_records = list(_iter_validation_records(merged_args))
+        belief_db = BeliefVectorDB.from_records(memory_records, merged_args)
 
     total = 0
     correct = 0
@@ -335,6 +364,9 @@ def _evaluate_vlm(args, merged_args, device):
             break
 
         prompt, choices = _build_eval_prompt(record, merged_args)
+        sample_id = str(_get_first(record, [merged_args.id_column, "id", "sample_id", "uid", "video_id"]) or total)
+        if belief_db is not None:
+            prompt = belief_db.augment_prompt(record, prompt, sample_id, top_k=merged_args.db_top_k)
         correct_idx = _resolve_correct_choice_index(record, len(choices))
         video_path = _resolve_hd_epic_video_path(merged_args, record)
         start_time_sec, end_time_sec = _resolve_hd_epic_clip_window(record)

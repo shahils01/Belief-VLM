@@ -145,6 +145,11 @@ def parse_args():
     parser.add_argument("--resume_checkpoint", type=str, default="")
     parser.add_argument("--load_model_only", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--use_db_prior", action="store_true")
+    parser.add_argument("--db_top_k", type=int, default=1)
+    parser.add_argument("--db_prior_prefix", type=str, default="Belief prior:")
+    parser.add_argument("--retrieval_embedder_model", type=str, default="")
+    parser.add_argument("--retrieval_hash_dim", type=int, default=512)
 
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--wandb_project", type=str, default="vlm-ppo-vqa")

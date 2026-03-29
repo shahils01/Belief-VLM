@@ -6,6 +6,11 @@ METADATA_ROOT="${METADATA_ROOT:-/scratch/shahils/hd_epic_dataset/HD-EPIC Interme
 VLM_CHECKPOINT="${VLM_CHECKPOINT:-/scratch/shahils/Belief-VLM/checkpoints_belief_hd_epic_ddp_07/ckpt_epoch_99.pt}"
 TRAIN_SAMPLES_PER_EPOCH="${TRAIN_SAMPLES_PER_EPOCH:-200000}"
 MAX_VAL_SAMPLES="${MAX_VAL_SAMPLES:-50}"
+USE_DB_PRIOR="${USE_DB_PRIOR:-0}"
+DB_TOP_K="${DB_TOP_K:-1}"
+DB_PRIOR_PREFIX="${DB_PRIOR_PREFIX:-Belief prior:}"
+DB_MEMORY_ANNOTATION_PATH="${DB_MEMORY_ANNOTATION_PATH:-}"
+RETRIEVAL_EMBEDDER_MODEL="${RETRIEVAL_EMBEDDER_MODEL:-}"
 
 CMD=(
   accelerate launch --num_processes 8 train_ppo_vqa.py
@@ -37,6 +42,16 @@ CMD=(
 
 if [[ -n "$VLM_CHECKPOINT" ]]; then
   CMD+=(--vlm_checkpoint "$VLM_CHECKPOINT")
+fi
+
+if [[ "$USE_DB_PRIOR" == "1" ]]; then
+  CMD+=(--use_db_prior --db_top_k "$DB_TOP_K" --db_prior_prefix "$DB_PRIOR_PREFIX")
+  if [[ -n "$DB_MEMORY_ANNOTATION_PATH" ]]; then
+    CMD+=(--db_memory_annotation_path "$DB_MEMORY_ANNOTATION_PATH")
+  fi
+  if [[ -n "$RETRIEVAL_EMBEDDER_MODEL" ]]; then
+    CMD+=(--retrieval_embedder_model "$RETRIEVAL_EMBEDDER_MODEL")
+  fi
 fi
 
 "${CMD[@]}"
