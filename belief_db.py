@@ -84,8 +84,6 @@ def build_query_text(record, prompt: str):
 
 
 def default_belief_text(record):
-    task_name = _normalize_text(record.get("task_name", ""))
-    question = _normalize_text(_get_first(record, ["question", "prompt", "instruction", "query"]))
     answer = _normalize_text(_get_first(record, ["answer", "response", "label", "caption", "narration"]))
     if not answer:
         choices = _get_first(record, ["options", "choices", "answer_options"])
@@ -100,14 +98,18 @@ def default_belief_text(record):
             except Exception:
                 pass
 
-    parts = []
-    if task_name:
-        parts.append(f"Task: {task_name}")
-    if question:
-        parts.append(f"Relevant question: {question}")
-    if answer:
-        parts.append(f"In a similar example, the best answer was: {answer}")
-    return " ".join(parts).strip()
+    if not answer:
+        return ""
+
+    # Keep retrieved priors short so they act as a hint rather than a
+    # full exemplar that can distract the VLM prompt.
+    tokens = answer.replace("\n", " ").split()
+    short_answer = " ".join(tokens[:12]).strip(" ,.;:")
+    if not short_answer:
+        return ""
+    if len(tokens) > 12:
+        short_answer = f"{short_answer}..."
+    return f"Likely goal: {short_answer}."
 
 
 @dataclass
