@@ -10,7 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from accelerate import Accelerator
 
-from multimodal_belief_db import MultimodalBeliefDB, build_prior_inputs_from_batch
+from vector_memory import OnlineVectorMemory, build_answer_only_inputs
 
 try:
     from accelerate import DataLoaderConfiguration
@@ -67,6 +67,37 @@ class PPOAnswerPolicy(nn.Module):
         logits = self.policy_head(hidden)
         value = self.value_head(hidden).squeeze(-1)
         return logits, value
+
+
+class GatedMemoryFusion(nn.Module):
+    def __init__(self, hidden_dim: int):
+        super().__init__()
+        self.context_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.answer_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.reward_proj = nn.Linear(1, hidden_dim)
+        self.gate = nn.Sequential(
+            nn.LayerNorm(hidden_dim * 3 + 2),
+            nn.Linear(hidden_dim * 3 + 2, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.output_norm = nn.LayerNorm(hidden_dim)
+
+    def forward(self, current_state, retrieved_context, retrieved_answer, retrieved_reward, retrieved_similarity):
+        reward = retrieved_reward.unsqueeze(-1)
+        similarity = retrieved_similarity.unsqueeze(-1)
+        gate_input = torch.cat(
+            [current_state, retrieved_context, retrieved_answer, reward, similarity],
+            dim=-1,
+        )
+        gate = torch.sigmoid(self.gate(gate_input))
+        memory_state = (
+            self.context_proj(retrieved_context)
+            + gate * self.answer_proj(retrieved_answer)
+            + self.reward_proj(reward)
+        )
+        fused_state = self.output_norm(current_state + memory_state)
+        return fused_state, gate
 
 
 def parse_args():
@@ -148,14 +179,13 @@ def parse_args():
     parser.add_argument("--load_model_only", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--use_db_prior", action="store_true")
-    parser.add_argument("--db_modality", type=str, default="text", choices=["text", "multimodal"])
     parser.add_argument("--db_top_k", type=int, default=1)
     parser.add_argument("--db_prior_prefix", type=str, default="Belief prior:")
-    parser.add_argument("--db_memory_annotation_path", type=str, default="")
-    parser.add_argument("--retrieval_embedder_model", type=str, default="")
-    parser.add_argument("--retrieval_hash_dim", type=int, default=512)
     parser.add_argument("--db_index_backend", type=str, default="auto", choices=["auto", "faiss", "numpy"])
-    parser.add_argument("--db_build_batch_size", type=int, default=4)
+    parser.add_argument("--db_same_task_first", action="store_true", default=True)
+    parser.add_argument("--db_text_max_words", type=int, default=12)
+    parser.add_argument("--memory_layer_idx", type=int, default=1)
+    parser.add_argument("--freeze_memory_prefix", action="store_true")
 
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--wandb_project", type=str, default="vlm-ppo-vqa")
@@ -191,53 +221,110 @@ def _masked_logits(logits, num_choices):
     return logits.masked_fill(~mask, torch.finfo(logits.dtype).min)
 
 
-def _extract_state(model, batch_inputs, args):
+def _extract_state(model, batch_inputs, args, layer_idx: int = -1):
     ctx = nullcontext() if args.train_vlm_with_rl else torch.no_grad()
     with ctx:
-        encoded = model(batch_inputs, return_hidden_states=True, pooling=args.state_pooling)
+        encoded = model(batch_inputs, return_hidden_states=True, pooling=args.state_pooling, layer_idx=layer_idx)
     pooled_state = encoded["pooled_state"]
     if not args.train_vlm_with_rl:
         pooled_state = pooled_state.detach()
     return pooled_state.float()
 
 
-def _policy_forward(model, policy, batch_inputs, num_choices, args):
-    state = _extract_state(model, batch_inputs, args)
+def _policy_from_state(policy, state, num_choices):
     logits, values = policy(state)
     masked_logits = _masked_logits(logits, num_choices.to(logits.device))
     dist = torch.distributions.Categorical(logits=masked_logits)
     return dist, values
 
 
-def _maybe_apply_multimodal_prior(model, processor, batch, db_index, args):
-    if db_index is None:
-        return batch["inputs"]
+def _aggregate_memory(memory, query_state, batch, args):
+    if memory is None or len(memory) == 0:
+        return None
+    aggregates = memory.retrieve_aggregates(
+        query_embeddings=query_state.detach(),
+        sample_ids=batch["ids"],
+        task_names=batch["task_names"],
+        top_k=args.db_top_k,
+    )
+    device = query_state.device
+    dtype = query_state.dtype
+    return {
+        "context": torch.from_numpy(aggregates["context"]).to(device=device, dtype=dtype),
+        "answer": torch.from_numpy(aggregates["answer"]).to(device=device, dtype=dtype),
+        "reward": torch.from_numpy(aggregates["reward"]).to(device=device, dtype=dtype),
+        "similarity": torch.from_numpy(aggregates["similarity"]).to(device=device, dtype=dtype),
+        "count": torch.from_numpy(aggregates["count"]).to(device=device),
+    }
+
+
+def _build_policy_state(model, batch, memory, fusion, args):
+    base_state = _extract_state(model, batch["inputs"], args, layer_idx=-1)
+    if memory is None or len(memory) == 0 or fusion is None:
+        zeros = torch.zeros(base_state.size(0), device=base_state.device, dtype=base_state.dtype)
+        return base_state, _extract_state(model, batch["inputs"], args, layer_idx=args.memory_layer_idx), {
+            "reward": zeros,
+            "similarity": zeros,
+            "count": zeros.long(),
+            "gate": None,
+        }
+    memory_query = _extract_state(model, batch["inputs"], args, layer_idx=args.memory_layer_idx)
+    aggregates = _aggregate_memory(memory, memory_query, batch, args)
+    fused_state, gate = fusion(
+        base_state,
+        aggregates["context"],
+        aggregates["answer"],
+        aggregates["reward"],
+        aggregates["similarity"],
+    )
+    aggregates["gate"] = gate
+    return fused_state, memory_query, aggregates
+
+
+def _selected_answer_texts(batch, actions):
+    selected = []
+    action_list = actions.detach().cpu().tolist()
+    for row, action in enumerate(action_list):
+        choices = batch["choices"][row]
+        idx = int(action)
+        idx = max(0, min(idx, len(choices) - 1))
+        selected.append(str(choices[idx]))
+    return selected
+
+
+def _encode_answer_embeddings(model, processor, answer_texts, args):
+    if not answer_texts:
+        return torch.zeros((0, 0), dtype=torch.float32)
+    answer_inputs = build_answer_only_inputs(processor, answer_texts, args.vl_max_text_len)
     with torch.no_grad():
-        encoded = model(batch["inputs"], return_hidden_states=True, pooling=args.state_pooling)
-        query_state = encoded["pooled_state"].float()
-    retrieved_texts = db_index.retrieve(query_state, batch["ids"], top_k=args.db_top_k)
-    prior_prompts = db_index.augment_prompts(batch["prompts"], retrieved_texts)
-    return build_prior_inputs_from_batch(processor, batch["inputs"], prior_prompts, args)
+        encoded = model(
+            answer_inputs,
+            return_hidden_states=True,
+            pooling=args.state_pooling,
+            layer_idx=args.memory_layer_idx,
+        )
+    return encoded["pooled_state"].float().detach()
 
 
-def _evaluate_policy(model, policy, loader, accelerator, args, db_index=None):
+def _evaluate_policy(model, policy, fusion, loader, accelerator, args, memory=None):
     model.eval()
     policy.eval()
+    if fusion is not None:
+        fusion.eval()
     total = 0
     correct = 0
-    processor = accelerator.unwrap_model(model).backbone.processor
     for batch in loader:
         num_choices = batch["num_choices"].to(accelerator.device)
         correct_idx = batch["correct_idx"].to(accelerator.device)
-        batch_inputs = _maybe_apply_multimodal_prior(
-            accelerator.unwrap_model(model),
-            processor,
-            batch,
-            db_index if getattr(args, "db_modality", "text") == "multimodal" else None,
-            args,
-        )
         with torch.no_grad():
-            dist, _ = _policy_forward(model, policy, batch_inputs, num_choices, args)
+            state, _, _ = _build_policy_state(
+                accelerator.unwrap_model(model),
+                batch,
+                memory,
+                accelerator.unwrap_model(fusion) if fusion is not None else None,
+                args,
+            )
+            dist, _ = _policy_from_state(policy, state, num_choices)
             actions = torch.argmax(dist.logits, dim=-1)
         correct += int((actions == correct_idx).sum().item())
         total += int(correct_idx.numel())
@@ -245,16 +332,21 @@ def _evaluate_policy(model, policy, loader, accelerator, args, db_index=None):
     return accuracy
 
 
-def run_epoch(model, policy, loader, optimizer, accelerator, args, train, global_step, db_index=None):
+def run_epoch(model, policy, fusion, loader, optimizer, accelerator, args, train, global_step, memory=None):
     model.train(args.train_vlm_with_rl and train)
     if not args.train_vlm_with_rl:
         model.eval()
     policy.train() if train else policy.eval()
+    if fusion is not None:
+        fusion.train() if train else fusion.eval()
 
     total_reward = 0.0
     total_policy_loss = 0.0
     total_value_loss = 0.0
     total_entropy = 0.0
+    total_memory_reward = 0.0
+    total_memory_similarity = 0.0
+    total_gate = 0.0
     total_examples = 0
     step = 0
     epoch_start_time = time.perf_counter()
@@ -269,16 +361,16 @@ def run_epoch(model, policy, loader, optimizer, accelerator, args, train, global
                 f"{args.max_choice_options}. Increase --max_choice_options."
             )
         correct_idx = batch["correct_idx"].to(accelerator.device)
-        batch_inputs = _maybe_apply_multimodal_prior(
-            accelerator.unwrap_model(model),
-            processor,
-            batch,
-            db_index if getattr(args, "db_modality", "text") == "multimodal" else None,
-            args,
-        )
 
         with torch.no_grad():
-            rollout_dist, rollout_values = _policy_forward(model, policy, batch_inputs, num_choices, args)
+            rollout_state, query_state, memory_info = _build_policy_state(
+                accelerator.unwrap_model(model),
+                batch,
+                memory,
+                accelerator.unwrap_model(fusion) if fusion is not None else None,
+                args,
+            )
+            rollout_dist, rollout_values = _policy_from_state(policy, rollout_state, num_choices)
             if train:
                 actions = rollout_dist.sample()
             else:
@@ -295,7 +387,14 @@ def run_epoch(model, policy, loader, optimizer, accelerator, args, train, global
         if train:
             with accelerator.accumulate(policy):
                 for _ in range(args.ppo_epochs):
-                    dist, values = _policy_forward(model, policy, batch_inputs, num_choices, args)
+                    policy_state, query_state, memory_info = _build_policy_state(
+                        model,
+                        batch,
+                        memory,
+                        fusion,
+                        args,
+                    )
+                    dist, values = _policy_from_state(policy, policy_state, num_choices)
                     log_probs = dist.log_prob(actions)
                     ratio = torch.exp(log_probs - old_log_probs)
                     unclipped = ratio * advantages
@@ -309,6 +408,8 @@ def run_epoch(model, policy, loader, optimizer, accelerator, args, train, global
                     accelerator.backward(loss)
                     if args.max_grad_norm > 0:
                         accelerator.clip_grad_norm_(policy.parameters(), args.max_grad_norm)
+                        if fusion is not None:
+                            accelerator.clip_grad_norm_(fusion.parameters(), args.max_grad_norm)
                         if args.train_vlm_with_rl:
                             accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
                     optimizer.step()
@@ -318,7 +419,14 @@ def run_epoch(model, policy, loader, optimizer, accelerator, args, train, global
                     entropy_value = float(entropy.detach().item())
         else:
             with torch.no_grad():
-                dist, values = _policy_forward(model, policy, batch["inputs"], num_choices, args)
+                policy_state, query_state, memory_info = _build_policy_state(
+                    accelerator.unwrap_model(model),
+                    batch,
+                    memory,
+                    accelerator.unwrap_model(fusion) if fusion is not None else None,
+                    args,
+                )
+                dist, values = _policy_from_state(policy, policy_state, num_choices)
                 log_probs = dist.log_prob(actions)
                 ratio = torch.exp(log_probs - old_log_probs)
                 unclipped = ratio * advantages
@@ -333,14 +441,38 @@ def run_epoch(model, policy, loader, optimizer, accelerator, args, train, global
         total_policy_loss += policy_loss_value * batch_size
         total_value_loss += value_loss_value * batch_size
         total_entropy += entropy_value * batch_size
+        total_memory_reward += float(memory_info["reward"].sum().item())
+        total_memory_similarity += float(memory_info["similarity"].sum().item())
+        if memory_info["gate"] is not None:
+            total_gate += float(memory_info["gate"].mean(dim=-1).sum().item())
         if train:
             global_step += 1
+            if memory is not None:
+                chosen_answers = _selected_answer_texts(batch, actions)
+                answer_embeddings = _encode_answer_embeddings(
+                    accelerator.unwrap_model(model),
+                    processor,
+                    chosen_answers,
+                    args,
+                )
+                memory.add(
+                    embeddings=query_state,
+                    sample_ids=batch["ids"],
+                    task_names=batch["task_names"],
+                    answer_texts=chosen_answers,
+                    max_words=args.db_text_max_words,
+                    answer_embeddings=answer_embeddings,
+                    rewards=rewards,
+                )
 
         if args.log_every > 0 and step % args.log_every == 0:
             avg_reward = total_reward / max(total_examples, 1)
             avg_policy_loss = total_policy_loss / max(total_examples, 1)
             avg_value_loss = total_value_loss / max(total_examples, 1)
             avg_entropy = total_entropy / max(total_examples, 1)
+            avg_memory_reward = total_memory_reward / max(total_examples, 1)
+            avg_memory_similarity = total_memory_similarity / max(total_examples, 1)
+            avg_gate = total_gate / max(total_examples, 1) if memory is not None else 0.0
             elapsed = max(time.perf_counter() - epoch_start_time, 1e-6)
             samples_per_sec = total_examples / elapsed
             sec_per_step = elapsed / max(step, 1)
@@ -348,6 +480,7 @@ def run_epoch(model, policy, loader, optimizer, accelerator, args, train, global
             accelerator.print(
                 f"{phase} step={step} reward={avg_reward:.4f} policy_loss={avg_policy_loss:.4f} "
                 f"value_loss={avg_value_loss:.4f} entropy={avg_entropy:.4f} "
+                f"memory_reward={avg_memory_reward:.4f} memory_sim={avg_memory_similarity:.4f} gate={avg_gate:.4f} "
                 f"samples_per_sec={samples_per_sec:.2f} sec_per_step={sec_per_step:.2f}"
             )
             if args.wandb:
@@ -356,6 +489,9 @@ def run_epoch(model, policy, loader, optimizer, accelerator, args, train, global
                     f"{phase}/policy_loss": avg_policy_loss,
                     f"{phase}/value_loss": avg_value_loss,
                     f"{phase}/entropy": avg_entropy,
+                    f"{phase}/memory_reward": avg_memory_reward,
+                    f"{phase}/memory_similarity": avg_memory_similarity,
+                    f"{phase}/memory_gate": avg_gate,
                     f"{phase}/samples_per_sec": samples_per_sec,
                     f"{phase}/sec_per_step": sec_per_step,
                 }
@@ -370,46 +506,53 @@ def run_epoch(model, policy, loader, optimizer, accelerator, args, train, global
         "policy_loss": total_policy_loss / max(total_examples, 1),
         "value_loss": total_value_loss / max(total_examples, 1),
         "entropy": total_entropy / max(total_examples, 1),
+        "memory_reward": total_memory_reward / max(total_examples, 1),
+        "memory_similarity": total_memory_similarity / max(total_examples, 1),
+        "memory_gate": total_gate / max(total_examples, 1) if memory is not None else 0.0,
     }
     return metrics, global_step
 
 
-def _save_checkpoint(model, policy, optimizer, accelerator, args, epoch, global_step, tag):
+def _save_checkpoint(model, policy, fusion, optimizer, accelerator, args, epoch, global_step, tag, memory=None):
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
         unwrapped_model = accelerator.unwrap_model(model)
         unwrapped_policy = accelerator.unwrap_model(policy)
+        unwrapped_fusion = accelerator.unwrap_model(fusion) if fusion is not None else None
         ckpt_path = os.path.join(args.save_dir, f"{tag}.pt")
         torch.save(
             {
                 "model": unwrapped_model.state_dict(),
                 "policy": unwrapped_policy.state_dict(),
+                "memory_fusion": unwrapped_fusion.state_dict() if unwrapped_fusion is not None else None,
                 "optimizer": optimizer.state_dict(),
                 "epoch": epoch,
                 "global_step": global_step,
                 "args": vars(args),
+                "vector_memory": memory.state_dict() if memory is not None else None,
             },
             ckpt_path,
         )
         accelerator.print(f"saved {ckpt_path}")
 
 
-def _run_validation(model, policy, val_loader, accelerator, args, global_step, prefix="val", db_index=None):
+def _run_validation(model, policy, fusion, val_loader, accelerator, args, global_step, prefix="val", memory=None):
     if val_loader is None:
         return None
     with torch.no_grad():
         val_metrics, _ = run_epoch(
             model=model,
             policy=policy,
+            fusion=fusion,
             loader=val_loader,
             optimizer=None,
             accelerator=accelerator,
             args=args,
             train=False,
             global_step=global_step,
-            db_index=db_index,
+            memory=memory,
         )
-        val_acc = _evaluate_policy(model, policy, val_loader, accelerator, args, db_index=db_index)
+        val_acc = _evaluate_policy(model, policy, fusion, val_loader, accelerator, args, memory=memory)
     accelerator.print(
         f"{prefix} step={global_step} reward={val_metrics['reward']:.4f} val_acc={val_acc:.4f}"
     )
@@ -504,6 +647,9 @@ def main():
 
     model = build_model(args, device=accelerator.device)
     model = _apply_peft(model, args)
+    if args.use_db_prior and args.freeze_memory_prefix:
+        frozen_layers = model.freeze_language_prefix(max(int(args.memory_layer_idx), 0))
+        print(f"froze {frozen_layers} language layers for memory encoder consistency")
     _configure_memory_optimizations(model, args)
     if args.vlm_checkpoint:
         vlm_ckpt = torch.load(args.vlm_checkpoint, map_location="cpu")
@@ -518,6 +664,7 @@ def main():
         action_dim=args.max_choice_options,
         dropout=args.policy_dropout,
     )
+    fusion = GatedMemoryFusion(hidden_dim=int(probe_state.shape[-1])) if args.use_db_prior else None
 
     if not args.train_vlm_with_rl:
         model.eval()
@@ -525,21 +672,43 @@ def main():
             param.requires_grad = False
 
     param_groups = [{"params": [p for p in policy.parameters() if p.requires_grad], "lr": args.policy_lr}]
+    if fusion is not None:
+        param_groups.append({"params": [p for p in fusion.parameters() if p.requires_grad], "lr": args.policy_lr})
     if args.train_vlm_with_rl:
         param_groups.append(
             {"params": [p for p in model.parameters() if p.requires_grad], "lr": args.vlm_lr}
         )
     optimizer = torch.optim.AdamW(param_groups, weight_decay=args.weight_decay)
 
-    model, policy, optimizer, train_loader = accelerator.prepare(model, policy, optimizer, train_loader)
+    prepare_items = [model, policy]
+    if fusion is not None:
+        prepare_items.append(fusion)
+    prepare_items.extend([optimizer, train_loader])
+    prepared = accelerator.prepare(*prepare_items)
+    if fusion is not None:
+        model, policy, fusion, optimizer, train_loader = prepared
+    else:
+        model, policy, optimizer, train_loader = prepared
     if val_loader is not None:
         val_loader = accelerator.prepare(val_loader)
 
     total_params, trainable_params = _count_parameters(policy)
     accelerator.print(f"policy parameters total={total_params:,} trainable={trainable_params:,}")
+    if fusion is not None:
+        total_params, trainable_params = _count_parameters(fusion)
+        accelerator.print(f"memory fusion parameters total={total_params:,} trainable={trainable_params:,}")
     if args.train_vlm_with_rl:
         total_params, trainable_params = _count_parameters(model)
         accelerator.print(f"vlm parameters total={total_params:,} trainable={trainable_params:,}")
+
+    memory = None
+    if args.use_db_prior:
+        memory = OnlineVectorMemory(
+            dim=int(probe_state.shape[-1]),
+            prior_prefix=args.db_prior_prefix,
+            backend=args.db_index_backend,
+            same_task_first=args.db_same_task_first,
+        )
 
     start_epoch = 0
     global_step = 0
@@ -547,30 +716,14 @@ def main():
         ckpt = torch.load(args.resume_checkpoint, map_location="cpu")
         _load_checkpoint_state(model, ckpt["model"], accelerator)
         accelerator.unwrap_model(policy).load_state_dict(ckpt["policy"])
+        if fusion is not None and ckpt.get("memory_fusion") is not None:
+            accelerator.unwrap_model(fusion).load_state_dict(ckpt["memory_fusion"])
         if not args.load_model_only:
             optimizer.load_state_dict(ckpt["optimizer"])
             start_epoch = int(ckpt.get("epoch", -1)) + 1
             global_step = int(ckpt.get("global_step", 0))
-
-    db_index = None
-    if args.use_db_prior and args.db_modality == "multimodal":
-        from data_loading import _load_records
-
-        memory_args = argparse.Namespace(**vars(args))
-        if args.db_memory_annotation_path:
-            memory_args.annotation_path = args.db_memory_annotation_path
-        memory_records = _load_records(memory_args)
-        accelerator.print(f"building multimodal belief DB from {len(memory_records)} records")
-        db_index = MultimodalBeliefDB.from_records(
-            records=memory_records,
-            model=accelerator.unwrap_model(model),
-            processor=accelerator.unwrap_model(model).backbone.processor,
-            args=args,
-            device=accelerator.device,
-        )
-        accelerator.print(
-            f"multimodal belief DB ready entries={len(db_index.entries)} backend={db_index.backend}"
-        )
+        if args.use_db_prior and ckpt.get("vector_memory") is not None:
+            memory = OnlineVectorMemory.from_state_dict(ckpt["vector_memory"], args)
 
     for epoch in range(start_epoch, args.epochs):
         train_sampler = getattr(train_loader, "sampler", None)
@@ -584,13 +737,14 @@ def main():
         train_metrics, global_step = run_epoch(
             model=model,
             policy=policy,
+            fusion=fusion,
             loader=train_loader,
             optimizer=optimizer,
             accelerator=accelerator,
             args=args,
             train=True,
             global_step=global_step,
-            db_index=db_index,
+            memory=memory,
         )
         accelerator.print(
             f"epoch={epoch} train_reward={train_metrics['reward']:.4f} "
@@ -609,7 +763,7 @@ def main():
 
         if val_loader is not None:
             val_result = _run_validation(
-                model, policy, val_loader, accelerator, args, global_step, prefix="val_epoch", db_index=db_index
+                model, policy, fusion, val_loader, accelerator, args, global_step, prefix="val_epoch", memory=memory
             )
             if args.wandb and val_result is not None:
                 accelerator.log(
@@ -623,7 +777,18 @@ def main():
                     step=global_step,
                 )
 
-        _save_checkpoint(model, policy, optimizer, accelerator, args, epoch, global_step, f"ckpt_epoch_{epoch}")
+        _save_checkpoint(
+            model,
+            policy,
+            fusion,
+            optimizer,
+            accelerator,
+            args,
+            epoch,
+            global_step,
+            f"ckpt_epoch_{epoch}",
+            memory=memory,
+        )
 
     if args.wandb:
         accelerator.end_training()

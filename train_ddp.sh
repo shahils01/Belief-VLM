@@ -11,7 +11,9 @@ DEBUG_GENERATE_EVERY="${DEBUG_GENERATE_EVERY:-0}"
 USE_DB_PRIOR="${USE_DB_PRIOR:-0}"
 DB_TOP_K="${DB_TOP_K:-1}"
 DB_PRIOR_PREFIX="${DB_PRIOR_PREFIX:-Belief prior:}"
-RETRIEVAL_EMBEDDER_MODEL="${RETRIEVAL_EMBEDDER_MODEL:-}"
+DB_INDEX_BACKEND="${DB_INDEX_BACKEND:-auto}"
+DB_SAME_TASK_FIRST="${DB_SAME_TASK_FIRST:-1}"
+DB_TEXT_MAX_WORDS="${DB_TEXT_MAX_WORDS:-12}"
 
 CMD=(
   accelerate launch --num_processes 4 train.py
@@ -46,9 +48,9 @@ if [[ "$DEBUG_GENERATE" == "1" ]]; then
 fi
 
 if [[ "$USE_DB_PRIOR" == "1" ]]; then
-  CMD+=(--use_db_prior --db_top_k "$DB_TOP_K" --db_prior_prefix "$DB_PRIOR_PREFIX")
-  if [[ -n "$RETRIEVAL_EMBEDDER_MODEL" ]]; then
-    CMD+=(--retrieval_embedder_model "$RETRIEVAL_EMBEDDER_MODEL")
+  CMD+=(--use_db_prior --db_top_k "$DB_TOP_K" --db_prior_prefix "$DB_PRIOR_PREFIX" --db_index_backend "$DB_INDEX_BACKEND" --db_text_max_words "$DB_TEXT_MAX_WORDS")
+  if [[ "$DB_SAME_TASK_FIRST" == "1" ]]; then
+    CMD+=(--db_same_task_first)
   fi
 fi
 

@@ -6,8 +6,7 @@ from types import SimpleNamespace
 import torch
 import torch.nn.functional as F
 
-from belief_db import BeliefVectorDB
-from multimodal_belief_db import MultimodalBeliefDB, build_prior_inputs_from_batch
+from vector_memory import OnlineVectorMemory
 from data_loading import (
     _get_first,
     _load_records,
@@ -16,12 +15,13 @@ from data_loading import (
     _resolve_hd_epic_video_path,
     _stable_fold,
     build_rl_vqa_loader,
+    build_prompt_only_example,
     build_sft_example,
     collate_sft_batch,
     decode_mp4_frames,
 )
 from train import _apply_peft, _configure_memory_optimizations, _resolve_vl_model_preset, build_model
-from train_ppo_vqa import PPOAnswerPolicy, _build_quant_config, _masked_logits
+from train_ppo_vqa import GatedMemoryFusion, PPOAnswerPolicy, _build_quant_config, _masked_logits
 
 
 def parse_args():
@@ -63,14 +63,11 @@ def parse_args():
     parser.add_argument("--progress_every", type=int, default=50)
     parser.add_argument("--save_predictions", type=str, default="")
     parser.add_argument("--use_db_prior", action="store_true")
-    parser.add_argument("--db_modality", type=str, default="text", choices=["text", "multimodal"])
     parser.add_argument("--db_top_k", type=int, default=1)
     parser.add_argument("--db_prior_prefix", type=str, default="Belief prior:")
-    parser.add_argument("--db_memory_annotation_path", type=str, default="")
-    parser.add_argument("--retrieval_embedder_model", type=str, default="")
-    parser.add_argument("--retrieval_hash_dim", type=int, default=512)
     parser.add_argument("--db_index_backend", type=str, default="auto", choices=["auto", "faiss", "numpy"])
-    parser.add_argument("--db_build_batch_size", type=int, default=4)
+    parser.add_argument("--db_same_task_first", action="store_true", default=True)
+    parser.add_argument("--memory_layer_idx", type=int, default=None)
     return parser.parse_args()
 
 
@@ -110,13 +107,10 @@ def _merge_args(cli_args, ckpt_args):
         "max_choice_options",
         "val_ratio",
         "db_top_k",
-        "db_modality",
         "db_prior_prefix",
-        "db_memory_annotation_path",
-        "retrieval_embedder_model",
-        "retrieval_hash_dim",
         "db_index_backend",
-        "db_build_batch_size",
+        "db_same_task_first",
+        "memory_layer_idx",
     )
     for key in optional_overrides:
         value = getattr(cli_args, key)
@@ -164,9 +158,8 @@ def _merge_args(cli_args, ckpt_args):
     merged.setdefault("use_db_prior", False)
     merged.setdefault("db_top_k", 1)
     merged.setdefault("db_prior_prefix", "Belief prior:")
-    merged.setdefault("db_memory_annotation_path", "")
-    merged.setdefault("retrieval_embedder_model", "")
-    merged.setdefault("retrieval_hash_dim", 512)
+    merged.setdefault("db_same_task_first", True)
+    merged.setdefault("memory_layer_idx", 1)
     return SimpleNamespace(**merged)
 
 
@@ -188,10 +181,17 @@ def _load_model_and_policy(checkpoint_path, args, device):
     )
     policy.load_state_dict(policy_state)
     policy.to(device)
+    fusion = None
+    if args.use_db_prior:
+        fusion = GatedMemoryFusion(hidden_dim=int(policy_state["policy_head.weight"].shape[1]))
+        if ckpt.get("memory_fusion") is not None:
+            fusion.load_state_dict(ckpt["memory_fusion"])
+        fusion.to(device)
+        fusion.eval()
 
     model.eval()
     policy.eval()
-    return model, policy, ckpt
+    return model, policy, fusion, ckpt
 
 
 def _load_vlm_model(checkpoint_path, args, device):
@@ -271,23 +271,47 @@ def _sequence_nll(logits, labels):
     return (token_losses * mask).sum(dim=1) / denom
 
 
+def _build_fused_state(model, fusion, memory, batch, inputs, merged_args, device):
+    with torch.no_grad():
+        query_state = model(
+            inputs,
+            return_hidden_states=True,
+            pooling=merged_args.state_pooling,
+            layer_idx=merged_args.memory_layer_idx,
+        )["pooled_state"].float()
+        current_state = model(
+            inputs,
+            return_hidden_states=True,
+            pooling=merged_args.state_pooling,
+            layer_idx=-1,
+        )["pooled_state"].float()
+    if fusion is None or memory is None or len(memory) == 0:
+        return current_state
+    aggregates = memory.retrieve_aggregates(
+        query_embeddings=query_state,
+        sample_ids=batch["ids"],
+        task_names=batch["task_names"],
+        top_k=merged_args.db_top_k,
+    )
+    retrieved_context = torch.from_numpy(aggregates["context"]).to(device=device, dtype=query_state.dtype)
+    retrieved_answer = torch.from_numpy(aggregates["answer"]).to(device=device, dtype=query_state.dtype)
+    retrieved_reward = torch.from_numpy(aggregates["reward"]).to(device=device, dtype=query_state.dtype)
+    retrieved_similarity = torch.from_numpy(aggregates["similarity"]).to(device=device, dtype=query_state.dtype)
+    fused_state, _ = fusion(
+        current_state,
+        retrieved_context,
+        retrieved_answer,
+        retrieved_reward,
+        retrieved_similarity,
+    )
+    return fused_state
+
+
 def _evaluate_ppo(args, merged_args, device):
-    model, policy, _ = _load_model_and_policy(args.checkpoint, merged_args, device=device)
-    db_index = None
-    if merged_args.use_db_prior and merged_args.db_modality == "multimodal":
-        if merged_args.db_memory_annotation_path:
-            memory_args = SimpleNamespace(**vars(merged_args))
-            memory_args.annotation_path = merged_args.db_memory_annotation_path
-            memory_records = _load_records(memory_args)
-        else:
-            memory_records = _load_records(merged_args)
-        db_index = MultimodalBeliefDB.from_records(
-            records=memory_records,
-            model=model,
-            processor=model.backbone.processor,
-            args=merged_args,
-            device=device,
-        )
+    model, policy, fusion, ckpt = _load_model_and_policy(args.checkpoint, merged_args, device=device)
+    memory = None
+    if merged_args.use_db_prior and ckpt.get("vector_memory") is not None:
+        memory = OnlineVectorMemory.from_state_dict(ckpt["vector_memory"], merged_args)
 
     loader = build_rl_vqa_loader(
         merged_args,
@@ -312,20 +336,9 @@ def _evaluate_ppo(args, merged_args, device):
             key: value.to(device) if torch.is_tensor(value) else value
             for key, value in batch["inputs"].items()
         }
-        if db_index is not None:
-            with torch.no_grad():
-                encoded = model(inputs, return_hidden_states=True, pooling=merged_args.state_pooling)
-                query_state = encoded["pooled_state"].float()
-            retrieved_texts = db_index.retrieve(query_state, batch["ids"], top_k=merged_args.db_top_k)
-            prior_prompts = db_index.augment_prompts(batch["prompts"], retrieved_texts)
-            inputs = {
-                key: value.to(device) if torch.is_tensor(value) else value
-                for key, value in build_prior_inputs_from_batch(model.backbone.processor, batch["inputs"], prior_prompts, merged_args).items()
-            }
 
         with torch.no_grad():
-            encoded = model(inputs, return_hidden_states=True, pooling=merged_args.state_pooling)
-            state = encoded["pooled_state"].float()
+            state = _build_fused_state(model, fusion, memory, batch, inputs, merged_args, device)
             logits, values = policy(state)
             masked_logits = _masked_logits(logits, num_choices)
             probs = torch.softmax(masked_logits, dim=-1)
@@ -378,17 +391,11 @@ def _evaluate_ppo(args, merged_args, device):
 
 
 def _evaluate_vlm(args, merged_args, device):
-    model, _ = _load_vlm_model(args.checkpoint, merged_args, device=device)
+    model, ckpt = _load_vlm_model(args.checkpoint, merged_args, device=device)
     processor = model.backbone.processor
-    belief_db = None
-    if merged_args.use_db_prior:
-        if merged_args.db_memory_annotation_path:
-            memory_args = SimpleNamespace(**vars(merged_args))
-            memory_args.annotation_path = merged_args.db_memory_annotation_path
-            memory_records = _load_records(memory_args)
-        else:
-            memory_records = list(_iter_validation_records(merged_args))
-        belief_db = BeliefVectorDB.from_records(memory_records, merged_args)
+    memory = None
+    if merged_args.use_db_prior and isinstance(ckpt, dict) and ckpt.get("vector_memory") is not None:
+        memory = OnlineVectorMemory.from_state_dict(ckpt["vector_memory"], merged_args)
 
     total = 0
     correct = 0
@@ -401,8 +408,6 @@ def _evaluate_vlm(args, merged_args, device):
 
         prompt, choices = _build_eval_prompt(record, merged_args)
         sample_id = str(_get_first(record, [merged_args.id_column, "id", "sample_id", "uid", "video_id"]) or total)
-        if belief_db is not None:
-            prompt = belief_db.augment_prompt(record, prompt, sample_id, top_k=merged_args.db_top_k)
         correct_idx = _resolve_correct_choice_index(record, len(choices))
         video_path = _resolve_hd_epic_video_path(merged_args, record)
         start_time_sec, end_time_sec = _resolve_hd_epic_clip_window(record)
@@ -412,6 +417,23 @@ def _evaluate_vlm(args, merged_args, device):
             start_time_sec=start_time_sec,
             end_time_sec=end_time_sec,
         )
+        if memory is not None and len(memory) > 0:
+            prompt_only = build_prompt_only_example(
+                processor=processor,
+                frames=frames,
+                prompt=prompt,
+                vl_backend=merged_args.vl_backend,
+                max_text_len=merged_args.vl_max_text_len,
+            )
+            query_inputs = {
+                key: value.to(device) if torch.is_tensor(value) else value
+                for key, value in prompt_only.items()
+                if key != "prompt_text"
+            }
+            with torch.no_grad():
+                query_state = model(query_inputs, return_hidden_states=True, pooling=merged_args.state_pooling)["pooled_state"].float()
+            prior_texts = memory.retrieve(query_state, [sample_id], [str(record.get("task_name", "unknown"))], top_k=merged_args.db_top_k)
+            prompt = memory.augment_prompts([prompt], prior_texts)[0]
 
         choice_examples = []
         for choice_text in choices:

@@ -9,8 +9,8 @@ VL_MODEL_PRESET="${VL_MODEL_PRESET:-internvl3_5_2b}"
 USE_DB_PRIOR="${USE_DB_PRIOR:-0}"
 DB_TOP_K="${DB_TOP_K:-1}"
 DB_PRIOR_PREFIX="${DB_PRIOR_PREFIX:-Belief prior:}"
-DB_MEMORY_ANNOTATION_PATH="${DB_MEMORY_ANNOTATION_PATH:-}"
-RETRIEVAL_EMBEDDER_MODEL="${RETRIEVAL_EMBEDDER_MODEL:-}"
+DB_INDEX_BACKEND="${DB_INDEX_BACKEND:-auto}"
+DB_SAME_TASK_FIRST="${DB_SAME_TASK_FIRST:-1}"
 
 CMD=(
   python eval_hd_epic_vqa.py
@@ -34,12 +34,9 @@ if [[ -n "$SAVE_PREDICTIONS" ]]; then
 fi
 
 if [[ "$USE_DB_PRIOR" == "1" ]]; then
-  CMD+=(--use_db_prior --db_top_k "$DB_TOP_K" --db_prior_prefix "$DB_PRIOR_PREFIX")
-  if [[ -n "$DB_MEMORY_ANNOTATION_PATH" ]]; then
-    CMD+=(--db_memory_annotation_path "$DB_MEMORY_ANNOTATION_PATH")
-  fi
-  if [[ -n "$RETRIEVAL_EMBEDDER_MODEL" ]]; then
-    CMD+=(--retrieval_embedder_model "$RETRIEVAL_EMBEDDER_MODEL")
+  CMD+=(--use_db_prior --db_top_k "$DB_TOP_K" --db_prior_prefix "$DB_PRIOR_PREFIX" --db_index_backend "$DB_INDEX_BACKEND")
+  if [[ "$DB_SAME_TASK_FIRST" == "1" ]]; then
+    CMD+=(--db_same_task_first)
   fi
 fi
 

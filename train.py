@@ -5,6 +5,7 @@ import os
 
 import torch
 from accelerate import Accelerator
+from vector_memory import OnlineVectorMemory, build_prompt_only_inputs_from_batch, build_sft_batch_from_batch
 
 try:
     from accelerate import DataLoaderConfiguration
@@ -119,8 +120,9 @@ def parse_args():
     parser.add_argument("--use_db_prior", action="store_true")
     parser.add_argument("--db_top_k", type=int, default=1)
     parser.add_argument("--db_prior_prefix", type=str, default="Belief prior:")
-    parser.add_argument("--retrieval_embedder_model", type=str, default="")
-    parser.add_argument("--retrieval_hash_dim", type=int, default=512)
+    parser.add_argument("--db_index_backend", type=str, default="auto", choices=["auto", "faiss", "numpy"])
+    parser.add_argument("--db_same_task_first", action="store_true", default=True)
+    parser.add_argument("--db_text_max_words", type=int, default=12)
 
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--wandb_project", type=str, default="vlm")
@@ -237,19 +239,41 @@ def _load_checkpoint_state(model, ckpt_state, accelerator):
         )
 
 
-def run_epoch(model, loader, optimizer, accelerator, args, train, global_step):
+def run_epoch(model, loader, optimizer, accelerator, args, train, global_step, memory=None):
     model.train() if train else model.eval()
     total_loss = 0.0
     total_examples = 0
     step = 0
+    processor = accelerator.unwrap_model(model).backbone.processor
 
     for batch in loader:
         step += 1
-        labels = batch["labels"].to(accelerator.device)
         inputs = {
             key: value.to(accelerator.device) if torch.is_tensor(value) else value
             for key, value in batch["inputs"].items()
         }
+        labels = batch["labels"].to(accelerator.device)
+
+        query_state = None
+        if memory is not None and len(memory) > 0:
+            with torch.no_grad():
+                query_state = accelerator.unwrap_model(model)(
+                    inputs, return_hidden_states=True, pooling="last"
+                )["pooled_state"].float()
+            retrieved_texts = memory.retrieve(query_state, batch["ids"], batch["task_names"], top_k=args.db_top_k)
+            prior_prompts = memory.augment_prompts(batch["prompts"], retrieved_texts)
+            rebuilt = build_sft_batch_from_batch(
+                processor=processor,
+                batch_inputs=batch["inputs"],
+                prompts=prior_prompts,
+                answers=batch["answer_text"],
+                args=args,
+            )
+            inputs = {
+                key: value.to(accelerator.device) if torch.is_tensor(value) else value
+                for key, value in rebuilt["inputs"].items()
+            }
+            labels = rebuilt["labels"].to(accelerator.device)
 
         with accelerator.accumulate(model):
             with torch.set_grad_enabled(train):
@@ -271,6 +295,19 @@ def run_epoch(model, loader, optimizer, accelerator, args, train, global_step):
                         accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
                     optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
+        if train and memory is not None:
+            if query_state is None:
+                with torch.no_grad():
+                    query_state = accelerator.unwrap_model(model)(
+                        batch["inputs"], return_hidden_states=True, pooling="last"
+                    )["pooled_state"].float()
+            memory.add(
+                embeddings=query_state,
+                sample_ids=batch["ids"],
+                task_names=batch["task_names"],
+                answer_texts=batch["answer_text"],
+                max_words=args.db_text_max_words,
+            )
 
         batch_size = labels.size(0)
         total_loss += loss.detach().item() * batch_size
@@ -407,6 +444,24 @@ def main():
     if val_loader is not None:
         val_loader = accelerator.prepare(val_loader)
 
+    probe_batch = next(iter(build_train_loader(args, args.train_split, batch_size=1, num_workers=0, is_train=True)))
+    with torch.no_grad():
+        probe_inputs = {
+            key: value.to(accelerator.device) if torch.is_tensor(value) else value
+            for key, value in probe_batch["inputs"].items()
+        }
+        probe_state = accelerator.unwrap_model(model)(probe_inputs, return_hidden_states=True, pooling="last")[
+            "pooled_state"
+        ]
+    memory = None
+    if args.use_db_prior:
+        memory = OnlineVectorMemory(
+            dim=int(probe_state.shape[-1]),
+            prior_prefix=args.db_prior_prefix,
+            backend=args.db_index_backend,
+            same_task_first=args.db_same_task_first,
+        )
+
     start_epoch = 0
     global_step = 0
     if args.resume_checkpoint:
@@ -417,6 +472,8 @@ def main():
             start_epoch = int(ckpt.get("epoch", -1)) + 1
             global_step = int(ckpt.get("global_step", 0))
             accelerator.print(f"resumed checkpoint={args.resume_checkpoint} start_epoch={start_epoch}")
+        if args.use_db_prior and ckpt.get("vector_memory") is not None:
+            memory = OnlineVectorMemory.from_state_dict(ckpt["vector_memory"], args)
 
     for epoch in range(start_epoch, args.epochs):
         train_loss, global_step = run_epoch(
@@ -427,6 +484,7 @@ def main():
             args=args,
             train=True,
             global_step=global_step,
+            memory=memory,
         )
         accelerator.print(f"epoch={epoch} train_loss={train_loss:.4f}")
         if args.wandb:
@@ -442,6 +500,7 @@ def main():
                     args=args,
                     train=False,
                     global_step=global_step,
+                    memory=memory,
                 )
             accelerator.print(f"epoch={epoch} val_loss={val_loss:.4f}")
             if args.wandb:
@@ -458,6 +517,7 @@ def main():
                     "epoch": epoch,
                     "global_step": global_step,
                     "args": vars(args),
+                    "vector_memory": memory.state_dict() if memory is not None else None,
                 },
                 ckpt_path,
             )

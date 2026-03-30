@@ -15,8 +15,6 @@ from PIL import Image
 from torch.utils.data import DataLoader, Dataset, IterableDataset, Sampler, get_worker_info
 from torch.utils.data.distributed import DistributedSampler
 
-from belief_db import BeliefVectorDB
-
 DEFAULT_PROMPT = "Describe what is happening in this egocentric video."
 
 
@@ -338,30 +336,6 @@ def _is_in_validation_fold(record, args, default):
         return False
     sample_id = _record_sample_id(record, args, default)
     return _stable_fold(sample_id, args.seed) < val_ratio
-
-
-def _build_belief_db(records, args):
-    if not getattr(args, "use_db_prior", False):
-        return None
-    if getattr(args, "db_modality", "text") != "text":
-        return None
-    memory_path = getattr(args, "db_memory_annotation_path", "") or getattr(args, "annotation_path", "")
-    if not memory_path:
-        warnings.warn("use_db_prior is enabled but annotation_path is empty; skipping belief DB.", RuntimeWarning)
-        return None
-    if getattr(args, "db_memory_annotation_path", ""):
-        class _MemoryArgs:
-            pass
-
-        memory_args = _MemoryArgs()
-        for key, value in vars(args).items():
-            setattr(memory_args, key, value)
-        memory_args.annotation_path = memory_path
-        base_records = _load_records(memory_args)
-    else:
-        base_records = records
-    memory_records = [record for idx, record in enumerate(base_records) if not _is_in_validation_fold(record, args, idx)]
-    return BeliefVectorDB.from_records(memory_records, args)
 
 
 def _get_distributed_rank_info():
@@ -724,13 +698,12 @@ def _build_prompt_answer_from_metadata(record):
 
 
 class LocalHD_EPICDataset(IterableDataset):
-    def __init__(self, records, processor, args, split_name: str, is_train: bool, belief_db=None):
+    def __init__(self, records, processor, args, split_name: str, is_train: bool):
         self.records = records
         self.processor = processor
         self.args = args
         self.split_name = split_name
         self.is_train = is_train
-        self.belief_db = belief_db
 
     def _iter_records(self):
         indices, worker_id = _build_distributed_worker_indices(len(self.records))
@@ -764,13 +737,6 @@ class LocalHD_EPICDataset(IterableDataset):
                 prompt, answer = _build_prompt_answer(self.args, record)
             else:
                 prompt, answer = _build_prompt_answer_from_metadata(record)
-            if self.belief_db is not None:
-                prompt = self.belief_db.augment_prompt(
-                    record=record,
-                    prompt=prompt,
-                    sample_id=sample_id,
-                    top_k=getattr(self.args, "db_top_k", 1),
-                )
             start_time_sec, end_time_sec = _resolve_hd_epic_clip_window(record)
             frames = decode_mp4_frames(
                 video_path,
@@ -789,18 +755,21 @@ class LocalHD_EPICDataset(IterableDataset):
 
             sample_count += 1
             yield {
+                "id": sample_id,
+                "task_name": str(record.get("task_name", "unknown")),
+                "prompt": prompt,
+                "answer_text": answer,
                 "inputs": {k: v for k, v in packed.items() if k not in {"labels", "prompt_text", "answer_text"}},
                 "labels": packed["labels"],
             }
 
 
 class LocalHD_EPICRLVQADataset(Dataset):
-    def __init__(self, records, processor, args, split_name: str, is_train: bool, belief_db=None):
+    def __init__(self, records, processor, args, split_name: str, is_train: bool):
         self.processor = processor
         self.args = args
         self.split_name = split_name
         self.is_train = is_train
-        self.belief_db = belief_db
         max_samples = int(args.max_samples_per_split)
         if not is_train and getattr(args, "max_val_samples_per_split", 0) > 0:
             max_samples = int(args.max_val_samples_per_split)
@@ -842,13 +811,6 @@ class LocalHD_EPICRLVQADataset(Dataset):
         )
         video_path = _resolve_hd_epic_video_path(self.args, record)
         prompt, choices, correct_idx = _build_vqa_prompt_choices(self.args, record)
-        if self.belief_db is not None:
-            prompt = self.belief_db.augment_prompt(
-                record=record,
-                prompt=prompt,
-                sample_id=sample_id,
-                top_k=getattr(self.args, "db_top_k", 1),
-            )
         start_time_sec, end_time_sec = _resolve_hd_epic_clip_window(record)
         frames = decode_mp4_frames(
             video_path,
@@ -937,6 +899,10 @@ def collate_sft_batch(batch):
         for item in batch
     ]
     return {
+        "ids": [item["id"] for item in batch],
+        "task_names": [item["task_name"] for item in batch],
+        "prompts": [item["prompt"] for item in batch],
+        "answer_text": [item["answer_text"] for item in batch],
         "inputs": _stack_inputs([item["inputs"] for item in batch]),
         "labels": torch.stack(labels, dim=0),
     }
@@ -960,9 +926,8 @@ def build_train_loader(args, split: str, batch_size: int, num_workers: int, is_t
 
     if args.dataset_type == "hd_epic_local":
         records = _load_records(args) if args.annotation_path else _discover_hd_epic_records(args)
-        belief_db = _build_belief_db(records, args)
         dataset = LocalHD_EPICDataset(
-            records=records, processor=processor, args=args, split_name=split, is_train=is_train, belief_db=belief_db
+            records=records, processor=processor, args=args, split_name=split, is_train=is_train
         )
     else:
         raise RuntimeError(
@@ -982,14 +947,12 @@ def build_train_loader(args, split: str, batch_size: int, num_workers: int, is_t
 def build_rl_vqa_loader(args, split: str, batch_size: int, num_workers: int, is_train: bool):
     processor = build_vlm_processor(args)
     records = _load_records(args)
-    belief_db = _build_belief_db(records, args)
     dataset = LocalHD_EPICRLVQADataset(
         records=records,
         processor=processor,
         args=args,
         split_name=split,
         is_train=is_train,
-        belief_db=belief_db,
     )
     sampler = None
     shuffle = False

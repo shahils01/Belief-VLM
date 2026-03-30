@@ -6,13 +6,14 @@ from types import SimpleNamespace
 import torch
 import torch.nn.functional as F
 
-from belief_db import BeliefVectorDB
+from vector_memory import OnlineVectorMemory
 from data_loading import (
     _get_first,
     _load_records,
     _normalize_text,
     _resolve_hd_epic_clip_window,
     _resolve_hd_epic_video_path,
+    build_prompt_only_example,
     build_sft_example,
     collate_sft_batch,
     decode_mp4_frames,
@@ -53,9 +54,8 @@ def parse_args():
     parser.add_argument("--use_db_prior", action="store_true")
     parser.add_argument("--db_top_k", type=int, default=1)
     parser.add_argument("--db_prior_prefix", type=str, default="Belief prior:")
-    parser.add_argument("--db_memory_annotation_path", type=str, default="")
-    parser.add_argument("--retrieval_embedder_model", type=str, default="")
-    parser.add_argument("--retrieval_hash_dim", type=int, default=512)
+    parser.add_argument("--db_index_backend", type=str, default="auto", choices=["auto", "faiss", "numpy"])
+    parser.add_argument("--db_same_task_first", action="store_true", default=True)
     return parser.parse_args()
 
 
@@ -88,9 +88,8 @@ def _merge_args(cli_args, ckpt_args):
         "peft",
         "db_top_k",
         "db_prior_prefix",
-        "db_memory_annotation_path",
-        "retrieval_embedder_model",
-        "retrieval_hash_dim",
+        "db_index_backend",
+        "db_same_task_first",
     )
     for key in optional_overrides:
         value = getattr(cli_args, key)
@@ -126,9 +125,7 @@ def _merge_args(cli_args, ckpt_args):
     merged.setdefault("use_db_prior", False)
     merged.setdefault("db_top_k", 1)
     merged.setdefault("db_prior_prefix", "Belief prior:")
-    merged.setdefault("db_memory_annotation_path", "")
-    merged.setdefault("retrieval_embedder_model", "")
-    merged.setdefault("retrieval_hash_dim", 512)
+    merged.setdefault("db_same_task_first", True)
     return SimpleNamespace(**merged)
 
 
@@ -227,15 +224,9 @@ def evaluate(args):
     model, _ = _load_model(args.checkpoint, merged_args, device=device)
     processor = model.backbone.processor
     records = _load_records(merged_args)
-    belief_db = None
-    if merged_args.use_db_prior:
-        if merged_args.db_memory_annotation_path:
-            memory_args = SimpleNamespace(**vars(merged_args))
-            memory_args.annotation_path = merged_args.db_memory_annotation_path
-            memory_records = _load_records(memory_args)
-        else:
-            memory_records = records
-        belief_db = BeliefVectorDB.from_records(memory_records, merged_args)
+    memory = None
+    if merged_args.use_db_prior and isinstance(ckpt, dict) and ckpt.get("vector_memory") is not None:
+        memory = OnlineVectorMemory.from_state_dict(ckpt["vector_memory"], merged_args)
 
     total = 0
     correct = 0
@@ -248,8 +239,6 @@ def evaluate(args):
 
         prompt, choices = _build_eval_prompt(record, merged_args)
         sample_id = str(_get_first(record, [merged_args.id_column, "id", "sample_id", "uid", "video_id"]) or total)
-        if belief_db is not None:
-            prompt = belief_db.augment_prompt(record, prompt, sample_id, top_k=merged_args.db_top_k)
         correct_idx = _resolve_correct_choice_index(record, len(choices))
         video_path = _resolve_hd_epic_video_path(merged_args, record)
         start_time_sec, end_time_sec = _resolve_hd_epic_clip_window(record)
@@ -259,6 +248,28 @@ def evaluate(args):
             start_time_sec=start_time_sec,
             end_time_sec=end_time_sec,
         )
+        if memory is not None and len(memory) > 0:
+            prompt_only = build_prompt_only_example(
+                processor=processor,
+                frames=frames,
+                prompt=prompt,
+                vl_backend=merged_args.vl_backend,
+                max_text_len=merged_args.vl_max_text_len,
+            )
+            query_inputs = {
+                key: value.to(device) if torch.is_tensor(value) else value
+                for key, value in prompt_only.items()
+                if key != "prompt_text"
+            }
+            with torch.no_grad():
+                query_state = model(query_inputs, return_hidden_states=True, pooling="last")["pooled_state"].float()
+            prior_texts = memory.retrieve(
+                query_state,
+                [sample_id],
+                [str(record.get("task_name", "unknown"))],
+                top_k=merged_args.db_top_k,
+            )
+            prompt = memory.augment_prompts([prompt], prior_texts)[0]
 
         choice_examples = []
         for choice_text in choices:

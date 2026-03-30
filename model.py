@@ -170,10 +170,14 @@ class MultimodalVLMModel(nn.Module):
         self.cfg = cfg
         self.backbone = InternVLBackbone(cfg, device=device)
 
-    def _pool_hidden_states(self, hidden_states, attention_mask, pooling: str):
+    def _pool_hidden_states(self, hidden_states, attention_mask, pooling: str, layer_idx: int = -1):
         if not hidden_states:
             raise RuntimeError("The selected VLM backend did not return hidden states.")
-        sequence_hidden = hidden_states[-1]
+        num_states = len(hidden_states)
+        if layer_idx < 0:
+            layer_idx = num_states + layer_idx
+        layer_idx = max(0, min(int(layer_idx), num_states - 1))
+        sequence_hidden = hidden_states[layer_idx]
         if attention_mask is None:
             pooled = sequence_hidden[:, -1, :]
         elif pooling == "mean":
@@ -186,9 +190,10 @@ class MultimodalVLMModel(nn.Module):
             "pooled_state": pooled,
             "sequence_hidden": sequence_hidden,
             "attention_mask": attention_mask,
+            "selected_layer_idx": layer_idx,
         }
 
-    def encode_inputs(self, inputs, pooling: str = "last"):
+    def encode_inputs(self, inputs, pooling: str = "last", layer_idx: int = -1):
         model_inputs = self.backbone._move_inputs_to_device(inputs)
         outputs = self.backbone.model(
             **model_inputs,
@@ -200,9 +205,10 @@ class MultimodalVLMModel(nn.Module):
             hidden_states=getattr(outputs, "hidden_states", None),
             attention_mask=model_inputs.get("attention_mask"),
             pooling=pooling,
+            layer_idx=layer_idx,
         )
 
-    def forward(self, inputs, labels=None, return_hidden_states: bool = False, pooling: str = "last"):
+    def forward(self, inputs, labels=None, return_hidden_states: bool = False, pooling: str = "last", layer_idx: int = -1):
         model_inputs = self.backbone._move_inputs_to_device(inputs)
         forward_kwargs = {"return_dict": True}
         if hasattr(self.backbone.model, "config") and hasattr(self.backbone.model.config, "use_cache"):
@@ -219,9 +225,32 @@ class MultimodalVLMModel(nn.Module):
                     hidden_states=getattr(outputs, "hidden_states", None),
                     attention_mask=model_inputs.get("attention_mask"),
                     pooling=pooling,
+                    layer_idx=layer_idx,
                 )
             )
         return result
+
+    def get_language_layers(self):
+        candidates = [
+            getattr(getattr(self.backbone.model, "language_model", None), "model", None),
+            getattr(self.backbone.model, "model", None),
+            self.backbone.model,
+        ]
+        for candidate in candidates:
+            layers = getattr(candidate, "layers", None)
+            if layers is not None:
+                return layers
+        return None
+
+    def freeze_language_prefix(self, num_layers: int):
+        layers = self.get_language_layers()
+        if layers is None:
+            return 0
+        count = max(0, min(int(num_layers), len(layers)))
+        for idx in range(count):
+            for param in layers[idx].parameters():
+                param.requires_grad = False
+        return count
 
     @torch.no_grad()
     def generate(self, inputs, max_new_tokens=64):
