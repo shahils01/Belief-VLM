@@ -167,7 +167,14 @@ class OnlineVectorMemory:
         if self._index is None:
             if requested == "numpy":
                 warnings.warn(
-                    "Using NumPy similarity search for vector memory. Install faiss for faster retrieval.",
+                    "Vector memory is using the NumPy backend for similarity search. "
+                    "This is slower than FAISS and is intended as a fallback/debug option.",
+                    RuntimeWarning,
+                )
+            else:
+                warnings.warn(
+                    "Vector memory fell back to the NumPy backend for similarity search. "
+                    "Install faiss to enable faster retrieval.",
                     RuntimeWarning,
                 )
             self._index = _NumpyIndex()
