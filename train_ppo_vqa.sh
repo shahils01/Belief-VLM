@@ -3,20 +3,20 @@ VL_MODEL_NAME="${VL_MODEL_NAME:-/scratch/shahils/hf_models/InternVL3_5-2B-HF}"
 VIDEO_ROOT="${VIDEO_ROOT:-/scratch/shahils/hd_epic_dataset/videos/HD-EPIC/Videos}"
 ANNOTATION_PATH="${ANNOTATION_PATH:-/scratch/shahils/hd_epic_dataset/hd-epic-annotations/vqa-benchmark/}"
 METADATA_ROOT="${METADATA_ROOT:-/scratch/shahils/hd_epic_dataset/HD-EPIC Intermediate Data}"
-VLM_CHECKPOINT="${VLM_CHECKPOINT:-/scratch/shahils/Belief-VLM/checkpoints_belief_hd_epic_ddp_07/ckpt_epoch_99.pt}"
+# VLM_CHECKPOINT="${VLM_CHECKPOINT:-checkpoints_ppo_vqa_vectorBeliefNew/ckpt_epoch_0.pt}"
 TRAIN_SAMPLES_PER_EPOCH="${TRAIN_SAMPLES_PER_EPOCH:-200000}"
 MAX_VAL_SAMPLES="${MAX_VAL_SAMPLES:-50}"
-USE_DB_PRIOR="${USE_DB_PRIOR:-0}"
+USE_DB_PRIOR="${USE_DB_PRIOR:-1}"
 DB_TOP_K="${DB_TOP_K:-2}"
 DB_PRIOR_PREFIX="${DB_PRIOR_PREFIX:-Belief prior:}"
 DB_INDEX_BACKEND="${DB_INDEX_BACKEND:-auto}"
 DB_SAME_TASK_FIRST="${DB_SAME_TASK_FIRST:-1}"
 DB_TEXT_MAX_WORDS="${DB_TEXT_MAX_WORDS:-12}"
-MEMORY_LAYER_IDX="${MEMORY_LAYER_IDX:-1}"
+MEMORY_LAYER_IDX="${MEMORY_LAYER_IDX:-3}"
 FREEZE_MEMORY_PREFIX="${FREEZE_MEMORY_PREFIX:-1}"
 
 CMD=(
-  accelerate launch --num_processes 4 train_ppo_vqa.py
+  accelerate launch --num_processes 8 train_ppo_vqa.py
   --dataset_type hd_epic_local
   --video_root "$VIDEO_ROOT"
   --metadata_root "$METADATA_ROOT"
@@ -38,9 +38,10 @@ CMD=(
   --vlm_lr 1e-4
   --vl_model_preset "$VL_MODEL_PRESET"
   --vl_model_name "$VL_MODEL_NAME"
-  --resume_checkpoint checkpoints_ppo_vqa_fulldataset/ckpt_epoch_34.pt
+  --resume_checkpoint checkpoints_ppo_vqa_vectorBeliefNew/ckpt_epoch_0.pt
   --gradient_checkpointing
-  --save_dir checkpoints_ppo_vqa_fulldataset
+  --save_dir checkpoints_ppo_vqa_vectorBeliefNew
+  --wandb
 )
 
 if [[ -n "$VLM_CHECKPOINT" ]]; then
