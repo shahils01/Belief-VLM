@@ -138,7 +138,7 @@ class SFTCollator:
             model_inputs = {
                 key: value
                 for key, value in packed.items()
-                if torch.is_tensor(value)
+                if torch.is_tensor(value) and key != "labels"
             }
             items.append(
                 {
@@ -150,6 +150,7 @@ class SFTCollator:
                     "choices": sample.get("choices"),
                     "correct_idx": sample.get("correct_idx"),
                     "media_type": sample["media_type"],
+                    "labels": packed["labels"],
                     "inputs": model_inputs,
                 }
             )
