@@ -1,42 +1,68 @@
 # Belief-VLM
 
-Belief-VLM is an egocentric video question answering codebase built around:
+This branch, `generalized-benchmarks-sft`, turns the repo into an online-first multimodal supervised fine-tuning and evaluation framework for InternVL-style vision-language models.
 
-- an `InternVL` vision-language model as the multimodal encoder
-- a supervised VLM training path for multiple-choice HD-EPIC VQA
-- a PPO answer-head training path on top of pooled VLM states
-- an optional online episodic vector memory for retrieval-conditioned PPO
+Default workflow on this branch:
 
-The repository is currently centered on local HD-EPIC style training and evaluation.
+- generalized supervised VLM training
+- benchmark-oriented evaluation
+- Hugging Face `datasets` as the preferred data source
+- multiple-choice tasks trained generatively by verbalizing the correct answer
 
-## What Is In This Repo
+Legacy workflows are still present:
 
-Core files:
+- HD-EPIC local supervised training
+- PPO answer-head training
+- online vector-memory PPO experiments
 
-- [model.py](/home/i2r/shahil_ws/Belief-VLM/model.py): InternVL wrapper and pooled hidden-state extraction
-- [data_loading.py](/home/i2r/shahil_ws/Belief-VLM/data_loading.py): HD-EPIC loaders, video decoding, prompt construction
-- [train.py](/home/i2r/shahil_ws/Belief-VLM/train.py): supervised VLM training
-- [eval_hd_epic_vqa.py](/home/i2r/shahil_ws/Belief-VLM/eval_hd_epic_vqa.py): supervised VLM evaluation
-- [train_ppo_vqa.py](/home/i2r/shahil_ws/Belief-VLM/train_ppo_vqa.py): PPO answer-head training
-- [eval_ppo_vqa.py](/home/i2r/shahil_ws/Belief-VLM/eval_ppo_vqa.py): PPO answer-head evaluation
-- [vector_memory.py](/home/i2r/shahil_ws/Belief-VLM/vector_memory.py): online episodic memory used by the PPO path
+Those paths remain runnable, but they are no longer the default entrypoint on this branch.
 
-Launchers:
+## Main Entry Points
 
-- [train_ddp.sh](/home/i2r/shahil_ws/Belief-VLM/train_ddp.sh): supervised VLM training
-- [eval_hd_epic_vqa.sh](/home/i2r/shahil_ws/Belief-VLM/eval_hd_epic_vqa.sh): supervised VLM evaluation
-- [train_ppo_vqa.sh](/home/i2r/shahil_ws/Belief-VLM/train_ppo_vqa.sh): single-node PPO training
-- [train_ppo_vqa_slurm_multinode.sh](/home/i2r/shahil_ws/Belief-VLM/train_ppo_vqa_slurm_multinode.sh): multi-node PPO training on Slurm
-- [eval_ppo_vqa.sh](/home/i2r/shahil_ws/Belief-VLM/eval_ppo_vqa.sh): PPO evaluation
+Generalized benchmark path:
+
+- `train_general_vlm.py`: generalized multimodal SFT
+- `eval_general_benchmarks.py`: generalized benchmark evaluation
+- `launchers/train_general_vlm.sh`: shell launcher for training
+- `launchers/eval_general_benchmarks.sh`: shell launcher for evaluation
+- `datasets_registry.py`: dataset adapter registry
+- `benchmark_registry.py`: benchmark evaluator registry
+- `datasets_adapters/`: benchmark and local-manifest adapters
+- `benchmark_evaluators/`: benchmark-specific answer scoring
+- `general_data_utils.py`: shared multimodal media decoding, prompt packing, and collate utilities
+
+Legacy paths kept intact:
+
+- `train.py`
+- `eval_hd_epic_vqa.py`
+- `train_ppo_vqa.py`
+- `eval_ppo_vqa.py`
+- `vector_memory.py`
+
+## Supported Benchmarks
+
+First-wave adapters on this branch:
+
+| Adapter | Default source | Modality | Train | Eval | Notes |
+|---|---|---:|---:|---:|---|
+| `mmmu` | `MMMU/MMMU` | image | yes | yes | multiple configs / subjects; use `DATASET_CONFIG` |
+| `mathvista` | `AI4Math/MathVista` | image | yes | yes | supports free-form and MCQ-style samples |
+| `ocrbench` | `LIME-DATA/ocrbench` | image | yes | yes | generative OCR-style scoring |
+| `ai2d` | `lmms-lab/ai2d` | image | yes | yes | multiple-choice as generative SFT |
+| `videomme` | `lmms-lab/Video-MME` | video | optional | yes | benchmark metadata is public; local or extracted media may still be needed depending on source format |
+| `mlvu` | `sy1998/MLVU_Test` | video | optional | yes | benchmark metadata is public; local or extracted media may still be needed depending on source format |
+| `local_manifest` | local JSON/JSONL/CSV | image/video | yes | yes | generic local adapter |
+| `hd_epic` | local HD-EPIC files | video | yes | yes | legacy-style local adapter retained |
+
+Important:
+
+- The image benchmarks are the cleanest supported path for online-first training right now.
+- Some video benchmarks publish metadata via Hugging Face but still package raw videos as zip/tar assets; for those, you may need local extracted media even on this branch.
+- The generalized path is benchmark-oriented, not a reproduction of the full InternVL3.5 training recipe.
 
 ## Environment
 
-Two environment files/scripts are provided:
-
-- [environment.yml](/home/i2r/shahil_ws/Belief-VLM/environment.yml)
-- [palmetto_env.yml](/home/i2r/shahil_ws/Belief-VLM/palmetto_env.yml)
-
-For Palmetto, the intended setup path is:
+Recommended on Palmetto:
 
 ```bash
 cd /home/i2r/shahil_ws/Belief-VLM
@@ -44,15 +70,13 @@ bash setup_palmetto_env.sh ma-vlcm
 conda activate ma-vlcm
 ```
 
-For a manual environment, you need at least:
+Minimum important packages:
 
 - Python 3.10
-- PyTorch 2.3+
-- CUDA-enabled `torch`, `torchvision`, `torchaudio`
+- `torch`, `torchvision`, `torchaudio`
 - `transformers`
 - `accelerate`
 - `datasets`
-- `wandb`
 - `peft`
 - `sentencepiece`
 - `protobuf`
@@ -60,52 +84,10 @@ For a manual environment, you need at least:
 
 Optional:
 
-- `faiss-cpu` or `faiss-gpu` for faster vector-memory retrieval
-- `torch-geometric` if you are reusing the older MA-VLCM environment
+- `wandb`
+- `faiss-cpu` or `faiss-gpu`
 
-## Data Layout
-
-The current code expects local HD-EPIC assets.
-
-Typical paths:
-
-- videos:
-  `/scratch/shahils/hd_epic_dataset/videos/HD-EPIC/Videos`
-- metadata:
-  `/scratch/shahils/hd_epic_dataset/HD-EPIC Intermediate Data`
-- annotations:
-  `/scratch/shahils/hd_epic_dataset/hd-epic-annotations/vqa-benchmark`
-
-Video path convention:
-
-```text
-<video_root>/<participant>/<video_id>.mp4
-```
-
-Metadata path convention:
-
-```text
-<metadata_root>/<participant>/<video_id>/framewise_info.jsonl
-```
-
-Annotation input can be:
-
-- a single `.json`, `.jsonl`, or `.csv`
-- a directory of annotation files
-- a comma-separated list of files
-
-The HD-EPIC VQA loader supports benchmark JSON files keyed by sample ID.
-
-## Models
-
-This repo currently targets InternVL 3.5 Hugging Face checkpoints such as:
-
-- `OpenGVLab/InternVL3_5-2B-HF`
-- `OpenGVLab/InternVL3_5-4B-HF`
-
-In practice, use a local copy on cluster storage.
-
-Example download:
+InternVL model downloads:
 
 ```bash
 huggingface-cli download OpenGVLab/InternVL3_5-2B-HF \
@@ -120,197 +102,171 @@ export HF_HUB_CACHE=/scratch/shahils/.cache/huggingface/hub
 export TRANSFORMERS_CACHE=/scratch/shahils/.cache/huggingface/transformers
 ```
 
-## Training Modes
+## Generalized Training
 
-### 1. Supervised VLM training
+The new default training mode is supervised causal-LM fine-tuning over multimodal prompts.
 
-This path trains the InternVL model with standard causal LM loss over the answer text.
+Design:
 
-Example:
+- every adapter normalizes raw samples into a common schema
+- multiple-choice tasks are verbalized as text generation targets
+- InternVL is trained with masked answer-token cross-entropy
+- `LoRA` is the default PEFT mode on this branch
+
+### Default launcher
 
 ```bash
 cd /home/i2r/shahil_ws/Belief-VLM
-bash train_ddp.sh
+bash launchers/train_general_vlm.sh
 ```
 
-Useful overrides:
+### Example: AI2D
 
 ```bash
-ANNOTATION_PATH=/scratch/shahils/hd_epic_dataset/hd-epic-annotations/vqa-benchmark/fine_grained_why_recognition.json \
-VIDEO_ROOT=/scratch/shahils/hd_epic_dataset/videos/HD-EPIC/Videos \
-METADATA_ROOT=/scratch/shahils/hd_epic_dataset/HD-EPIC\\ Intermediate\\ Data \
+DATASET_NAME=ai2d \
 VL_MODEL_PRESET=custom \
 VL_MODEL_NAME=/scratch/shahils/hf_models/InternVL3_5-2B-HF \
-bash train_ddp.sh
+PEFT=lora \
+MIXED_PRECISION=bf16 \
+OUTPUT_DIR=checkpoints_general_ai2d \
+bash /home/i2r/shahil_ws/Belief-VLM/launchers/train_general_vlm.sh
 ```
 
-Evaluation:
+### Example: MMMU with a specific subject config
 
 ```bash
-bash eval_hd_epic_vqa.sh
+DATASET_NAME=mmmu \
+DATASET_CONFIG=Accounting \
+TRAIN_SPLIT=dev \
+EVAL_SPLIT=validation \
+VL_MODEL_PRESET=custom \
+VL_MODEL_NAME=/scratch/shahils/hf_models/InternVL3_5-2B-HF \
+PEFT=lora \
+bash /home/i2r/shahil_ws/Belief-VLM/launchers/train_general_vlm.sh
 ```
 
-### 2. PPO answer-head training
+### Example: Local JSON/JSONL/CSV manifest
 
-This path keeps the VLM as a context encoder and trains a PPO policy/value head over pooled VLM states.
+```bash
+DATASET_NAME=local_manifest \
+ANNOTATION_PATH=/path/to/manifest.jsonl \
+MEDIA_ROOT=/path/to/media \
+VL_MODEL_PRESET=custom \
+VL_MODEL_NAME=/scratch/shahils/hf_models/InternVL3_5-2B-HF \
+bash /home/i2r/shahil_ws/Belief-VLM/launchers/train_general_vlm.sh
+```
 
-Example:
+Supported local manifest schema:
+
+```python
+{
+  "id": "...",
+  "task_name": "...",
+  "media_type": "image" or "video",
+  "image": "...",      # or image_path / media
+  "video": "...",      # or video_path / media
+  "question": "...",
+  "answer": "...",
+  "choices": [...],    # optional
+  "correct_idx": 0     # optional
+}
+```
+
+## Generalized Evaluation
+
+The evaluation path supports:
+
+- free-form generation
+- normalized exact-match style scoring
+- multiple-choice candidate scoring via sequence NLL
+
+### Default launcher
 
 ```bash
 cd /home/i2r/shahil_ws/Belief-VLM
-bash train_ppo_vqa.sh
+bash launchers/eval_general_benchmarks.sh
 ```
 
-Key features:
+### Example: evaluate AI2D with a trained checkpoint
 
-- multiple-choice answer selection
-- optional VLM fine-tuning during PPO
-- `state_pooling` over InternVL hidden states
-- task-uniform training sampling
-- optional online vector memory
+```bash
+DATASET_NAME=ai2d \
+CHECKPOINT=checkpoints_general_ai2d/ckpt_epoch_1.pt \
+VL_MODEL_PRESET=custom \
+VL_MODEL_NAME=/scratch/shahils/hf_models/InternVL3_5-2B-HF \
+EVAL_MODE=multiple_choice_nll \
+bash /home/i2r/shahil_ws/Belief-VLM/launchers/eval_general_benchmarks.sh
+```
+
+### Example: evaluate MathVista
+
+```bash
+DATASET_NAME=mathvista \
+CHECKPOINT=checkpoints_general_mathvista/ckpt_epoch_1.pt \
+VL_MODEL_PRESET=custom \
+VL_MODEL_NAME=/scratch/shahils/hf_models/InternVL3_5-2B-HF \
+EVAL_MODE=generate \
+bash /home/i2r/shahil_ws/Belief-VLM/launchers/eval_general_benchmarks.sh
+```
+
+## Important Arguments
+
+Training:
+
+- `DATASET_NAME`
+- `DATASET_REPO`
+- `DATASET_CONFIG`
+- `TRAIN_SPLIT`
+- `EVAL_SPLIT`
+- `ANNOTATION_PATH`
+- `MEDIA_ROOT`
+- `VIDEO_ROOT`
+- `VL_MODEL_PRESET`
+- `VL_MODEL_NAME`
+- `PEFT`
+- `OUTPUT_DIR`
+- `STREAMING`
 
 Evaluation:
 
-```bash
-bash eval_ppo_vqa.sh
-```
+- `DATASET_NAME`
+- `BENCHMARK_NAME`
+- `CHECKPOINT`
+- `EVAL_MODE=auto|generate|multiple_choice_nll`
+- `SAVE_PREDICTIONS`
 
-### 3. Multi-node PPO on Slurm
+## Legacy Paths
 
-Example inside an allocation:
+The following remain available but are now legacy / task-specific on this branch:
 
-```bash
-srun --nodes=$SLURM_NNODES --ntasks=$SLURM_NNODES \
-  bash /home/i2r/shahil_ws/Belief-VLM/train_ppo_vqa_slurm_multinode.sh
-```
+- `train_ddp.sh`
+- `eval_hd_epic_vqa.sh`
+- `train_ppo_vqa.sh`
+- `eval_ppo_vqa.sh`
+- `train_ppo_vqa_slurm_multinode.sh`
 
-## Online Vector Memory
+These are still useful for:
 
-The PPO path can use an online episodic vector memory.
+- HD-EPIC local training
+- PPO answer-head experiments
+- vector-memory PPO research
 
-Current behavior:
+They are not the default benchmark workflow anymore.
 
-- memory entries are created from past training experience
-- memory stores:
-  - frozen/intermediate context embedding
-  - past response embedding
-  - past reward
-- retrieval uses cosine-style similarity on normalized latent vectors
-- retrieved memory is fused into the current PPO state through a gated fusion module
+## Current Limitations
 
-Important:
+- The generalized branch does not reproduce InternVL3.5’s full public benchmark suite yet.
+- Some video benchmarks still need local extracted media despite public Hugging Face metadata.
+- Adapter defaults are best-effort public dataset handles and may need `DATASET_REPO` / `DATASET_CONFIG` overrides if upstream repos change.
+- PPO and vector-memory code are intentionally not integrated into the new default benchmark path.
 
-- memory is written online during training
-- memory is saved in PPO checkpoints
-- evaluation can load the saved memory from a PPO checkpoint
-- this is not an offline pre-built database
+## Verification
 
-Enable it with:
+This branch includes compile/syntax checks for:
 
-```bash
-USE_DB_PRIOR=1 bash train_ppo_vqa.sh
-```
+- dataset adapters
+- benchmark evaluators
+- generalized train/eval scripts
+- launcher shell syntax
 
-Useful memory knobs:
-
-- `DB_TOP_K`
-- `DB_INDEX_BACKEND=auto|faiss|numpy`
-- `DB_SAME_TASK_FIRST=1`
-- `MEMORY_LAYER_IDX`
-- `FREEZE_MEMORY_PREFIX=1`
-
-Recommended starting point:
-
-```bash
-USE_DB_PRIOR=1 \
-DB_TOP_K=1 \
-MEMORY_LAYER_IDX=1 \
-FREEZE_MEMORY_PREFIX=1 \
-bash train_ppo_vqa.sh
-```
-
-## Resuming Checkpoints
-
-### Supervised VLM
-
-Use `--resume_checkpoint` via [train_ddp.sh](/home/i2r/shahil_ws/Belief-VLM/train_ddp.sh).
-
-### PPO
-
-Use `--resume_checkpoint` via [train_ppo_vqa.sh](/home/i2r/shahil_ws/Belief-VLM/train_ppo_vqa.sh).
-
-If you are changing the architecture or training regime, prefer loading only weights:
-
-```bash
---load_model_only
-```
-
-This is especially important when:
-
-- switching from policy-only PPO to VLM fine-tuning
-- enabling the newer vector-memory fusion path
-
-## LoRA / QLoRA
-
-Both supervised and PPO paths support PEFT.
-
-Typical PPO usage:
-
-```bash
-PEFT=lora
-```
-
-or directly in Python args:
-
-```text
---peft lora
-```
-
-For PPO with a trainable VLM:
-
-- `LoRA` is the safer first option
-- `QLoRA` is possible but more fragile
-- gradient accumulation is recommended if batch size becomes small
-
-## Common Commands
-
-Train PPO on one VQA annotation file:
-
-```bash
-ANNOTATION_PATH=/scratch/shahils/hd_epic_dataset/hd-epic-annotations/vqa-benchmark/fine_grained_why_recognition.json \
-bash train_ppo_vqa.sh
-```
-
-Evaluate PPO on all `3d_perception_*` files:
-
-```bash
-ANNOTATION_PATH="$(printf "%s," /scratch/shahils/hd_epic_dataset/hd-epic-annotations/vqa-benchmark/3d_perception_*.json | sed 's/,$//')" \
-bash eval_ppo_vqa.sh
-```
-
-Evaluate the full selected split with no 50-sample cap:
-
-```bash
-MAX_VAL_SAMPLES=0 VAL_RATIO=1.0 bash eval_ppo_vqa.sh
-```
-
-## Notes on Performance
-
-- Video decoding is done locally from MP4 files.
-- The loader uses uniformly sampled frames from the clip window and seeks directly to target frames when possible.
-- Long clips are still more expensive than short clips.
-- The online vector memory can improve performance, but it also adds compute and retrieval-state complexity.
-- If you fine-tune the VLM heavily, retrieval consistency becomes an issue unless the memory/query encoder is kept frozen or partially frozen.
-
-## Current Scope / Limitations
-
-- The plain supervised VLM and PPO paths are the stable baselines.
-- The online vector-memory PPO path is implemented and checkpointed, but still an active research direction.
-- There is no separate offline memory-building script in the current mainline code.
-- The repository is currently optimized for local HD-EPIC experiments, not general-purpose VQA benchmarks.
-
-## Citation
-
-If you use this code, cite the corresponding paper once finalized. The current draft lives in:
-
-- [beliefVLM_paper/root.tex](/home/i2r/shahil_ws/Belief-VLM/beliefVLM_paper/root.tex)
+Use this branch as the generalized SFT baseline, and treat the older HD-EPIC/PPO code as retained legacy functionality.
