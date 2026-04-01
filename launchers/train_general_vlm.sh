@@ -25,9 +25,15 @@ MAX_TRAIN_SAMPLES="${MAX_TRAIN_SAMPLES:-0}"
 MAX_EVAL_SAMPLES="${MAX_EVAL_SAMPLES:-0}"
 SEED="${SEED:-42}"
 WANDB="${WANDB:-0}"
+LAUNCHER="${LAUNCHER:-accelerate}"
+NUM_PROCESSES="${NUM_PROCESSES:-1}"
+NUM_MACHINES="${NUM_MACHINES:-1}"
+MACHINE_RANK="${MACHINE_RANK:-0}"
+MAIN_PROCESS_PORT="${MAIN_PROCESS_PORT:-29501}"
+MIXED_PRECISION_LAUNCH="${MIXED_PRECISION_LAUNCH:-$MIXED_PRECISION}"
 
-CMD=(
-  python /home/i2r/shahil_ws/Belief-VLM/train_general_vlm.py
+TRAIN_CMD=(
+  /home/i2r/shahil_ws/Belief-VLM/train_general_vlm.py
   --dataset_name "$DATASET_NAME"
   --batch_size "$BATCH_SIZE"
   --grad_accum_steps "$GRAD_ACCUM_STEPS"
@@ -44,15 +50,28 @@ CMD=(
   --vl_model_preset "$VL_MODEL_PRESET"
 )
 
-if [[ -n "$DATASET_REPO" ]]; then CMD+=(--dataset_repo "$DATASET_REPO"); fi
-if [[ -n "$DATASET_CONFIG" ]]; then CMD+=(--dataset_config "$DATASET_CONFIG"); fi
-if [[ -n "$TRAIN_SPLIT" ]]; then CMD+=(--train_split "$TRAIN_SPLIT"); fi
-if [[ -n "$EVAL_SPLIT" ]]; then CMD+=(--eval_split "$EVAL_SPLIT"); fi
-if [[ -n "$ANNOTATION_PATH" ]]; then CMD+=(--annotation_path "$ANNOTATION_PATH"); fi
-if [[ -n "$MEDIA_ROOT" ]]; then CMD+=(--media_root "$MEDIA_ROOT"); fi
-if [[ -n "$VIDEO_ROOT" ]]; then CMD+=(--video_root "$VIDEO_ROOT"); fi
-if [[ -n "$VL_MODEL_NAME" ]]; then CMD+=(--vl_model_name "$VL_MODEL_NAME"); fi
-if [[ "$STREAMING" == "1" ]]; then CMD+=(--streaming); fi
-if [[ "$WANDB" == "1" ]]; then CMD+=(--wandb); fi
+if [[ -n "$DATASET_REPO" ]]; then TRAIN_CMD+=(--dataset_repo "$DATASET_REPO"); fi
+if [[ -n "$DATASET_CONFIG" ]]; then TRAIN_CMD+=(--dataset_config "$DATASET_CONFIG"); fi
+if [[ -n "$TRAIN_SPLIT" ]]; then TRAIN_CMD+=(--train_split "$TRAIN_SPLIT"); fi
+if [[ -n "$EVAL_SPLIT" ]]; then TRAIN_CMD+=(--eval_split "$EVAL_SPLIT"); fi
+if [[ -n "$ANNOTATION_PATH" ]]; then TRAIN_CMD+=(--annotation_path "$ANNOTATION_PATH"); fi
+if [[ -n "$MEDIA_ROOT" ]]; then TRAIN_CMD+=(--media_root "$MEDIA_ROOT"); fi
+if [[ -n "$VIDEO_ROOT" ]]; then TRAIN_CMD+=(--video_root "$VIDEO_ROOT"); fi
+if [[ -n "$VL_MODEL_NAME" ]]; then TRAIN_CMD+=(--vl_model_name "$VL_MODEL_NAME"); fi
+if [[ "$STREAMING" == "1" ]]; then TRAIN_CMD+=(--streaming); fi
+if [[ "$WANDB" == "1" ]]; then TRAIN_CMD+=(--wandb); fi
 
-"${CMD[@]}"
+if [[ "$LAUNCHER" == "python" || "$NUM_PROCESSES" == "1" ]]; then
+  exec python "${TRAIN_CMD[@]}"
+fi
+
+ACCELERATE_CMD=(
+  accelerate launch
+  --num_processes "$NUM_PROCESSES"
+  --num_machines "$NUM_MACHINES"
+  --machine_rank "$MACHINE_RANK"
+  --main_process_port "$MAIN_PROCESS_PORT"
+  --mixed_precision "$MIXED_PRECISION_LAUNCH"
+)
+
+exec "${ACCELERATE_CMD[@]}" python "${TRAIN_CMD[@]}"
