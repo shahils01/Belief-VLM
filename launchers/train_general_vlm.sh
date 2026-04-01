@@ -40,7 +40,7 @@ MEMORY_INJECT_OFFSET="${MEMORY_INJECT_OFFSET:-0}"
 FREEZE_MEMORY_PREFIX="${FREEZE_MEMORY_PREFIX:-1}"
 
 TRAIN_CMD=(
-  /home/i2r/shahil_ws/Belief-VLM/train_general_vlm.py
+  train_general_vlm.py
   --dataset_name "$DATASET_NAME"
   --batch_size "$BATCH_SIZE"
   --grad_accum_steps "$GRAD_ACCUM_STEPS"
