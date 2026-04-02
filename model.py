@@ -231,15 +231,29 @@ class MultimodalVLMModel(nn.Module):
         return result
 
     def get_language_layers(self):
-        candidates = [
-            getattr(getattr(self.backbone.model, "language_model", None), "model", None),
-            getattr(self.backbone.model, "model", None),
+        queue = [
             self.backbone.model,
+            getattr(self.backbone.model, "language_model", None),
+            getattr(self.backbone.model, "model", None),
+            getattr(getattr(self.backbone.model, "language_model", None), "model", None),
+            getattr(getattr(self.backbone.model, "model", None), "model", None),
         ]
-        for candidate in candidates:
+        seen = set()
+        while queue:
+            candidate = queue.pop(0)
+            if candidate is None:
+                continue
+            ident = id(candidate)
+            if ident in seen:
+                continue
+            seen.add(ident)
             layers = getattr(candidate, "layers", None)
             if layers is not None:
                 return layers
+            for attr in ("model", "language_model", "base_model", "transformer"):
+                child = getattr(candidate, attr, None)
+                if child is not None:
+                    queue.append(child)
         return None
 
     def get_lm_head(self):
