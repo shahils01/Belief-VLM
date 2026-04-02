@@ -389,8 +389,9 @@ def main():
                     fused_memory = memory_fusion(query_state.to(accelerator.device), memory_context, memory_answer, memory_reward)
                     batch_memory_sim = float(retrieved["similarity"].mean()) if len(retrieved["similarity"]) else 0.0
                     batch_memory_count = float(retrieved["count"].mean()) if len(retrieved["count"]) else 0.0
-                    batch_gate_mean = float(memory_fusion.latest_gate_mean)
-                    batch_gate_max = float(memory_fusion.latest_gate_max)
+                    fusion_ref = accelerator.unwrap_model(memory_fusion)
+                    batch_gate_mean = float(fusion_ref.latest_gate_mean)
+                    batch_gate_max = float(fusion_ref.latest_gate_max)
                     inject_layer_idx = max(int(args.memory_layer_idx) + int(args.memory_inject_offset), 0)
                     hook_handle = accelerator.unwrap_model(model).inject_pooled_memory_context(fused_memory, inject_layer_idx)
                     injected = True
