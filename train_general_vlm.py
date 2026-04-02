@@ -120,6 +120,20 @@ def _set_seed(seed: int):
     torch.cuda.manual_seed_all(seed)
 
 
+def _infer_hidden_dim_from_batch(model, batch, accelerator, layer_idx: int):
+    prompt_inputs = {
+        k: v.to(accelerator.device) if torch.is_tensor(v) else v
+        for k, v in batch["prompt_inputs"].items()
+    }
+    with torch.no_grad():
+        encoded = accelerator.unwrap_model(model).encode_inputs(
+            prompt_inputs,
+            pooling="last",
+            layer_idx=layer_idx,
+        )
+    return int(encoded["pooled_state"].shape[-1])
+
+
 class SFTCollator:
     def __init__(self, processor, args):
         self.processor = processor
@@ -281,19 +295,6 @@ def main():
     processor = accelerator.unwrap_model(model).backbone.processor
     memory_fusion = None
     memory = None
-    if args.use_memory_retrieval:
-        hidden_dim = getattr(model.backbone.model.config, "hidden_size", None)
-        if hidden_dim is None:
-            hidden_dim = getattr(getattr(model.backbone.model, "config", None), "hidden_size", None)
-        if hidden_dim is None:
-            raise RuntimeError("Could not determine hidden size for memory fusion.")
-        memory_fusion = GatedMemoryFusion(int(hidden_dim)).to(accelerator.device)
-        memory = OnlineVectorMemory(
-            dim=int(hidden_dim),
-            prior_prefix="Belief prior:",
-            backend=args.memory_index_backend,
-            same_task_first=args.memory_same_task_first,
-        )
 
     train_dataset = adapter.build_train_dataset(args)
     shuffle = not isinstance(train_dataset, IterableDataset)
@@ -304,6 +305,24 @@ def main():
         num_workers=args.num_workers,
         collate_fn=SFTCollator(processor, args),
     )
+
+    if args.use_memory_retrieval:
+        warmup_loader = DataLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            collate_fn=SFTCollator(processor, args),
+        )
+        warmup_batch = next(iter(warmup_loader))
+        hidden_dim = _infer_hidden_dim_from_batch(model, warmup_batch, accelerator, args.memory_layer_idx)
+        memory_fusion = GatedMemoryFusion(int(hidden_dim)).to(accelerator.device)
+        memory = OnlineVectorMemory(
+            dim=int(hidden_dim),
+            prior_prefix="Belief prior:",
+            backend=args.memory_index_backend,
+            same_task_first=args.memory_same_task_first,
+        )
 
     optimizer = torch.optim.AdamW(
         (
