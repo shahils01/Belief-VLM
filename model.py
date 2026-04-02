@@ -242,6 +242,35 @@ class MultimodalVLMModel(nn.Module):
                 return layers
         return None
 
+    def get_lm_head(self):
+        for candidate in (
+            getattr(self.backbone.model, "lm_head", None),
+            getattr(getattr(self.backbone.model, "language_model", None), "lm_head", None),
+            getattr(getattr(self.backbone.model, "model", None), "lm_head", None),
+        ):
+            if candidate is not None:
+                return candidate
+        return None
+
+    def inject_pooled_memory_context(self, pooled_memory: torch.Tensor, inject_layer_idx: int):
+        layers = self.get_language_layers()
+        if layers is None:
+            raise RuntimeError("Could not locate language layers for memory injection.")
+        num_layers = len(layers)
+        inject_layer_idx = max(0, min(int(inject_layer_idx), num_layers - 1))
+        pooled_memory = pooled_memory.to(self.backbone.device)
+
+        def _hook(_module, _args, output):
+            if isinstance(output, tuple):
+                hidden = output[0]
+                remainder = output[1:]
+                updated = hidden + pooled_memory[:, None, :].to(hidden.device, dtype=hidden.dtype)
+                return (updated, *remainder)
+            return output + pooled_memory[:, None, :].to(output.device, dtype=output.dtype)
+
+        handle = layers[inject_layer_idx].register_forward_hook(_hook)
+        return handle
+
     def freeze_language_prefix(self, num_layers: int):
         layers = self.get_language_layers()
         if layers is None:

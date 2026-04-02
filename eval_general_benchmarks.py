@@ -5,6 +5,7 @@ from collections import defaultdict
 from types import SimpleNamespace
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 from benchmark_registry import get_evaluator
@@ -15,6 +16,7 @@ from general_data_utils import (
     decode_media,
 )
 from train import _apply_peft, _configure_memory_optimizations, _resolve_vl_model_preset, build_model
+from vector_memory import OnlineVectorMemory
 
 
 def parse_args():
@@ -58,7 +60,34 @@ def parse_args():
     parser.add_argument("--print_samples", type=int, default=10)
     parser.add_argument("--progress_every", type=int, default=50)
     parser.add_argument("--save_predictions", type=str, default="")
+    parser.add_argument("--use_memory_retrieval", action="store_true")
+    parser.add_argument("--memory_top_k", type=int, default=2)
+    parser.add_argument("--memory_index_backend", type=str, default="auto", choices=["auto", "faiss", "numpy"])
+    parser.add_argument("--memory_same_task_first", action="store_true", default=True)
+    parser.add_argument("--memory_layer_idx", type=int, default=None)
+    parser.add_argument("--memory_inject_offset", type=int, default=None)
     return parser.parse_args()
+
+
+class GatedMemoryFusion(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.context_proj = nn.Linear(dim, dim)
+        self.answer_proj = nn.Linear(dim, dim)
+        self.reward_proj = nn.Linear(1, dim)
+        self.gate = nn.Sequential(
+            nn.Linear(dim * 2 + 1, dim),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, query_state, memory_context, memory_answer, memory_reward):
+        reward = memory_reward.unsqueeze(-1)
+        gate = self.gate(torch.cat([query_state, memory_context, reward], dim=-1))
+        return (
+            self.context_proj(memory_context)
+            + gate * self.answer_proj(memory_answer)
+            + self.reward_proj(reward)
+        )
 
 
 def _build_quant_config(args):
@@ -97,6 +126,12 @@ def _merge_args(cli_args, ckpt_args):
     merged.setdefault("gradient_checkpointing", False)
     merged.setdefault("disable_vl_cache", False)
     merged.setdefault("allow_tf32", False)
+    merged.setdefault("use_memory_retrieval", False)
+    merged.setdefault("memory_top_k", 2)
+    merged.setdefault("memory_index_backend", "auto")
+    merged.setdefault("memory_same_task_first", True)
+    merged.setdefault("memory_layer_idx", 1)
+    merged.setdefault("memory_inject_offset", 0)
     return SimpleNamespace(**merged)
 
 
@@ -107,12 +142,21 @@ def _load_model(checkpoint_path, args, device):
     model = _apply_peft(model, args)
     _configure_memory_optimizations(model, args)
     ckpt = {}
+    memory_fusion = None
     if checkpoint_path:
         ckpt = torch.load(checkpoint_path, map_location="cpu")
         state_dict = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
         model.load_state_dict(state_dict, strict=False)
+        if args.use_memory_retrieval and isinstance(ckpt, dict) and ckpt.get("memory_fusion") is not None:
+            hidden_dim = getattr(model.backbone.model.config, "hidden_size", None)
+            if hidden_dim is None:
+                raise RuntimeError("Could not determine hidden size for memory fusion.")
+            memory_fusion = GatedMemoryFusion(int(hidden_dim)).to(device)
+            memory_fusion.load_state_dict(ckpt["memory_fusion"], strict=False)
     model.eval()
-    return model, ckpt
+    if memory_fusion is not None:
+        memory_fusion.eval()
+    return model, memory_fusion, ckpt
 
 
 def _sequence_nll(logits, labels):
@@ -148,10 +192,13 @@ def evaluate(args):
         raise RuntimeError(
             f"Unknown dataset adapter `{merged_args.dataset_name}`. Available: {', '.join(list_adapters())}"
         )
-    model, _ = _load_model(args.checkpoint, merged_args, device)
+    model, memory_fusion, ckpt = _load_model(args.checkpoint, merged_args, device)
     adapter = get_adapter(merged_args.dataset_name)
     evaluator = get_evaluator(merged_args.benchmark_name or adapter.default_evaluator)
     dataset = adapter.build_eval_dataset(merged_args, split=merged_args.eval_split)
+    memory = None
+    if merged_args.use_memory_retrieval and isinstance(ckpt, dict) and ckpt.get("vector_memory") is not None:
+        memory = OnlineVectorMemory.from_state_dict(ckpt["vector_memory"], merged_args)
 
     total = 0
     correct = 0
@@ -168,35 +215,9 @@ def evaluate(args):
             video_frames=merged_args.video_frames,
             metadata=sample.get("metadata") or {},
         )
-
-        if merged_args.eval_mode == "multiple_choice_nll" or (
-            merged_args.eval_mode == "auto" and evaluator.task_type == "multiple_choice"
-        ):
-            best_idx = None
-            best_nll = None
-            for idx, choice in enumerate(sample.get("choices") or []):
-                packed = build_multimodal_sft_example(
-                    processor=model.backbone.processor,
-                    media_type=sample["media_type"],
-                    media=media,
-                    prompt=evaluator.prepare_prompt(sample),
-                    answer=choice,
-                    vl_backend=merged_args.vl_backend,
-                    max_text_len=merged_args.vl_max_text_len,
-                )
-                inputs = {k: v.unsqueeze(0).to(device) if torch.is_tensor(v) and v.dim() > 0 else v for k, v in packed.items() if k in {"input_ids", "attention_mask", "pixel_values", "pixel_values_videos"}}
-                labels = packed["labels"].unsqueeze(0).to(device)
-                with torch.no_grad():
-                    outputs = model(inputs, labels=labels)
-                nll = float(_sequence_nll(outputs["logits"], labels)[0].item())
-                if best_nll is None or nll < best_nll:
-                    best_nll = nll
-                    best_idx = idx
-            pred_text = sample["choices"][best_idx] if best_idx is not None else ""
-            metrics = evaluator.score(pred_text, sample)
-            metrics["pred_idx"] = best_idx
-        else:
-            packed = build_multimodal_prompt_only_example(
+        hook_handle = None
+        if memory is not None and len(memory) > 0 and memory_fusion is not None:
+            prompt_only = build_multimodal_prompt_only_example(
                 processor=model.backbone.processor,
                 media_type=sample["media_type"],
                 media=media,
@@ -204,11 +225,76 @@ def evaluate(args):
                 vl_backend=merged_args.vl_backend,
                 max_text_len=merged_args.vl_max_text_len,
             )
-            inputs = {k: v.unsqueeze(0).to(device) if torch.is_tensor(v) and v.dim() > 0 else v for k, v in packed.items() if k in {"input_ids", "attention_mask", "pixel_values", "pixel_values_videos"}}
+            prompt_inputs = {
+                k: v.unsqueeze(0).to(device) if torch.is_tensor(v) and v.dim() > 0 else v
+                for k, v in prompt_only.items()
+                if torch.is_tensor(v)
+            }
             with torch.no_grad():
-                generated = model.generate(inputs, max_new_tokens=merged_args.max_new_tokens)
-            pred_text = _decode_generated_text(model, generated, inputs["input_ids"])
-            metrics = evaluator.score(pred_text, sample)
+                query_state = model.encode_inputs(
+                    prompt_inputs,
+                    pooling="last",
+                    layer_idx=merged_args.memory_layer_idx,
+                )["pooled_state"].float()
+            retrieved = memory.retrieve_aggregates(
+                query_state,
+                [sample["id"]],
+                [sample["task_name"]],
+                top_k=merged_args.memory_top_k,
+            )
+            memory_context = torch.from_numpy(retrieved["context"]).to(device, dtype=query_state.dtype)
+            memory_answer = torch.from_numpy(retrieved["answer"]).to(device, dtype=query_state.dtype)
+            memory_reward = torch.from_numpy(retrieved["reward"]).to(device, dtype=query_state.dtype)
+            fused_memory = memory_fusion(query_state, memory_context, memory_answer, memory_reward)
+            hook_handle = model.inject_pooled_memory_context(
+                fused_memory,
+                max(int(merged_args.memory_layer_idx) + int(merged_args.memory_inject_offset), 0),
+            )
+
+        try:
+            if merged_args.eval_mode == "multiple_choice_nll" or (
+                merged_args.eval_mode == "auto" and evaluator.task_type == "multiple_choice"
+            ):
+                best_idx = None
+                best_nll = None
+                for idx, choice in enumerate(sample.get("choices") or []):
+                    packed = build_multimodal_sft_example(
+                        processor=model.backbone.processor,
+                        media_type=sample["media_type"],
+                        media=media,
+                        prompt=evaluator.prepare_prompt(sample),
+                        answer=choice,
+                        vl_backend=merged_args.vl_backend,
+                        max_text_len=merged_args.vl_max_text_len,
+                    )
+                    inputs = {k: v.unsqueeze(0).to(device) if torch.is_tensor(v) and v.dim() > 0 else v for k, v in packed.items() if k in {"input_ids", "attention_mask", "pixel_values", "pixel_values_videos"}}
+                    labels = packed["labels"].unsqueeze(0).to(device)
+                    with torch.no_grad():
+                        outputs = model(inputs, labels=labels)
+                    nll = float(_sequence_nll(outputs["logits"], labels)[0].item())
+                    if best_nll is None or nll < best_nll:
+                        best_nll = nll
+                        best_idx = idx
+                pred_text = sample["choices"][best_idx] if best_idx is not None else ""
+                metrics = evaluator.score(pred_text, sample)
+                metrics["pred_idx"] = best_idx
+            else:
+                packed = build_multimodal_prompt_only_example(
+                    processor=model.backbone.processor,
+                    media_type=sample["media_type"],
+                    media=media,
+                    prompt=evaluator.prepare_prompt(sample),
+                    vl_backend=merged_args.vl_backend,
+                    max_text_len=merged_args.vl_max_text_len,
+                )
+                inputs = {k: v.unsqueeze(0).to(device) if torch.is_tensor(v) and v.dim() > 0 else v for k, v in packed.items() if k in {"input_ids", "attention_mask", "pixel_values", "pixel_values_videos"}}
+                with torch.no_grad():
+                    generated = model.generate(inputs, max_new_tokens=merged_args.max_new_tokens)
+                pred_text = _decode_generated_text(model, generated, inputs["input_ids"])
+                metrics = evaluator.score(pred_text, sample)
+        finally:
+            if hook_handle is not None:
+                hook_handle.remove()
 
         total += 1
         correct += int(metrics["correct"])

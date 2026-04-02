@@ -20,6 +20,12 @@ EVAL_MODE="${EVAL_MODE:-auto}"
 PRINT_SAMPLES="${PRINT_SAMPLES:-10}"
 PROGRESS_EVERY="${PROGRESS_EVERY:-50}"
 SAVE_PREDICTIONS="${SAVE_PREDICTIONS:-}"
+USE_MEMORY_RETRIEVAL="${USE_MEMORY_RETRIEVAL:-0}"
+MEMORY_TOP_K="${MEMORY_TOP_K:-2}"
+MEMORY_INDEX_BACKEND="${MEMORY_INDEX_BACKEND:-auto}"
+MEMORY_SAME_TASK_FIRST="${MEMORY_SAME_TASK_FIRST:-1}"
+MEMORY_LAYER_IDX="${MEMORY_LAYER_IDX:-}"
+MEMORY_INJECT_OFFSET="${MEMORY_INJECT_OFFSET:-}"
 
 CMD=(
   python /home/i2r/shahil_ws/Belief-VLM/eval_general_benchmarks.py
@@ -44,5 +50,10 @@ if [[ -n "$VIDEO_ROOT" ]]; then CMD+=(--video_root "$VIDEO_ROOT"); fi
 if [[ -n "$VL_MODEL_NAME" ]]; then CMD+=(--vl_model_name "$VL_MODEL_NAME"); fi
 if [[ -n "$SAVE_PREDICTIONS" ]]; then CMD+=(--save_predictions "$SAVE_PREDICTIONS"); fi
 if [[ "$STREAMING" == "1" ]]; then CMD+=(--streaming); fi
+if [[ "$USE_MEMORY_RETRIEVAL" == "1" ]]; then CMD+=(--use_memory_retrieval); fi
+if [[ "$MEMORY_SAME_TASK_FIRST" == "1" ]]; then CMD+=(--memory_same_task_first); fi
+CMD+=(--memory_top_k "$MEMORY_TOP_K" --memory_index_backend "$MEMORY_INDEX_BACKEND")
+if [[ -n "$MEMORY_LAYER_IDX" ]]; then CMD+=(--memory_layer_idx "$MEMORY_LAYER_IDX"); fi
+if [[ -n "$MEMORY_INJECT_OFFSET" ]]; then CMD+=(--memory_inject_offset "$MEMORY_INJECT_OFFSET"); fi
 
 "${CMD[@]}"
