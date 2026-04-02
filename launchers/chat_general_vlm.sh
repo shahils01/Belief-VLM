@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CHECKPOINT="${CHECKPOINT:-}"
-QUESTION="${QUESTION:-}"
-IMAGE_PATH="${IMAGE_PATH:-}"
+CHECKPOINT="${CHECKPOINT:-/scratch/shahils/Belief-VLM/checkpoints_general_vlm/ckpt_epoch_20.pt}"
+QUESTION="${QUESTION:-"What does this diagram explain?"}"
+IMAGE_PATH="${IMAGE_PATH:-/scratch/shahils/hd_epic_dataset/hd-epic-annotations/logo-white.png}"
 VIDEO_PATH="${VIDEO_PATH:-}"
 TASK_NAME="${TASK_NAME:-chat}"
 SAMPLE_ID="${SAMPLE_ID:-interactive}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-128}"
-USE_MEMORY_RETRIEVAL="${USE_MEMORY_RETRIEVAL:-0}"
+USE_MEMORY_RETRIEVAL="${USE_MEMORY_RETRIEVAL:-1}"
 MEMORY_TOP_K="${MEMORY_TOP_K:-2}"
 MEMORY_INDEX_BACKEND="${MEMORY_INDEX_BACKEND:-auto}"
 MEMORY_SAME_TASK_FIRST="${MEMORY_SAME_TASK_FIRST:-1}"
@@ -18,7 +18,7 @@ VL_MODEL_PRESET="${VL_MODEL_PRESET:-}"
 VL_MODEL_NAME="${VL_MODEL_NAME:-}"
 
 CMD=(
-  python /home/i2r/shahil_ws/Belief-VLM/chat_general_vlm.py
+  python chat_general_vlm.py
   --checkpoint "$CHECKPOINT"
   --question "$QUESTION"
   --task_name "$TASK_NAME"
