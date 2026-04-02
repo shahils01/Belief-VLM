@@ -144,6 +144,20 @@ def _decode_generated_text(model, generated_ids, prompt_input_ids):
     return tokenizer.decode(gen_tokens, skip_special_tokens=True).strip()
 
 
+def _prepare_model_inputs(packed, device):
+    prepared = {}
+    for key, value in packed.items():
+        if not torch.is_tensor(value):
+            continue
+        tensor = value
+        if key in {"input_ids", "attention_mask"} and tensor.dim() == 1:
+            tensor = tensor.unsqueeze(0)
+        elif key == "pixel_values" and tensor.dim() == 3:
+            tensor = tensor.unsqueeze(0)
+        prepared[key] = tensor.to(device)
+    return prepared
+
+
 def main():
     args = parse_args()
     if bool(args.image_path) == bool(args.video_path):
@@ -163,11 +177,7 @@ def main():
         vl_backend=merged_args.vl_backend,
         max_text_len=merged_args.vl_max_text_len,
     )
-    inputs = {
-        k: v.unsqueeze(0).to(device) if torch.is_tensor(v) and v.dim() > 0 else v
-        for k, v in packed.items()
-        if torch.is_tensor(v)
-    }
+    inputs = _prepare_model_inputs(packed, device)
 
     hook_handle = None
     if memory is not None and memory_fusion is not None and len(memory) > 0:
