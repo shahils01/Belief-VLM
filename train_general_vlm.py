@@ -87,6 +87,7 @@ def parse_args():
     parser.add_argument("--memory_layer_idx", type=int, default=1)
     parser.add_argument("--memory_inject_offset", type=int, default=0)
     parser.add_argument("--freeze_memory_prefix", action="store_true")
+    parser.add_argument("--memory_max_entries", type=int, default=0)
 
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--wandb_project", type=str, default="general-vlm")
@@ -220,10 +221,14 @@ class GatedMemoryFusion(nn.Module):
             nn.Linear(dim * 2 + 1, dim),
             nn.Sigmoid(),
         )
+        self.latest_gate_mean = 0.0
+        self.latest_gate_max = 0.0
 
     def forward(self, query_state, memory_context, memory_answer, memory_reward):
         reward = memory_reward.unsqueeze(-1)
         gate = self.gate(torch.cat([query_state, memory_context, reward], dim=-1))
+        self.latest_gate_mean = float(gate.detach().mean().item())
+        self.latest_gate_max = float(gate.detach().max().item())
         return (
             self.context_proj(memory_context)
             + gate * self.answer_proj(memory_answer)
@@ -322,6 +327,7 @@ def main():
             prior_prefix="Belief prior:",
             backend=args.memory_index_backend,
             same_task_first=args.memory_same_task_first,
+            max_entries=args.memory_max_entries,
         )
 
     optimizer = torch.optim.AdamW(
@@ -354,6 +360,10 @@ def main():
             hook_handle = None
             query_state = None
             response_state = None
+            batch_memory_sim = 0.0
+            batch_memory_count = 0.0
+            batch_gate_mean = 0.0
+            batch_gate_max = 0.0
             if memory is not None:
                 with torch.no_grad():
                     query_state = accelerator.unwrap_model(model).encode_inputs(
@@ -377,6 +387,10 @@ def main():
                     memory_answer = torch.from_numpy(retrieved["answer"]).to(accelerator.device, dtype=query_state.dtype)
                     memory_reward = torch.from_numpy(retrieved["reward"]).to(accelerator.device, dtype=query_state.dtype)
                     fused_memory = memory_fusion(query_state.to(accelerator.device), memory_context, memory_answer, memory_reward)
+                    batch_memory_sim = float(retrieved["similarity"].mean()) if len(retrieved["similarity"]) else 0.0
+                    batch_memory_count = float(retrieved["count"].mean()) if len(retrieved["count"]) else 0.0
+                    batch_gate_mean = float(memory_fusion.latest_gate_mean)
+                    batch_gate_max = float(memory_fusion.latest_gate_max)
                     inject_layer_idx = max(int(args.memory_layer_idx) + int(args.memory_inject_offset), 0)
                     hook_handle = accelerator.unwrap_model(model).inject_pooled_memory_context(fused_memory, inject_layer_idx)
                     injected = True
@@ -412,11 +426,37 @@ def main():
                 elapsed = time.time() - start_time
                 extra = ""
                 if memory is not None:
-                    extra = f" memory_size={len(memory)} injected={int(injected)}"
+                    extra = (
+                        f" memory_size={len(memory)} injected={int(injected)}"
+                        f" memory_sim={batch_memory_sim:.4f} memory_count={batch_memory_count:.2f}"
+                        f" gate_mean={batch_gate_mean:.4f} gate_max={batch_gate_max:.4f}"
+                    )
                 accelerator.print(
                     f"epoch={epoch} step={step} global_step={global_step} loss={avg_loss:.4f} "
                     f"samples={running_count} sec={elapsed:.1f}{extra}"
                 )
+                if accelerator.is_main_process and args.wandb:
+                    try:
+                        import wandb
+
+                        payload = {
+                            "train/loss": avg_loss,
+                            "train/global_step": global_step,
+                        }
+                        if memory is not None:
+                            payload.update(
+                                {
+                                    "memory/size": len(memory),
+                                    "memory/similarity": batch_memory_sim,
+                                    "memory/retrieved_count": batch_memory_count,
+                                    "memory/gate_mean": batch_gate_mean,
+                                    "memory/gate_max": batch_gate_max,
+                                    "memory/injected": int(injected),
+                                }
+                            )
+                        wandb.log(payload, step=global_step)
+                    except Exception:
+                        pass
         _save_checkpoint(model, memory_fusion, optimizer, accelerator, args, epoch + 1, global_step, memory)
 
     if accelerator.is_main_process and args.wandb:

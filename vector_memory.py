@@ -143,10 +143,11 @@ class MemoryEntry:
 
 
 class OnlineVectorMemory:
-    def __init__(self, dim: int, prior_prefix: str, backend: str = "auto", same_task_first: bool = True):
+    def __init__(self, dim: int, prior_prefix: str, backend: str = "auto", same_task_first: bool = True, max_entries: int = 0):
         self.dim = int(dim)
         self.prior_prefix = str(prior_prefix)
         self.same_task_first = bool(same_task_first)
+        self.max_entries = max(0, int(max_entries))
         self.entries: list[MemoryEntry] = []
         self.embeddings = np.zeros((0, self.dim), dtype=np.float32)
         self.answer_embeddings = np.zeros((0, self.dim), dtype=np.float32)
@@ -184,8 +185,9 @@ class OnlineVectorMemory:
         memory = cls(
             dim=int(state["dim"]),
             prior_prefix=state.get("prior_prefix", getattr(args, "db_prior_prefix", "Belief prior:")),
-            backend=getattr(args, "db_index_backend", "auto"),
-            same_task_first=bool(state.get("same_task_first", getattr(args, "db_same_task_first", True))),
+            backend=getattr(args, "memory_index_backend", getattr(args, "db_index_backend", "auto")),
+            same_task_first=bool(state.get("same_task_first", getattr(args, "memory_same_task_first", getattr(args, "db_same_task_first", True)))),
+            max_entries=int(state.get("max_entries", getattr(args, "memory_max_entries", 0))),
         )
         embeddings = np.asarray(state.get("embeddings", np.zeros((0, memory.dim), dtype=np.float32)), dtype=np.float32)
         answer_embeddings = np.asarray(
@@ -215,6 +217,7 @@ class OnlineVectorMemory:
             "dim": self.dim,
             "prior_prefix": self.prior_prefix,
             "same_task_first": self.same_task_first,
+            "max_entries": self.max_entries,
             "entries": [
                 {"id": e.id, "task_name": e.task_name, "belief_text": e.belief_text, "reward": e.reward}
                 for e in self.entries
@@ -226,6 +229,29 @@ class OnlineVectorMemory:
 
     def __len__(self):
         return len(self.entries)
+
+    def _rebuild_index(self):
+        requested = self.backend
+        if requested == "faiss":
+            try:
+                self._index = _FaissIndex(self.dim)
+            except Exception:
+                self._index = _NumpyIndex()
+                self.backend = "numpy"
+        else:
+            self._index = _NumpyIndex()
+        if self.embeddings.size:
+            self._index.add(self.embeddings)
+
+    def _apply_capacity(self):
+        if self.max_entries <= 0 or len(self.entries) <= self.max_entries:
+            return
+        keep = int(self.max_entries)
+        self.entries = self.entries[-keep:]
+        self.embeddings = self.embeddings[-keep:]
+        self.answer_embeddings = self.answer_embeddings[-keep:]
+        self.rewards = self.rewards[-keep:]
+        self._rebuild_index()
 
     def add(
         self,
@@ -285,6 +311,7 @@ class OnlineVectorMemory:
             self.rewards = np.concatenate([self.rewards, new_rewards], axis=0)
         self.entries.extend(new_entries)
         self._index.add(new_embeddings)
+        self._apply_capacity()
 
     def retrieve(self, query_embeddings: torch.Tensor | np.ndarray, sample_ids, task_names, top_k: int):
         if len(self.entries) == 0 or int(top_k) <= 0:
