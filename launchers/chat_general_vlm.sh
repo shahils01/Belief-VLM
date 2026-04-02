@@ -2,8 +2,8 @@
 set -euo pipefail
 
 CHECKPOINT="${CHECKPOINT:-/scratch/shahils/Belief-VLM/checkpoints_general_vlm/ckpt_epoch_20.pt}"
-QUESTION="${QUESTION:-"What does this diagram explain?"}"
-IMAGE_PATH="${IMAGE_PATH:-/scratch/shahils/hd_epic_dataset/hd-epic-annotations/logo-white.png}"
+QUESTION="${QUESTION:-"explain this image?"}"
+IMAGE_PATH="${IMAGE_PATH:-/home/shahils/Desktop/marl_ws/Multi-Agent-Transformer/training_pipelines.jpg}"
 VIDEO_PATH="${VIDEO_PATH:-}"
 TASK_NAME="${TASK_NAME:-chat}"
 SAMPLE_ID="${SAMPLE_ID:-interactive}"
