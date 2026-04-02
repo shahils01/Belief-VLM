@@ -25,6 +25,8 @@ MAX_TRAIN_SAMPLES="${MAX_TRAIN_SAMPLES:-0}"
 MAX_EVAL_SAMPLES="${MAX_EVAL_SAMPLES:-0}"
 SEED="${SEED:-42}"
 WANDB="${WANDB:-1}"
+RESUME_CHECKPOINT="${RESUME_CHECKPOINT:-}"
+LOAD_MODEL_ONLY="${LOAD_MODEL_ONLY:-0}"
 LAUNCHER="${LAUNCHER:-accelerate}"
 NUM_PROCESSES="${NUM_PROCESSES:-4}"
 NUM_MACHINES="${NUM_MACHINES:-1}"
@@ -38,6 +40,7 @@ MEMORY_SAME_TASK_FIRST="${MEMORY_SAME_TASK_FIRST:-1}"
 MEMORY_LAYER_IDX="${MEMORY_LAYER_IDX:-3}"
 MEMORY_INJECT_OFFSET="${MEMORY_INJECT_OFFSET:-0}"
 FREEZE_MEMORY_PREFIX="${FREEZE_MEMORY_PREFIX:-1}"
+MEMORY_MAX_ENTRIES="${MEMORY_MAX_ENTRIES:-0}"
 
 TRAIN_CMD=(
   train_general_vlm.py
@@ -65,12 +68,14 @@ if [[ -n "$ANNOTATION_PATH" ]]; then TRAIN_CMD+=(--annotation_path "$ANNOTATION_
 if [[ -n "$MEDIA_ROOT" ]]; then TRAIN_CMD+=(--media_root "$MEDIA_ROOT"); fi
 if [[ -n "$VIDEO_ROOT" ]]; then TRAIN_CMD+=(--video_root "$VIDEO_ROOT"); fi
 if [[ -n "$VL_MODEL_NAME" ]]; then TRAIN_CMD+=(--vl_model_name "$VL_MODEL_NAME"); fi
+if [[ -n "$RESUME_CHECKPOINT" ]]; then TRAIN_CMD+=(--resume_checkpoint "$RESUME_CHECKPOINT"); fi
 if [[ "$STREAMING" == "1" ]]; then TRAIN_CMD+=(--streaming); fi
 if [[ "$WANDB" == "1" ]]; then TRAIN_CMD+=(--wandb); fi
+if [[ "$LOAD_MODEL_ONLY" == "1" ]]; then TRAIN_CMD+=(--load_model_only); fi
 if [[ "$USE_MEMORY_RETRIEVAL" == "1" ]]; then TRAIN_CMD+=(--use_memory_retrieval); fi
 if [[ "$MEMORY_SAME_TASK_FIRST" == "1" ]]; then TRAIN_CMD+=(--memory_same_task_first); fi
 if [[ "$FREEZE_MEMORY_PREFIX" == "1" ]]; then TRAIN_CMD+=(--freeze_memory_prefix); fi
-TRAIN_CMD+=(--memory_top_k "$MEMORY_TOP_K" --memory_index_backend "$MEMORY_INDEX_BACKEND" --memory_layer_idx "$MEMORY_LAYER_IDX" --memory_inject_offset "$MEMORY_INJECT_OFFSET")
+TRAIN_CMD+=(--memory_top_k "$MEMORY_TOP_K" --memory_index_backend "$MEMORY_INDEX_BACKEND" --memory_layer_idx "$MEMORY_LAYER_IDX" --memory_inject_offset "$MEMORY_INJECT_OFFSET" --memory_max_entries "$MEMORY_MAX_ENTRIES")
 
 if [[ "$LAUNCHER" == "python" || "$NUM_PROCESSES" == "1" ]]; then
   exec python "${TRAIN_CMD[@]}"
