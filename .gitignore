@@ -12,3 +12,7 @@ logs/
 .wandb/
 wandb/
 .DS_Store
+
+
+dataset_sample/*
+VLM_tutorial/*

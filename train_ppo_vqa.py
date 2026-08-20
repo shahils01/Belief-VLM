@@ -69,6 +69,7 @@ class PPOAnswerPolicy(nn.Module):
         return logits, value
 
 
+
 class GatedMemoryFusion(nn.Module):
     def __init__(self, hidden_dim: int):
         super().__init__()
@@ -98,6 +99,7 @@ class GatedMemoryFusion(nn.Module):
         )
         fused_state = self.output_norm(current_state + memory_state)
         return fused_state, gate
+
 
 
 def parse_args():
